@@ -1,0 +1,59 @@
+# ------------------------------------------------------------
+# read_sas.R
+# Script to open/read SAS files (.sas7bdat and .xpt) in R
+# ------------------------------------------------------------
+
+# Install haven package if not already installed
+if (!requireNamespace("haven", quietly = TRUE)) {
+  install.packages("haven")
+}
+
+library(haven)
+
+# --- Set the path to your SAS file ---
+file_path <- "C:/Users/lukas/Documents/Med School/AOT/R/SAS Dataset/Liver/Immunosuppression/liver_immuno_followup_data.sas7bdat"   # or "path/to/your_file.xpt"
+
+# --- Read the SAS data file ---
+if (grepl("\\.sas7bdat$", file_path, ignore.case = TRUE)) {
+  data <- read_sas(file_path)
+} else if (grepl("\\.xpt$", file_path, ignore.case = TRUE)) {
+  data <- read_xpt(file_path)
+} else {
+  stop("Unsupported file type. Expecting .sas7bdat or .xpt")
+}
+
+# --- Inspect the data ---
+str(data)      # structure of the dataset
+head(data)     # first few rows
+dim(data)      # dimensions (rows, columns)
+
+# --- Optional: view variable labels (SAS metadata) ---
+sapply(data, function(x) attr(x, "label"))
+
+#--- Filter rows by date of follow up ---
+# important to note, study will be filtered by 10 years of tx NOT follow up
+# data set will be filtered from 
+  
+  if (!requireNamespace("dplyr", quietly = TRUE)) {
+    install.packages("dplyr")
+  }
+library(dplyr)
+
+date_col   <- "PX_STAT_DATE_FOL"          # <- date column name
+start_date <- as.Date("2016-04-03")       # <- start date - STILL NEED what dates the Database captures
+end_date   <- as.Date("2026-04-03")       # <- end date
+
+# Check the column's class first: (liver follow up SAS file uses 'date' class instead of 'numeric' class)
+class(data[[date_col]])
+data_filtered <- data %>%
+  filter(.data[[date_col]] >= start_date & .data[[date_col]] <= end_date)
+
+dim(data_filtered)   # check how many rows remain
+head(data_filtered)
+
+
+# --- Optional: save as CSV or RDS ---
+write.csv(data_filtered, "C:/Users/lukas/Documents/Med School/AOT/R/Output/liver-immuno-follow-up_date-filtered.csv", row.names = FALSE)
+# saveRDS(data, "output.rds")
+
+
