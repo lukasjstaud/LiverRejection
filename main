@@ -46,12 +46,28 @@ if (!requireNamespace("lubridate", quietly = TRUE)) {
 }
 library(lubridate)
 
+if (!requireNamespace("gt", quietly = TRUE)) {
+  install.packages("gt")
+}
+library(gt)
+
+if (!requireNamespace("tibble", quietly = TRUE)) {
+  install.packages("tibble")
+}
+library(tibble)
+
 # ______________________________________________________________________________
 # Reading data (adjust path and file type as needed)
 
-df_immuno_fol_read <- read.csv("C:/Users/lukas/Documents/Med School/AOT/R/Output/Filtered Data by Date/liver-immuno-follow-up_date-filtered.csv", stringsAsFactors = FALSE)
-df_liver_data <- read.csv("C:/Users/lukas/Documents/Med School/AOT/R/Output/Filtered Data by Date/liver-data_date-filtered.csv", stringsAsFactors = FALSE)
-df_immuno_induc <- read.csv("C:/Users/lukas/Documents/Med School/AOT/R/Output/Filtered Data by Date/liver-immuno-discharge_unfilter.csv")
+# Mac loading
+df_immuno_fol_read <- read.csv("~/Local Documents/AOT/Analysis/FilteredData/liver-immuno-follow-up_date-filtered.csv", stringsAsFactors = FALSE)
+df_liver_data <- read.csv("~/Local Documents/AOT/Analysis/FilteredData/liver-data_date-filtered.csv", stringsAsFactors = FALSE)
+df_immuno_induc <- read.csv("~/Local Documents/AOT/Analysis/FilteredData/liver-immuno-discharge_unfilter.csv")
+
+# Window loading
+# df_immuno_fol_read <- read.csv("C:/Users/lukas/Documents/Med School/AOT/R/Output/Filtered Data by Date/liver-immuno-follow-up_date-filtered.csv", stringsAsFactors = FALSE)
+# df_liver_data <- read.csv("C:/Users/lukas/Documents/Med School/AOT/R/Output/Filtered Data by Date/liver-data_date-filtered.csv", stringsAsFactors = FALSE)
+# df_immuno_induc <- read.csv("C:/Users/lukas/Documents/Med School/AOT/R/Output/Filtered Data by Date/liver-immuno-discharge_unfilter.csv")
 
 df_immuno_fol <- df_immuno_fol_read
 # _____________________________________________________________________________
@@ -135,7 +151,7 @@ df_immuno_fol <- df_immuno_fol %>% # telling R to treat columns as a date and so
   filter(abs(FOL_DATE_DAYS_DELTA) < 365.24219) %>% # filters for follow ups + 1 year
   arrange(PX_STAT_DATE_FOL) # orders based on follow up date
 
-  
+
 #print(df_immuno_fol)
 
 #_________________________________________________________________________________
@@ -144,12 +160,12 @@ df_immuno_fol <- df_immuno_fol %>% # telling R to treat columns as a date and so
 # set search columns
 # GENERICMMF, GENERICTACROLIMUS, ASTAGRAFXL, NULOJIX are a maintenance column ONLY
 RX_COLS <- c("ALG", "CYCLOSPORIN", "OKT4", "CYTOXAN", "METHOTREXATE", "BREQUINARSODIUM", "MIZORIBINE",
-          "ATGAM", "NRATGNRATS", "OKT3", "XOMAZYMECD5", "DAB486IL2", "ANTILFA1", "ANTIICAM1",
-          "IL1RECEPTORANTAGONIST", "ANTIIL6", "ANTITNF", "SOLUBLEIL1RECEPTOR", "ALDESLEUKIN", "T10B9",
-          "SANDIMMUNE", "DEOXYSPERGUALIN", "NEORAL", "SANGCYA", "THYMOGLOBULIN", "ZENAPAX",
-          "SIMULECT", "GENGRAF", "ZORTRESS", "EON", "MYFORTIC", "GENERICCYCLOSPORIN", "STEROIDS", "PROGRAF",
-          "CAMPATH", "FTY720","RITUXAN", "GENERICMYFORTIC", "GENERICSIROLIMUS", "ENVARSUSXR", "RAPAMUNE",
-          "LEFLUNOMIDE", "IMURAN", "CELLCEPT") # important to note this does not capture the "other drug" column
+             "ATGAM", "NRATGNRATS", "OKT3", "XOMAZYMECD5", "DAB486IL2", "ANTILFA1", "ANTIICAM1",
+             "IL1RECEPTORANTAGONIST", "ANTIIL6", "ANTITNF", "SOLUBLEIL1RECEPTOR", "ALDESLEUKIN", "T10B9",
+             "SANDIMMUNE", "DEOXYSPERGUALIN", "NEORAL", "SANGCYA", "THYMOGLOBULIN", "ZENAPAX",
+             "SIMULECT", "GENGRAF", "ZORTRESS", "EON", "MYFORTIC", "GENERICCYCLOSPORIN", "STEROIDS", "PROGRAF",
+             "CAMPATH", "FTY720","RITUXAN", "GENERICMYFORTIC", "GENERICSIROLIMUS", "ENVARSUSXR", "RAPAMUNE",
+             "LEFLUNOMIDE", "IMURAN", "CELLCEPT") # important to note this does not capture the "other drug" column
 
 COL_TAIL <- "_ANTIREJ" # this needs to change based on if we are looking at induction, maintenance, ANTI-reject
 
@@ -161,11 +177,11 @@ COLS_TO_CHECK <- paste0(RX_COLS, COL_TAIL)
 # Below commented out bc it takes so damn long to run
 df_immuno_fol <- df_immuno_fol %>%
   # running count
-  mutate(RUNNING_COUNT = 0L) %>%
+  mutate(REJECT_RUNNING_COUNT = 0L) %>%
   group_by(TRR_ID_CODE) %>%
   mutate(
-    RUNNING_COUNT = cumsum(if_any(all_of(COLS_TO_CHECK), ~ !is.na(.) & . == 1))
-    ) %>%
+    REJECT_RUNNING_COUNT = cumsum(if_any(all_of(COLS_TO_CHECK), ~ !is.na(.) & . == 1))
+  ) %>%
   ungroup() %>%
   # combo therapy rx'ed?
   mutate(NUM_ANTI_REJ_RXED = 0L) |>
@@ -215,7 +231,7 @@ df_immuno_induc <- df_immuno_induc |>
     TX_DATE = as.Date(TX_DATE)
   ) %>% # sets csv values in these columns as date data types
   mutate(DAYS_HOSP_SP_TX = time_length(interval(TX_DATE, DISCHARGE_DATE), "days")) # new column with post op days
-  
+
 #print(df_immuno_induc)
 
 
@@ -226,16 +242,151 @@ df_immuno_induc <- df_immuno_induc |>
 #_______________________________________________________________________________
 # Creating Demographic Tables
 
+#-------------------------------------------------------------------------------
 # Parsing by Anti-rejection and No rejection through 1 year
 # NOTE: code as written 13JUL26 does NOT combine discharge and follow up data
 
 # Isolating Patients with first instance of rejection in 1 year
 pat_rej_array <- df_immuno_fol_calc |> 
-  filter(RUNNING_COUNT == 1) %>%
-  select(TRR_ID_CODE, TRR_FOL_ID_CODE, TX_DATE, DISCHARGE_DATE, PX_STAT_DATE_FOL, FOL_DATE_DAYS_DELTA, RUNNING_COUNT, NUM_ANTI_REJ_RXED) |> 
+  filter(REJECT_RUNNING_COUNT == 1) %>%
+  select(TRR_ID_CODE, TRR_FOL_ID_CODE, TX_DATE, DISCHARGE_DATE, PX_STAT_DATE_FOL, FOL_DATE_DAYS_DELTA, REJECT_RUNNING_COUNT, NUM_ANTI_REJ_RXED) |> 
   filter(NUM_ANTI_REJ_RXED == 1) # this filters out follow up visits post rejection treatment
 
-print(pat_rej_array)
+#print(pat_rej_array)
+
+# Isolating patients w/o rejection at follow ups at 1 year
+pat_cntrl_array <- df_immuno_fol_calc %>% 
+  filter(REJECT_RUNNING_COUNT == 0) %>% 
+  select(TRR_ID_CODE, TRR_FOL_ID_CODE, TX_DATE, DISCHARGE_DATE, PX_STAT_DATE_FOL, FOL_DATE_DAYS_DELTA, REJECT_RUNNING_COUNT, NUM_ANTI_REJ_RXED) %>% 
+  mutate(FOLLOW_UP_NUM = 1L) |>
+  group_by(TRR_ID_CODE) %>%
+  slice_max(order_by = PX_STAT_DATE_FOL, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+#print(pat_cntrl_array)
+
+#------------------------------------------------------------------------
+# Collecting Demographic Data on the Reject vs Control Patients
+
+pat_rej_demo_table <- pat_rej_array %>% 
+  left_join(df_liver_data_filtered %>% 
+              select(TRR_ID_CODE, AGE, GENDER, ETHCAT, TXKID, TXHRT, TXLNG, TXPAN, 
+                     PREV_TX, PREV_TX_ANY_N, DON_TY), by = "TRR_ID_CODE")
+
+pat_cntrl_demo_table <- pat_cntrl_array %>% 
+  left_join(df_liver_data_filtered %>% 
+              select(TRR_ID_CODE, AGE, GENDER, ETHCAT, TXKID, TXHRT, TXLNG, TXPAN, 
+                     PREV_TX, PREV_TX_ANY_N, DON_TY), by = "TRR_ID_CODE")
+
+# calculating bitch ass values for the below table
+
+# Tibble Data husk
+tbl_data <- tribble(
+  ~label,                          ~value,            ~indent, ~section,
+  "Recipient Age (y), median(IQR)", "empty",         FALSE,   FALSE,
+  "Male Gender, n(%)",              "empty",     FALSE,   FALSE,
+  "Race, n(%)",                     "",                FALSE,   TRUE,
+  "White",                          "empty",      TRUE,    FALSE,
+  "Black",                          "empty",      TRUE,    FALSE,
+  "Hispanic",                       "empty",       TRUE,    FALSE,
+  "Asian",                          "empty",         TRUE,    FALSE,
+  "Other/Multiracial",              "empty",         TRUE,    FALSE,
+  "Organ Transplanted, n(%)",       "",                FALSE,   TRUE,
+  "Kidney",                         "empty",      TRUE,    FALSE,
+  "Kidney and Pancreas",            "empty",        TRUE,    FALSE,
+  "Living Donor, n(%)",             "empty",       FALSE,   FALSE,
+  "Cold Ischemic Time (hr), median(IQR)", "empty", FALSE, FALSE,
+  "Previous Kidney Transplants, n(%)", "",              FALSE,   TRUE,
+  "0",                              "empty",      TRUE,    FALSE,
+  "1",                              "empty",        TRUE,    FALSE,
+  "2",                              "empty",          TRUE,    FALSE,
+  "3",                              "empty",          TRUE,    FALSE,
+  "Peak PRA, n(%)",                 "",                FALSE,   TRUE,
+  "0%",                             "empty",       TRUE,    FALSE,
+  "1%-20%",                         "empty",       TRUE,    FALSE,
+  "21%-80%",                        "empty",        TRUE,    FALSE,
+  "81%-100%",                       "empty",         TRUE,    FALSE,
+  "HLA Mismatch Level, n(%)",       "",                FALSE,   TRUE,
+  "0",                              "empty",         TRUE,    FALSE,
+  "1",                              "empty",         TRUE,    FALSE
+)
+
+
+
+# BUILD THE GT TABLE
+# ------------------------------------------------------------
+gt_tbl <- pat_rej_demo_table %>%
+  select(display_label, value, section) %>%
+  gt() %>%
+  
+  # column header (bold, two lines, italic n)
+  cols_label(
+    display_label = "",
+    value = html(paste0(
+      "<span style='font-weight:bold;'>", header_title,
+      " (<span style='font-style:italic;'>n</span> = ", header_n, ")</span>"
+    ))
+  ) %>%
+  
+  # hide helper column
+  cols_hide(section) %>%
+  
+  # left-align everything, generous column widths
+  cols_align(align = "left", columns = everything()) %>%
+  cols_width(
+    display_label ~ px(320),
+    value ~ px(220)
+  ) %>%
+  
+  # thick rule under header, like the reference image
+  tab_style(
+    style = cell_borders(sides = "bottom", color = "black", weight = px(2)),
+    locations = cells_column_labels(everything())
+  ) %>%
+  
+  # remove default vertical gridlines / borders between columns
+  tab_style(
+    style = cell_borders(sides = c("left", "right"), color = "white", weight = px(0)),
+    locations = cells_body(columns = everything())
+  ) %>%
+  
+  # bold the section header rows (e.g., "Race, n(%)")
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(
+      columns = display_label,
+      rows = section == TRUE
+    )
+  ) %>%
+  
+  # alternating row shading (banded by physical row, continuous down the table)
+  tab_style(
+    style = cell_fill(color = "#e6e6e6"),
+    locations = cells_body(rows = seq(1, nrow(tbl_data), 2))
+  ) %>%
+  tab_style(
+    style = cell_fill(color = "white"),
+    locations = cells_body(rows = seq(2, nrow(tbl_data), 2))
+  ) %>%
+  
+  # remove row striping borders, keep clean look
+  tab_options(
+    table.border.top.color = "white",
+    table.border.bottom.color = "black",
+    table.border.bottom.width = px(2),
+    column_labels.border.top.color = "white",
+    data_row.padding = px(6),
+    table.font.size = px(15),
+    column_labels.font.size = px(15)
+  ) %>%
+  
+  # font
+  opt_table_font(font = "Georgia")
+
+# ------------------------------------------------------------
+# SAVE / DISPLAY
+# ------------------------------------------------------------
+gt_tbl
 
 
 #__________________________________________________________________________________
@@ -317,4 +468,3 @@ post_tx_anti_rej_table %>%
 
 
 # ___________________________________________________________________________
-
