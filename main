@@ -159,20 +159,20 @@ COLS_TO_CHECK <- paste0(RX_COLS, COL_TAIL)
 # Creating running counts of follow up treatments for anti-rejection therapy and checking for combo therapy
 
 # Below commented out bc it takes so damn long to run
-# df_immuno_fol <- df_immuno_fol %>%
-#   # running count
-#   mutate(RUNNING_COUNT = 0L) %>%
-#   group_by(TRR_ID_CODE) %>%
-#   mutate(
-#     RUNNING_COUNT = cumsum(if_any(all_of(COLS_TO_CHECK), ~ !is.na(.) & . == 1))
-#     ) %>%
-#   ungroup() %>%
-#   # combo therapy rx'ed?
-#   mutate(NUM_ANTI_REJ_RXED = 0L) |>
-#   mutate(NUM_ANTI_REJ_RXED = rowSums(across(all_of(COLS_TO_CHECK)) == 1, na.rm = TRUE))
-#   
-# # store data so that I dont have to keep calculating it
-# df_immuno_fol_calc <- df_immuno_fol
+df_immuno_fol <- df_immuno_fol %>%
+  # running count
+  mutate(RUNNING_COUNT = 0L) %>%
+  group_by(TRR_ID_CODE) %>%
+  mutate(
+    RUNNING_COUNT = cumsum(if_any(all_of(COLS_TO_CHECK), ~ !is.na(.) & . == 1))
+    ) %>%
+  ungroup() %>%
+  # combo therapy rx'ed?
+  mutate(NUM_ANTI_REJ_RXED = 0L) |>
+  mutate(NUM_ANTI_REJ_RXED = rowSums(across(all_of(COLS_TO_CHECK)) == 1, na.rm = TRUE))
+
+# store data so that I dont have to keep calculating it
+df_immuno_fol_calc <- df_immuno_fol
 
 #print(df_immuno_fol)
 
@@ -221,6 +221,22 @@ df_immuno_induc <- df_immuno_induc |>
 
 #_________________________________________________________________________________
 # Future merge of anti-rejection therapy counts
+# TBD - Need to talk with Dr. Karhadkar
+
+#_______________________________________________________________________________
+# Creating Demographic Tables
+
+# Parsing by Anti-rejection and No rejection through 1 year
+# NOTE: code as written 13JUL26 does NOT combine discharge and follow up data
+
+# Isolating Patients with first instance of rejection in 1 year
+pat_rej_array <- df_immuno_fol_calc |> 
+  filter(RUNNING_COUNT == 1) %>%
+  select(TRR_ID_CODE, TRR_FOL_ID_CODE, TX_DATE, DISCHARGE_DATE, PX_STAT_DATE_FOL, FOL_DATE_DAYS_DELTA, RUNNING_COUNT, NUM_ANTI_REJ_RXED) |> 
+  filter(NUM_ANTI_REJ_RXED == 1) # this filters out follow up visits post rejection treatment
+
+print(pat_rej_array)
+
 
 #__________________________________________________________________________________
 # Prepping Table for graphing
@@ -273,6 +289,7 @@ freq_long <- freq_drug_fol_antirej_indiv %>%
 # # _________________________________________________________________________________
 # Tables
 
+#---------------------------------------------------------------------------------
 # Follow Up Anti rejection tables
 
 followup_12m_anti_rej_table <- data.frame(
@@ -286,7 +303,7 @@ followup_12m_anti_rej_table %>%
   kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
 
 #-------------------------------------------------------------------------------------
-# In patient hospital course sp liver transplant
+# Inpatient hospital course sp liver transplant
 
 post_tx_anti_rej_table <- data.frame(
   AntiRejectionTherapy = str_remove(COLS_TO_CHECK,COL_TAIL),
@@ -297,8 +314,7 @@ post_tx_anti_rej_table %>%
   arrange(desc(Frequency)) %>%
   kable(caption = "Frequency of Anti-Rejection Therapies Used While Admitted s/p Liver Transplant") %>%
   kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+
 # ___________________________________________________________________________
-
-
-
 
