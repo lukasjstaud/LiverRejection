@@ -60,14 +60,14 @@ library(tibble)
 # Reading data (adjust path and file type as needed)
 
 # Mac loading
-df_immuno_fol_read <- read.csv("~/Local Documents/AOT/Analysis/FilteredData/liver-immuno-follow-up_date-filtered.csv", stringsAsFactors = FALSE)
-df_liver_data <- read.csv("~/Local Documents/AOT/Analysis/FilteredData/liver-data_date-filtered.csv", stringsAsFactors = FALSE)
-df_immuno_induc <- read.csv("~/Local Documents/AOT/Analysis/FilteredData/liver-immuno-discharge_unfilter.csv")
+# df_immuno_fol_read <- read.csv("~/Local Documents/AOT/Analysis/FilteredData/liver-immuno-follow-up_date-filtered.csv", stringsAsFactors = FALSE)
+# df_liver_data <- read.csv("~/Local Documents/AOT/Analysis/FilteredData/liver-data_date-filtered.csv", stringsAsFactors = FALSE)
+# df_immuno_induc <- read.csv("~/Local Documents/AOT/Analysis/FilteredData/liver-immuno-discharge_unfilter.csv")
 
 # Window loading
-# df_immuno_fol_read <- read.csv("C:/Users/lukas/Documents/Med School/AOT/R/Output/Filtered Data by Date/liver-immuno-follow-up_date-filtered.csv", stringsAsFactors = FALSE)
-# df_liver_data <- read.csv("C:/Users/lukas/Documents/Med School/AOT/R/Output/Filtered Data by Date/liver-data_date-filtered.csv", stringsAsFactors = FALSE)
-# df_immuno_induc <- read.csv("C:/Users/lukas/Documents/Med School/AOT/R/Output/Filtered Data by Date/liver-immuno-discharge_unfilter.csv")
+df_immuno_fol_read <- read.csv("C:/Users/lukas/Documents/Med School/AOT/R/Output/Filtered Data by Date/liver-immuno-follow-up_date-filtered.csv", stringsAsFactors = FALSE)
+df_liver_data <- read.csv("C:/Users/lukas/Documents/Med School/AOT/R/Output/Filtered Data by Date/liver-data_date-filtered.csv", stringsAsFactors = FALSE)
+df_immuno_induc <- read.csv("C:/Users/lukas/Documents/Med School/AOT/R/Output/Filtered Data by Date/liver-immuno-discharge_unfilter.csv")
 
 df_immuno_fol <- df_immuno_fol_read
 # _____________________________________________________________________________
@@ -270,123 +270,473 @@ pat_cntrl_array <- df_immuno_fol_calc %>%
 
 pat_rej_demo_table <- pat_rej_array %>% 
   left_join(df_liver_data_filtered %>% 
-              select(TRR_ID_CODE, AGE, GENDER, ETHCAT, TXKID, TXHRT, TXLNG, TXPAN, 
-                     PREV_TX, PREV_TX_ANY_N, DON_TY), by = "TRR_ID_CODE")
+              select(TRR_ID_CODE, AGE, GENDER, ETHCAT, MELD_PELD_LAB_SCORE, TXKID, TXHRT, TXLNG, TXPAN, 
+                     PREV_TX, PREV_TX_ANY_N, DON_TY, COLD_ISCH), by = "TRR_ID_CODE") |> 
+  mutate(REJ_STAT = 0L) # for the following merge this will let me know what is a rejection pt
 
-pat_cntrl_demo_table <- pat_cntrl_array %>% 
+pat_ctrl_demo_table <- pat_cntrl_array %>% 
   left_join(df_liver_data_filtered %>% 
-              select(TRR_ID_CODE, AGE, GENDER, ETHCAT, TXKID, TXHRT, TXLNG, TXPAN, 
-                     PREV_TX, PREV_TX_ANY_N, DON_TY), by = "TRR_ID_CODE")
+              select(TRR_ID_CODE, AGE, GENDER, ETHCAT, MELD_PELD_LAB_SCORE, TXKID, TXHRT, TXLNG, TXPAN, 
+                     PREV_TX, PREV_TX_ANY_N, DON_TY, COLD_ISCH), by = "TRR_ID_CODE") |> 
+  mutate(REJ_STAT = 1L) # for the following merge this will let me know what is a nonrejection pt
+
+pat_all_demo_table <- full_join(pat_rej_demo_table,pat_ctrl_demo_table)
 
 # calculating bitch ass values for the below table
 
-# Tibble Data husk
-tbl_data <- tribble(
-  ~label,                          ~value,            ~indent, ~section,
-  "Recipient Age (y), median(IQR)", "empty",         FALSE,   FALSE,
-  "Male Gender, n(%)",              "empty",     FALSE,   FALSE,
-  "Race, n(%)",                     "",                FALSE,   TRUE,
-  "White",                          "empty",      TRUE,    FALSE,
-  "Black",                          "empty",      TRUE,    FALSE,
-  "Hispanic",                       "empty",       TRUE,    FALSE,
-  "Asian",                          "empty",         TRUE,    FALSE,
-  "Other/Multiracial",              "empty",         TRUE,    FALSE,
-  "Organ Transplanted, n(%)",       "",                FALSE,   TRUE,
-  "Kidney",                         "empty",      TRUE,    FALSE,
-  "Kidney and Pancreas",            "empty",        TRUE,    FALSE,
-  "Living Donor, n(%)",             "empty",       FALSE,   FALSE,
-  "Cold Ischemic Time (hr), median(IQR)", "empty", FALSE, FALSE,
-  "Previous Kidney Transplants, n(%)", "",              FALSE,   TRUE,
-  "0",                              "empty",      TRUE,    FALSE,
-  "1",                              "empty",        TRUE,    FALSE,
-  "2",                              "empty",          TRUE,    FALSE,
-  "3",                              "empty",          TRUE,    FALSE,
-  "Peak PRA, n(%)",                 "",                FALSE,   TRUE,
-  "0%",                             "empty",       TRUE,    FALSE,
-  "1%-20%",                         "empty",       TRUE,    FALSE,
-  "21%-80%",                        "empty",        TRUE,    FALSE,
-  "81%-100%",                       "empty",         TRUE,    FALSE,
-  "HLA Mismatch Level, n(%)",       "",                FALSE,   TRUE,
-  "0",                              "empty",         TRUE,    FALSE,
-  "1",                              "empty",         TRUE,    FALSE
+demo_label1 = c(
+  "Recipient Age (y), median(IQR)",
+  "Male Gender, n(%)",
+  "Race, n(%)",
+  "White", "Black", "Hispanic", "Asian", "Other/Multiracial",
+  "MELD, median(IQR)",
+  "Organ Transplanted, n(%)",
+  "Liver", "Liver and Kidney", "Liver and Heart", "Liver and Lung", "Liver and Pancreas",
+  "Living Donor, n(%)",
+  "Cold Ischemic Time (hr), median(IQR)",
+  "Previous Liver Transplants, n(%)",
+  "Previous Any Transplants, n(%)",
+  "0", "1", "2", "3"
+)
+
+ref_value1 = c(
+  "AGE",
+  "GENDER", # 1 - MALE, 2 - FEMALE
+  "", # RACE ROW
+  "ETHCAT", #1 - WHITE
+  "ETHCAT", # 2 - BLACK
+  "ETHCAT", # 4 - HISPANIC/LATINO
+  "ETHCAT", # 5 - ASIAN
+  "ETHCAT", # 6,7,9,998 - OTHER
+  "MELD_PELD_LAB_SCORE", # TX MELD
+  "", # ORGAN TRANSPLANTED, n(%)
+  "", # LIVER NEED TO CALC TOTAL CONSIDERED THEN SUBTRACT THE BELOW
+  "TXKID", # R,L,E
+  "TXHRT",
+  "TXLNG", #-R,L,E
+  "TXPAN", #-R,L,E
+  "DON_TY", # LIVING DONOR
+  "COLD_ISCH", #ISCHEMIA TIME
+  "PREV_TX", #PREVIOUS LIVER TX
+  "", # PREVIOUS ANY TX
+  "PREV_TX_ANY_N", # 0
+  "PREV_TX_ANY_N", # 1
+  "PREV_TX_ANY_N", # 2
+  "PREV_TX_ANY_N" # 3
+)
+
+# calculations to fill out demographics table
+#-----------
+# Rejection variables calculation + dataframe column
+
+age_rej_med <- median(pat_rej_demo_table$AGE, na.rm = TRUE)
+gen_rej_count <- pat_rej_demo_table |> # number of dudes
+  filter(GENDER == "M") |> 
+  nrow()
+race_wt_rej_count <- pat_rej_demo_table |> 
+  filter(ETHCAT == "1") |> 
+  nrow()
+race_bl_rej_count <- pat_rej_demo_table |> 
+  filter(ETHCAT == "2") |> 
+  nrow()
+race_his_rej_count <- pat_rej_demo_table |> 
+  filter(ETHCAT == "4") |> 
+  nrow()
+race_asia_rej_count <- pat_rej_demo_table |> 
+  filter(ETHCAT == "5") |> 
+  nrow()
+race_other_rej_count <- nrow(pat_rej_demo_table) - sum(race_wt_rej_count, race_bl_rej_count, race_his_rej_count, race_asia_rej_count)
+meld_rej_med <- median(pat_rej_demo_table$MELD_PELD_LAB_SCORE, na.rm = TRUE)
+txkid_rej_count <- pat_rej_demo_table |> 
+  filter(TXKID %in% c("L","R","E")) |> 
+  nrow()
+txhrt_rej_count <- pat_rej_demo_table |> 
+  filter(TXHRT  == "Y") |> 
+  nrow()
+txlng_rej_count <- pat_rej_demo_table |> 
+  filter(TXLNG %in% c("L","R","E")) |> 
+  nrow()
+txpan_rej_count <- pat_rej_demo_table |> 
+  filter(TXPAN %in% c("L","R","E")) |> 
+  nrow()
+txliv_rej_count <- nrow(pat_rej_demo_table) - sum(txkid_rej_count,txhrt_rej_count,txlng_rej_count,txpan_rej_count)
+prev_liver_rej <- pat_rej_demo_table |> 
+  filter(PREV_TX == "Y") |> 
+  nrow()
+prev_tx_1_rej_count <- pat_rej_demo_table |> 
+  filter(PREV_TX_ANY_N == "1") |> 
+  nrow()
+prev_tx_2_rej_count <- pat_rej_demo_table |> 
+  filter(PREV_TX_ANY_N == "2") |> 
+  nrow()
+prev_tx_3_rej_count <- pat_rej_demo_table |> 
+  filter(PREV_TX_ANY_N == "3") |> 
+  nrow()
+prev_tx_0_rej_count <- sum(is.na(pat_rej_demo_table$PREV_TX_ANY_N))
+cold_isch_time_rej <- median(pat_rej_demo_table$COLD_ISCH, na.rm = TRUE)
+liv_don_rej <- pat_rej_demo_table |> 
+  filter(DON_TY == "L") |> 
+  nrow()
+
+mean_rej <- c(
+  age_rej_med,           # 1  Recipient Age
+  gen_rej_count,         # 2  Male Gender
+  NA,                    # 3  "Race, n(%)" header
+  race_wt_rej_count,     # 4  White
+  race_bl_rej_count,     # 5  Black
+  race_his_rej_count,    # 6  Hispanic
+  race_asia_rej_count,   # 7  Asian 
+  race_other_rej_count,  # 8  Other/Multiracial
+  meld_rej_med,          # 9  MELD
+  NA,                    # 10 "Organ Transplanted, n(%)" header
+  txliv_rej_count,       # 11 Liver
+  txkid_rej_count,       # 12 Liver and Kidney
+  txhrt_rej_count,       # 13 Liver and Heart
+  txlng_rej_count,       # 14 Liver and Lung
+  txpan_rej_count,       # 15 Liver and Pancreas
+  liv_don_rej,           # 16 Living Donor 
+  cold_isch_time_rej,    # 17 Cold Ischemic Time 
+  prev_liver_rej,      # 18 Previous Liver Transplants
+  NA,                    # 19 "Previous Any Transplants, n(%)" header
+  prev_tx_0_rej_count,  # 20 0
+  prev_tx_1_rej_count,   # 21 1
+  prev_tx_2_rej_count,   # 22 2
+  prev_tx_3_rej_count    # 23 3
+)
+
+#--------------------------------------
+#control
+
+age_ctrl_med <- median(pat_ctrl_demo_table$AGE, na.rm = TRUE)
+gen_ctrl_count <- pat_ctrl_demo_table |> # number of dudes
+  filter(GENDER == "M") |> 
+  nrow()
+race_wt_ctrl_count <- pat_ctrl_demo_table |> 
+  filter(ETHCAT == "1") |> 
+  nrow()
+race_bl_ctrl_count <- pat_ctrl_demo_table |> 
+  filter(ETHCAT == "2") |> 
+  nrow()
+race_his_ctrl_count <- pat_ctrl_demo_table |> 
+  filter(ETHCAT == "4") |> 
+  nrow()
+race_asia_ctrl_count <- pat_ctrl_demo_table |> 
+  filter(ETHCAT == "5") |> 
+  nrow()
+race_other_ctrl_count <- nrow(pat_ctrl_demo_table) - sum(race_wt_ctrl_count, race_bl_ctrl_count, race_his_ctrl_count, race_asia_ctrl_count)
+meld_ctrl_med <- median(pat_ctrl_demo_table$MELD_PELD_LAB_SCORE, na.rm = TRUE)
+txkid_ctrl_count <- pat_ctrl_demo_table |> 
+  filter(TXKID %in% c("L","R","E")) |> 
+  nrow()
+txhrt_ctrl_count <- pat_ctrl_demo_table |> 
+  filter(TXHRT  == "Y") |> 
+  nrow()
+txlng_ctrl_count <- pat_ctrl_demo_table |> 
+  filter(TXLNG %in% c("L","R","E")) |> 
+  nrow()
+txpan_ctrl_count <- pat_ctrl_demo_table |> 
+  filter(TXPAN %in% c("L","R","E")) |> 
+  nrow()
+txliv_ctrl_count <- nrow(pat_ctrl_demo_table) - sum(txkid_ctrl_count,txhrt_ctrl_count,txlng_ctrl_count,txpan_ctrl_count)
+prev_liver_ctrl <- pat_ctrl_demo_table |> 
+  filter(PREV_TX == "Y") |> 
+  nrow()
+prev_tx_1_ctrl_count <- pat_ctrl_demo_table |> 
+  filter(PREV_TX_ANY_N == "1") |> 
+  nrow()
+prev_tx_2_ctrl_count <- pat_ctrl_demo_table |> 
+  filter(PREV_TX_ANY_N == "2") |> 
+  nrow()
+prev_tx_3_ctrl_count <- pat_ctrl_demo_table |> 
+  filter(PREV_TX_ANY_N == "3") |> 
+  nrow()
+prev_tx_0_ctrl_count <- sum(is.na(pat_ctrl_demo_table$PREV_TX_ANY_N))
+cold_isch_time_ctrl <- median(pat_ctrl_demo_table$COLD_ISCH, na.rm = TRUE)
+liv_don_ctrl <- pat_ctrl_demo_table |> 
+  filter(DON_TY == "L") |> 
+  nrow()
+
+mean_ctrl <- c(
+  age_ctrl_med,           # 1  Recipient Age
+  gen_ctrl_count,         # 2  Male Gender
+  NA,                     # 3  "Race, n(%)" header
+  race_wt_ctrl_count,     # 4  White
+  race_bl_ctrl_count,     # 5  Black
+  race_his_ctrl_count,    # 6  Hispanic
+  race_asia_ctrl_count,   # 7  Asian 
+  race_other_ctrl_count,  # 8  Other/Multiracial
+  meld_ctrl_med,          # 9  MELD
+  NA,                     # 10 "Organ Transplanted, n(%)" header
+  txliv_ctrl_count,       # 11 Liver
+  txkid_ctrl_count,       # 12 Liver and Kidney
+  txhrt_ctrl_count,       # 13 Liver and Heart
+  txlng_ctrl_count,       # 14 Liver and Lung
+  txpan_ctrl_count,       # 15 Liver and Pancreas
+  liv_don_ctrl,           # 16 Living Donor 
+  cold_isch_time_ctrl,    # 17 Cold Ischemic Time 
+  prev_liver_ctrl,  # 18 Previous Liver Transplants
+  NA,                     # 19 "Previous Any Transplants, n(%)" header
+  prev_tx_0_ctrl_count,  # 20 0
+  prev_tx_1_ctrl_count,   # 21 1
+  prev_tx_2_ctrl_count,   # 22 2
+  prev_tx_3_ctrl_count    # 23 3
+)
+
+#----------------------------------------------------------------------
+# IQR + Percents for demographic data
+
+# Rejections
+num_rej <- nrow(pat_rej_demo_table)
+
+age_rej_q1  <- quantile(pat_rej_demo_table$AGE, 0.25, na.rm = TRUE)
+age_rej_q3  <- quantile(pat_rej_demo_table$AGE, 0.75, na.rm = TRUE)
+age_rej_qstring <- paste0(" (", age_rej_q1, "–", age_rej_q3, ")")
+
+gen_rej_perc <- gen_rej_count/num_rej
+
+race_wt_rej_perc <- 100*race_wt_rej_count/num_rej
+race_bl_rej_perc <- 100*race_bl_rej_count/num_rej
+race_his_rej_perc <- 100*race_his_rej_count/num_rej
+race_asia_rej_perc <- 100*race_asia_rej_count/num_rej
+race_other_rej_perc <- 100*race_other_rej_count/num_rej
+
+meld_rej_q1 <- quantile(pat_rej_demo_table$MELD_PELD_LAB_SCORE, 0.25, na.rm = TRUE)
+meld_rej_q3  <- quantile(pat_rej_demo_table$MELD_PELD_LAB_SCORE, 0.75, na.rm = TRUE)
+meld_rej_qstring <- paste0( " (", meld_rej_q1, "–", meld_rej_q3, ")")
+
+txliv_rej_perc <- 100*txliv_rej_count/num_rej
+txkid_rej_perc <- 100*txkid_rej_count/num_rej
+txhrt_rej_perc <- 100*txhrt_rej_count/num_rej
+txlng_rej_perc <- 100*txlng_rej_count/num_rej
+txpan_rej_perc <- 100*txpan_rej_count/num_rej
+
+liv_don_rej_perc <- liv_don_rej/num_rej
+
+cold_isch_time_rej_q1 <- quantile(pat_rej_demo_table$COLD_ISCH, 0.25, na.rm = TRUE)
+cold_isch_time_rej_q3 <- quantile(pat_rej_demo_table$COLD_ISCH, 0.75, na.rm = TRUE)
+isch_rej_qstring <- paste0(" (", cold_isch_time_rej_q1, "–", cold_isch_time_rej_q3, ")")
+
+prev_liv_rej_perc <- 100*prev_liver_rej/num_rej
+
+prev_tx_0_rej_perc <- 100*prev_tx_0_rej_count/num_rej
+prev_tx_1_rej_perc <- 100*prev_tx_1_rej_count/num_rej
+prev_tx_2_rej_perc <- 100*prev_tx_2_rej_count/num_rej
+prev_tx_3_rej_perc <- 100*prev_tx_3_rej_count/num_rej
+
+std_rej <- data.frame(
+  std_rej = c(
+    age_rej_qstring,       # 1  Recipient Age IQR
+    gen_rej_perc,          # 2  Male Gender %
+    NA,                    # 3  Race header
+    race_wt_rej_perc,      # 4  White %
+    race_bl_rej_perc,      # 5  Black %
+    race_his_rej_perc,     # 6  Hispanic %
+    race_asia_rej_perc,    # 7  Asian %
+    race_other_rej_perc,   # 8  Other/Multiracial %
+    meld_rej_qstring,      # 9  MELD IQR
+    NA,                    # 10 Organ Transplanted header
+    txliv_rej_perc,        # 11 Liver %
+    txkid_rej_perc,        # 12 Liver and Kidney %
+    txhrt_rej_perc,        # 13 Liver and Heart %
+    txlng_rej_perc,        # 14 Liver and Lung %
+    txpan_rej_perc,        # 15 Liver and Pancreas %
+    liv_don_rej_perc,      # 16 Living Donor %
+    isch_rej_qstring,      # 17 Cold Ischemic Time IQR
+    prev_liv_rej_perc,     # 18 Previous Liver Transplants %
+    NA,                    # 19 Previous Any Transplants header
+    prev_tx_0_rej_perc,    # 20 0 %
+    prev_tx_1_rej_perc,    # 21 1 %
+    prev_tx_2_rej_perc,    # 22 2 %
+    prev_tx_3_rej_perc     # 23 3 %
+  )
+)
+
+# Controls
+num_ctrl <- nrow(pat_ctrl_demo_table)
+
+age_ctrl_q1  <- quantile(pat_ctrl_demo_table$AGE, 0.25, na.rm = TRUE)
+age_ctrl_q3  <- quantile(pat_ctrl_demo_table$AGE, 0.75, na.rm = TRUE)
+age_ctrl_qstring <- paste0(" (", age_ctrl_q1, "–", age_ctrl_q3, ")")
+
+gen_ctrl_perc <- gen_ctrl_count/num_ctrl
+
+race_wt_ctrl_perc <- 100*race_wt_ctrl_count/num_ctrl
+race_bl_ctrl_perc <- 100*race_bl_ctrl_count/num_ctrl
+race_his_ctrl_perc <- 100*race_his_ctrl_count/num_ctrl
+race_asia_ctrl_perc <- 100*race_asia_ctrl_count/num_ctrl
+race_other_ctrl_perc <- 100*race_other_ctrl_count/num_ctrl
+
+meld_ctrl_q1 <- quantile(pat_ctrl_demo_table$MELD_PELD_LAB_SCORE, 0.25, na.rm = TRUE)
+meld_ctrl_q3  <- quantile(pat_ctrl_demo_table$MELD_PELD_LAB_SCORE, 0.75, na.rm = TRUE)
+meld_ctrl_qstring <- paste0( " (", meld_ctrl_q1, "–", meld_ctrl_q3, ")")
+
+txliv_ctrl_perc <- 100*txliv_ctrl_count/num_ctrl
+txkid_ctrl_perc <- 100*txkid_ctrl_count/num_ctrl
+txhrt_ctrl_perc <- 100*txhrt_ctrl_count/num_ctrl
+txlng_ctrl_perc <- 100*txlng_ctrl_count/num_ctrl
+txpan_ctrl_perc <- 100*txpan_ctrl_count/num_ctrl
+
+liv_don_ctrl_perc <- liv_don_ctrl/num_ctrl
+
+cold_isch_time_ctrl_q1 <- quantile(pat_ctrl_demo_table$COLD_ISCH, 0.25, na.rm = TRUE)
+cold_isch_time_ctrl_q3 <- quantile(pat_ctrl_demo_table$COLD_ISCH, 0.75, na.rm = TRUE)
+isch_ctrl_qstring <- paste0(" (", cold_isch_time_ctrl_q1, "–", cold_isch_time_ctrl_q3, ")")
+
+prev_liv_ctrl_perc <- 100*prev_liver_ctrl/num_ctrl
+
+prev_tx_0_ctrl_perc <- 100*prev_tx_0_ctrl_count/num_ctrl
+prev_tx_1_ctrl_perc <- 100*prev_tx_1_ctrl_count/num_ctrl
+prev_tx_2_ctrl_perc <- 100*prev_tx_2_ctrl_count/num_ctrl
+prev_tx_3_ctrl_perc <- 100*prev_tx_3_ctrl_count/num_ctrl
+
+std_ctrl <- data.frame(
+  std_ctrl = c(
+    age_ctrl_qstring,       # 1  Recipient Age IQR
+    gen_ctrl_perc,          # 2  Male Gender %
+    NA,                     # 3  Race header
+    race_wt_ctrl_perc,      # 4  White %
+    race_bl_ctrl_perc,      # 5  Black %
+    race_his_ctrl_perc,     # 6  Hispanic %
+    race_asia_ctrl_perc,    # 7  Asian %
+    race_other_ctrl_perc,   # 8  Other/Multiracial %
+    meld_ctrl_qstring,      # 9  MELD IQR
+    NA,                     # 10 Organ Transplanted header
+    txliv_ctrl_perc,        # 11 Liver %
+    txkid_ctrl_perc,        # 12 Liver and Kidney %
+    txhrt_ctrl_perc,        # 13 Liver and Heart %
+    txlng_ctrl_perc,        # 14 Liver and Lung %
+    txpan_ctrl_perc,        # 15 Liver and Pancreas %
+    liv_don_ctrl_perc,      # 16 Living Donor %
+    isch_ctrl_qstring,      # 17 Cold Ischemic Time IQR
+    prev_liv_ctrl_perc,     # 18 Previous Liver Transplants %
+    NA,                     # 19 Previous Any Transplants header
+    prev_tx_0_ctrl_perc,    # 20 0 %
+    prev_tx_1_ctrl_perc,    # 21 1 %
+    prev_tx_2_ctrl_perc,    # 22 2 %
+    prev_tx_3_ctrl_perc     # 23 3 %
+  )
 )
 
 
+#------------------------------------------------------------------------
+# Final Table once I upload the HLA and PRA
+# demo_label2 = c(
+#   "Recipient Age (y), median(IQR)",
+#   "Male Gender, n(%)",
+#   "Race, n(%)",
+#   "White", "Black", "Hispanic", "Asian", "Other/Multiracial",
+#   "MELD, median(IQR)",
+#   "Organ Transplanted, n(%)",
+#   "Liver", "Liver and Kidney", "Liver and Heart", "Liver and Lung", "Liver and Pancreas",
+#   "Living Donor, n(%)",
+#   "Cold Ischemic Time (hr), median(IQR)",
+#   "Previous Liver Transplants, n(%)",
+#   "0", "1", "2", "3",
+#   "Previous Any Transplants, n(%)",
+#   "0", "1", "2", "3",
+#   "Peak PRA, n(%)",
+#   "0%", "1%-20%", "21%-80%", "81%-100%",
+#   "HLA Mismatch Level, n(%)",
+#   "0", "1", "2", "3", "4", "5", "6",
+#   "L-EPTS at Graft Failure, n(%)",
+#   "0%-10%", "11%-20%", "21%-30%", "31%-40%", "41%-50%",
+#   "51%-60%", "61%-70%", "71%-80%", "81%-90%", "91%-100%",
+#   "Delayed Graft Function, n(%)"
+# )
 
-# BUILD THE GT TABLE
-# ------------------------------------------------------------
-gt_tbl <- pat_rej_demo_table %>%
-  select(display_label, value, section) %>%
-  gt() %>%
-  
-  # column header (bold, two lines, italic n)
-  cols_label(
-    display_label = "",
-    value = html(paste0(
-      "<span style='font-weight:bold;'>", header_title,
-      " (<span style='font-style:italic;'>n</span> = ", header_n, ")</span>"
-    ))
-  ) %>%
-  
-  # hide helper column
-  cols_hide(section) %>%
-  
-  # left-align everything, generous column widths
-  cols_align(align = "left", columns = everything()) %>%
-  cols_width(
-    display_label ~ px(320),
-    value ~ px(220)
-  ) %>%
-  
-  # thick rule under header, like the reference image
-  tab_style(
-    style = cell_borders(sides = "bottom", color = "black", weight = px(2)),
-    locations = cells_column_labels(everything())
-  ) %>%
-  
-  # remove default vertical gridlines / borders between columns
-  tab_style(
-    style = cell_borders(sides = c("left", "right"), color = "white", weight = px(0)),
-    locations = cells_body(columns = everything())
-  ) %>%
-  
-  # bold the section header rows (e.g., "Race, n(%)")
-  tab_style(
-    style = cell_text(weight = "bold"),
-    locations = cells_body(
-      columns = display_label,
-      rows = section == TRUE
-    )
-  ) %>%
-  
-  # alternating row shading (banded by physical row, continuous down the table)
-  tab_style(
-    style = cell_fill(color = "#e6e6e6"),
-    locations = cells_body(rows = seq(1, nrow(tbl_data), 2))
-  ) %>%
-  tab_style(
-    style = cell_fill(color = "white"),
-    locations = cells_body(rows = seq(2, nrow(tbl_data), 2))
-  ) %>%
-  
-  # remove row striping borders, keep clean look
-  tab_options(
-    table.border.top.color = "white",
-    table.border.bottom.color = "black",
-    table.border.bottom.width = px(2),
-    column_labels.border.top.color = "white",
-    data_row.padding = px(6),
-    table.font.size = px(15),
-    column_labels.font.size = px(15)
-  ) %>%
-  
-  # font
-  opt_table_font(font = "Georgia")
 
-# ------------------------------------------------------------
-# SAVE / DISPLAY
-# ------------------------------------------------------------
-gt_tbl
+
+
+# ------------------------------------------------------------------------
+# Tibble Demographic Data 
+
+tbl_data <- tibble(
+  demo_label1,
+  ref_value1,
+  mean_rej,
+  std_rej,
+  mean_ctrl,
+  std_ctrl
+)
+
+#-------------------------------------------------------------------------------
+# claude going crazy - nah it fucked it up; im just hard coding this shit
+
+# --- Frequency / Mean calculator ---
+# calc_stat <- function(raw_data, label, ref_col, rej_stat_value) {
+#   
+#   grp <- raw_data %>% filter(REJ_STAT == rej_stat_value)
+#   if (nrow(grp) == 0) return(NA_real_)
+#   
+#   # Special case: "Liver" alone = not flagged with any other organ combo
+#   if (label == "Liver") {
+#     other_organ <- with(grp, TXKID == "Y" | TXHRT == "Y" | TXLNG == "Y" | TXPAN == "Y")
+#     other_organ[is.na(other_organ)] <- FALSE  # blank = not that organ combo
+#     return(mean(!other_organ) * 100)
+#   }
+#   
+#   # Skip section header rows (blank ref_value1)
+#   if (is.na(ref_col) || ref_col == "") return(NA_real_)
+#   
+#   col_data <- grp[[ref_col]]
+#   
+#   # NA in PREV_TX_ANY_N means "0 previous transplants"
+#   if (ref_col == "PREV_TX_ANY_N") {
+#     col_data <- ifelse(is.na(col_data), 0, col_data)
+#   }
+#   
+#   case_when(
+#     label == "Recipient Age (y), median(IQR)"       ~ mean(col_data, na.rm = TRUE),
+#     label == "MELD, median(IQR)"                     ~ mean(col_data, na.rm = TRUE),
+#     label == "Cold Ischemic Time (hr), median(IQR)"  ~ mean(col_data, na.rm = TRUE),
+#     label == "Male Gender, n(%)"    ~ mean(col_data == "M", na.rm = TRUE) * 100,
+#     label == "White"                ~ mean(col_data == 1, na.rm = TRUE) * 100,
+#     label == "Black"                ~ mean(col_data == 2, na.rm = TRUE) * 100,
+#     label == "Hispanic"             ~ mean(col_data == 4, na.rm = TRUE) * 100,
+#     label == "Asian"                ~ mean(col_data == 5, na.rm = TRUE) * 100,
+#     label == "Other/Multiracial"    ~ mean(col_data %in% c(6, 7, 9, 998), na.rm = TRUE) * 100,
+#     label == "Liver and Kidney"     ~ mean(col_data == "Y", na.rm = TRUE) * 100,
+#     label == "Liver and Heart"      ~ mean(col_data == "Y", na.rm = TRUE) * 100,
+#     label == "Liver and Lung"       ~ mean(col_data == "Y", na.rm = TRUE) * 100,
+#     label == "Liver and Pancreas"   ~ mean(col_data == "Y", na.rm = TRUE) * 100,
+#     label == "Living Donor, n(%)"   ~ mean(col_data == "L", na.rm = TRUE) * 100,
+#     label %in% c("0", "1", "2", "3") & ref_col == "PREV_TX" ~ mean(col_data == label, na.rm = TRUE) * 100,
+#     label %in% c("0", "1", "2", "3") & ref_col == "PREV_TX_ANY_N" ~ mean(col_data == as.numeric(label), na.rm = TRUE) * 100,
+#     TRUE ~ NA_real_
+#   )
+# }
+# 
+# # --- Standard deviation calculator (continuous rows only) ---
+# calc_std <- function(raw_data, label, ref_col, rej_stat_value) {
+#   
+#   # Only applies to continuous variables
+#   continuous_labels <- c(
+#     "Recipient Age (y), median(IQR)",
+#     "MELD, median(IQR)",
+#     "Cold Ischemic Time (hr), median(IQR)"
+#   )
+#   if (!(label %in% continuous_labels)) return(NA_real_)
+#   
+#   grp <- raw_data %>% filter(REJ_STAT == rej_stat_value)
+#   if (nrow(grp) == 0) return(NA_real_)
+#   
+#   col_data <- grp[[ref_col]]
+#   sd(col_data, na.rm = TRUE)
+# }
+# 
+# # --- Apply across every row of tbl_data ---
+# tbl_data <- tbl_data %>%
+#   rowwise() %>%
+#   mutate(
+#     mean_rej  = calc_stat(pat_all_demo_table, demo_label1, ref_value1, rej_stat_value = 0),
+#     mean_ctrl = calc_stat(pat_all_demo_table, demo_label1, ref_value1, rej_stat_value = 1),
+#     std_rej   = calc_std(pat_all_demo_table, demo_label1, ref_value1, rej_stat_value = 0),
+#     std_ctrl  = calc_std(pat_all_demo_table, demo_label1, ref_value1, rej_stat_value = 1)
+#   ) %>%
+#   ungroup()
+# 
+# tbl_data
+#--------------------------------------------------------------------------------------
 
 
 #__________________________________________________________________________________
@@ -437,7 +787,7 @@ freq_long <- freq_drug_fol_antirej_indiv %>%
 # 
 # ggsave("C:/Users/lukas/Documents/Med School/AOT/R/Output/Graphs/immuno_induction_rej_frequency_bar_plot.png", width = 8, height = 6)
 # 
-# # _________________________________________________________________________________
+#_________________________________________________________________________________
 # Tables
 
 #---------------------------------------------------------------------------------
