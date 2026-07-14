@@ -38,8 +38,8 @@ sapply(data, function(x) attr(x, "label"))
 
 # --- Optional: save as CSV or RDS ---
 # Windows
-# write.csv(data_filtered, "C:/Users/lukas/Documents/Med School/AOT/R/Output/liver-immuno-follow-up_date-filtered.csv", row.names = FALSE)
+# write.csv(data, "C:/Users/lukas/Documents/Med School/AOT/R/Output/liver-immuno-follow-up_date-filtered.csv", row.names = FALSE)
 # saveRDS(data, "output.rds")
 
 # Mac
-write.csv(data_filtered, "~/Local Documents/AOT/Analysis/FilteredData/liver_addtl_hla.csv", row.names = FALSE)
+write.csv(data, "~/Local Documents/AOT/Analysis/FilteredData/liver_addtl_hla.csv", row.names = FALSE)
