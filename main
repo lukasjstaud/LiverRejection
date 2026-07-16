@@ -129,7 +129,7 @@ df_hla_fil <- df_hla %>%
 df_pra_fil <- df_pra %>% 
   filter(TRR_ID_CODE %in% tx_ids_to_keep)
 
-# need to load living donor data
+# still need to load living donor data
 
 # ______________________________________________________________________________
 # Parsing liver_data filtered into respective groups: rejection vs no rejection - currently not in use
@@ -207,8 +207,6 @@ df_immuno_fol <- df_immuno_fol %>%
 
 # store data so that I dont have to keep calculating it
 df_immuno_fol_calc <- df_immuno_fol
-
-
 
 #-----------------------------------------------------------------------------------------------------
 # Actually counting number of instances within set time
@@ -304,19 +302,66 @@ pat_ctrl_array <- df_immuno_fol_calc %>%
 
 #-----------------------------------------------------------------------
 # Processing HLA Data
-# need karhadkar help bc i dont think there is any :(
+# ============================================================
+# HLA MISMATCH CALCULATION (A, B, DR loci) — 0 to 6 scale
+# Assumes df is your data frame with the raw HLA typing columns
+# ============================================================
+
+# --- Step 1: Use retyped donor HLA if available, else original typing ---
+df_hla_fil <- df_hla_fil %>%
+  mutate(
+    DA1_final  = coalesce(RT_DA1, DA1),
+    DA2_final  = coalesce(RT_DA2, DA2),
+    DB1_final  = coalesce(RT_DB1, DB1),
+    DB2_final  = coalesce(RT_DB2, DB2),
+    DDR1_final = coalesce(RT_DDR1, DDR1),
+    DDR2_final = coalesce(RT_DDR2, DDR2)
+  )
+
+# --- Step 2: Function to calculate mismatch at a single locus ---
+locus_mismatch <- function(r1, r2, d1, d2) {
+  # Returns NA if any of the 4 alleles are missing
+  if (any(is.na(c(r1, r2, d1, d2)))) return(NA_integer_)
+  rec_alleles <- c(r1, r2)
+  don_alleles <- c(d1, d2)
+  sum(!don_alleles %in% rec_alleles)
+}
+
+# --- Step 3: Apply row-wise to compute mismatch per locus + total ---
+df_hla_fil <- df_hla_fil %>%
+  rowwise() %>%
+  mutate(
+    MM_A     = locus_mismatch(RA1, RA2, DA1_final, DA2_final),
+    MM_B     = locus_mismatch(RB1, RB2, DB1_final, DB2_final),
+    MM_DR    = locus_mismatch(RDR1, RDR2, DDR1_final, DDR2_final),
+    MM_TOTAL = if_else(
+      any(is.na(c(MM_A, MM_B, MM_DR))),
+      NA_integer_,
+      MM_A + MM_B + MM_DR
+    )
+  ) %>%
+  ungroup() %>% 
+  select(TRR_ID_CODE, MM_A, MM_B, MM_DR, MM_TOTAL)
+
 
 
 #-----------------------------------------------------------------------
 # Processing PRA Data
-
+# need karhadkar help bc i dont think there is any :(
 
 #-----------------------------------------------------------------------
 # Processing Deceased Donor Data
 # want to extract time to transplant, perfusion(y/n), age of donor
 
+df_pra_invest <- df_pra %>% 
+  left_join(df_liver_data %>% 
+              select(TRR_ID_CODE, TX_DATE), by = "TRR_ID_CODE") %>% 
+  select(TRR_ID_CODE,PRA1,PRA2,TX_DATE)
+            
 
 #--------------------------------
+# Processing Living Donor Data
+# FYI data still not loaded as of 16JUL26
 
 
 # ____________________________________________________________________________________
