@@ -56,25 +56,27 @@ if (!requireNamespace("tibble", quietly = TRUE)) {
   install.packages("tibble")
 }
 library(tibble)
-
+#-----------------
 # ______________________________________________________________________________
 # Reading data (adjust path and file type as needed)
 
+#------------------------
 # Mac loading
-df_immuno_fol_read <- read.csv("~/Local Documents/AOT/Analysis/FilteredData/liver-immuno-follow-up_date-filtered.csv", stringsAsFactors = FALSE)
-df_liver_data <- read.csv("~/Local Documents/AOT/Analysis/FilteredData/liver-data_date-filtered.csv", stringsAsFactors = FALSE)
+df_immuno_fol_read <- read.csv("~/Local Documents/AOT/Analysis/FilteredData/liver_immuno_followup.csv", stringsAsFactors = FALSE)
+df_liver_data <- read.csv("~/Local Documents/AOT/Analysis/FilteredData/liver_data.csv", stringsAsFactors = FALSE)
 df_immuno_induc <- read.csv("~/Local Documents/AOT/Analysis/FilteredData/liver-immuno-discharge_unfilter.csv")
 df_hla <- read.csv("~/Local Documents/AOT/Analysis/FilteredData/liver_addtl_hla.csv")
 df_pra <- read.csv("~/Local Documents/AOT/Analysis/FilteredData/liver_pra_crossmatch_data.csv")
 df_deceased_don <- read.csv("~/Local Documents/AOT/Analysis/FilteredData/deceased_donor_data.csv")
-df_liver_fol <- read.csv("~/Local Documents/AOT/Analysis/FilteredData/liver-follow-up_date-filtered.csv")
-
+df_liver_fol <- read.csv("~/Local Documents/AOT/Analysis/FilteredData/liver_followup_data.csv")
+# need to load living donor
+#---------------------------------
 # Window loading
 #df_immuno_fol_read <- read.csv("C:/Users/lukas/Documents/Med School/AOT/R/Output/Filtered Data by Date/liver-immuno-follow-up_date-filtered.csv", stringsAsFactors = FALSE)
 #df_liver_data <- read.csv("C:/Users/lukas/Documents/Med School/AOT/R/Output/Filtered Data by Date/liver-data_date-filtered.csv", stringsAsFactors = FALSE)
 #df_immuno_induc <- read.csv("C:/Users/lukas/Documents/Med School/AOT/R/Output/Filtered Data by Date/liver-immuno-discharge_unfilter.csv")
 
-df_immuno_fol <- df_immuno_fol_read
+#-----------------------------------------------
 # _____________________________________________________________________________
 # creating filters of index data
 # NOTE: loaded data is already filtered by 10 year date range at this point
@@ -86,25 +88,51 @@ col_age_range  <- "AGE"     # <- change to your column name
 age_min <- 18            # <- change to the value you want 
 age_max <- 80         # <- change to the value you want
 
-#print(df_liver_data)
-
 df_liver_data$AGE <- as.numeric(df_liver_data$AGE)
-
-#print(df_liver_data)
 
 df_liver_data_filtered <- df_liver_data %>%
   filter(.data[[col_age_range]] >= age_min & .data[[col_age_range]] <= age_max)  # filters the age
 
-#print(df_liver_data_filtered)
-
 # ---------------------------------------------------------------
-#  Filter2 - TBD
+#  Filter2 - Data Dates: Filter out Patients w. TX before 03APR2015 and after 03APR2025
 # 
+FILTER_DATE_COL_FOL <- "PX_STAT_DATE_FOL" # column for follow up data
+FILTER_DATE_COL_TX <- "TX_DATE"
+
+tx_start_date <- "2015-04-03"
+tx_end_date <- "2025-04-03"
+
+df_liver_data_filtered <- df_liver_data_filtered %>%
+  filter(.data[[FILTER_DATE_COL_TX]] >= tx_start_date & .data[[FILTER_DATE_COL_TX]] <= tx_end_date)
+
+#--------------------------------------------------------------
+# Filter* - Filtering of dfs base on the above criteria
+
+tx_ids_to_keep <- df_liver_data_filtered$TRR_ID_CODE
+dnr_ids_to_keep <- df_liver_data_filtered$DONOR_ID
+
+df_immuno_induc <- df_immuno_induc %>% 
+  filter(TRR_ID_CODE %in% tx_ids_to_keep)
+
+df_liver_fol_fil <- df_liver_fol %>% 
+  filter(TRR_ID_CODE %in% tx_ids_to_keep)
+
+df_immuno_fol <- df_immuno_fol_read %>% 
+  filter(TRR_ID_CODE %in% tx_ids_to_keep)
+
+df_deceased_don_fil <- df_deceased_don%>% 
+  filter(DONOR_ID %in% dnr_ids_to_keep)
+
+df_hla_fil <- df_hla %>% 
+  filter(TRR_ID_CODE %in% tx_ids_to_keep)
+  
+df_pra_fil <- df_pra %>% 
+  filter(TRR_ID_CODE %in% tx_ids_to_keep)
+
+# need to load living donor data
 
 # ______________________________________________________________________________
 # Parsing liver_data filtered into respective groups: rejection vs no rejection - currently not in use
-
-
 
 # ______________________________________________________________________________
 # Merging look up table with liver_date to compare No Rejection, 6 month, 12 month 
@@ -128,9 +156,6 @@ df_immuno_fol <- df_immuno_fol %>% # telling R to treat columns as a date and so
   filter(abs(FOL_DATE_DAYS_DELTA) < 365.24219) %>% # filters for follow ups + 1 year
   arrange(PX_STAT_DATE_FOL) # orders based on follow up date
 
-
-#print(df_immuno_fol)
-
 #_________________________________________________________________________________
 # Counting Anti-rejection therapy at set times
 # 
@@ -147,6 +172,22 @@ RX_COLS <- c("ALG", "CYCLOSPORIN", "OKT4", "CYTOXAN", "METHOTREXATE", "BREQUINAR
 COL_TAIL <- "_ANTIREJ" # this needs to change based on if we are looking at induction, maintenance, ANTI-reject
 
 COLS_TO_CHECK <- paste0(RX_COLS, COL_TAIL)
+
+# -------------------------------------------------------------
+# Collecting TRR_CODE of patients that used Rituxan in anti-rejection therapy
+
+# During in patient stay
+rituxan_id_disc_vect <- df_immuno_induc %>%
+  filter(RITUXAN_ANTIREJ == 1) %>%
+  pull(TRR_ID_CODE)
+
+# At follow up filtered by patients that had Rituxan administered during inpatient sp tx
+rituxan_id_fol_vect <- df_immuno_fol %>% 
+  filter(RITUXAN_ANTIREJ == 1) %>% 
+  filter(!(TRR_ID_CODE %in% rituxan_id_disc_vect)) %>% 
+  pull(TRR_ID_CODE)
+  
+rituxan_id_all_vect <- c(rituxan_id_disc_vect, rituxan_id_fol_vect)
 
 #--------------------------------------------------------------------------------------------------
 # Creating running counts of follow up treatments for anti-rejection therapy and checking for combo therapy
@@ -167,7 +208,7 @@ df_immuno_fol <- df_immuno_fol %>%
 # store data so that I dont have to keep calculating it
 df_immuno_fol_calc <- df_immuno_fol
 
-#print(df_immuno_fol)
+
 
 #-----------------------------------------------------------------------------------------------------
 # Actually counting number of instances within set time
@@ -189,22 +230,36 @@ freq_drug_fol_antirej_indiv <- data.frame(
 # * will need to combine in patient and follow up data
 # GENERICMMF, GENERICTACROLIMUS, ASTAGRAFXL, NULOJIX are a maintenance column ONLY
 
+# df_immuno_induc <- df_immuno_induc |> 
+#   semi_join(df_liver_data_filtered, by = "TRR_ID_CODE") |> # I'm bad at coding
+#   # combo therapy rx'ed?
+#   mutate(NUM_ANTI_REJ_RXED = 0L) |> 
+#   mutate(NUM_ANTI_REJ_RXED = rowSums(across(all_of(COLS_TO_CHECK)) == 1, na.rm = TRUE)) |> 
+#   # add date of tx and discharge date for my sake
+#   left_join(df_liver_data_filtered %>% 
+#               select(TRR_ID_CODE, DEATH_DATE), by = "TRR_ID_CODE") |> 
+#   arrange(TX_DATE) |> # orders based on follow up date
+#   # calculating days hospitalized sp transplant
+#   mutate(DAYS_HOSP_SP_TX = 0L) |> 
+#   mutate(
+#     DISCHARGE_DATE = as.Date(DISCHARGE_DATE),
+#     TX_DATE = as.Date(TX_DATE)
+#   ) %>% # sets csv values in these columns as date data types
+#   mutate(DAYS_HOSP_SP_TX = time_length(interval(TX_DATE, DISCHARGE_DATE), "days")) # new column with post op days
+
 df_immuno_induc <- df_immuno_induc |> 
-  semi_join(df_liver_data_filtered, by = "TRR_ID_CODE") |> # I'm bad at coding
-  # combo therapy rx'ed?
+  semi_join(df_liver_data_filtered, by = "TRR_ID_CODE") |> 
   mutate(NUM_ANTI_REJ_RXED = 0L) |> 
   mutate(NUM_ANTI_REJ_RXED = rowSums(across(all_of(COLS_TO_CHECK)) == 1, na.rm = TRUE)) |> 
-  # add date of tx and discharge date for my sake
   left_join(df_liver_data_filtered %>% 
-              select(TRR_ID_CODE, TX_DATE, DISCHARGE_DATE, TX_DATE), by = "TRR_ID_CODE") |> 
-  arrange(TX_DATE) |> # orders based on follow up date
-  # calculating days hospitalized sp transplant
+              select(TRR_ID_CODE, TX_DATE, DISCHARGE_DATE, DEATH_DATE), by = "TRR_ID_CODE") |> 
+  arrange(TX_DATE) |> 
   mutate(DAYS_HOSP_SP_TX = 0L) |> 
   mutate(
     DISCHARGE_DATE = as.Date(DISCHARGE_DATE),
     TX_DATE = as.Date(TX_DATE)
-  ) %>% # sets csv values in these columns as date data types
-  mutate(DAYS_HOSP_SP_TX = time_length(interval(TX_DATE, DISCHARGE_DATE), "days")) # new column with post op days
+  ) %>%
+  mutate(DAYS_HOSP_SP_TX = time_length(interval(TX_DATE, DISCHARGE_DATE), "days"))
 
 #print(df_immuno_induc)
 
@@ -217,11 +272,14 @@ df_immuno_induc <- df_immuno_induc |>
 # NOTE: code as written 13JUL26 does NOT combine discharge and follow up data
 
 # Isolating Patients with first instance of rejection in 1 year
-pat_rej_array_fol <- df_immuno_fol_calc |> 
-  filter(REJECT_RUNNING_COUNT == 1) %>%
-  select(TRR_ID_CODE, TRR_FOL_ID_CODE, TX_DATE, DISCHARGE_DATE, PX_STAT_DATE_FOL, FOL_DATE_DAYS_DELTA, REJECT_RUNNING_COUNT, NUM_ANTI_REJ_RXED) %>%  
-  mutate(DISCHARGE_DATE = as.Date(DISCHARGE_DATE)) %>% 
-  filter(NUM_ANTI_REJ_RXED >= 1) # this filters out follow up visits without anti-rej therapy
+pat_rej_array_fol <- df_immuno_fol_calc %>%
+  filter(REJECT_RUNNING_COUNT == 1, NUM_ANTI_REJ_RXED >= 1) %>%
+  group_by(TRR_ID_CODE) %>%
+  slice_min(order_by = PX_STAT_DATE_FOL, n = 1, with_ties = FALSE) %>%  # earliest qualifying visit only
+  ungroup() %>%
+  select(TRR_ID_CODE, TRR_FOL_ID_CODE, TX_DATE, DISCHARGE_DATE, PX_STAT_DATE_FOL,
+         FOL_DATE_DAYS_DELTA, REJECT_RUNNING_COUNT, NUM_ANTI_REJ_RXED) %>%
+  mutate(DISCHARGE_DATE = as.Date(DISCHARGE_DATE))
   
 
 # Creating an array of patients with anti-rejection during inpatient sp tx
@@ -229,7 +287,6 @@ pat_rej_array_dis <- df_immuno_induc %>%
   filter(NUM_ANTI_REJ_RXED >= 1) %>% 
   mutate(DISCHARGE_DATE = as.Date(DISCHARGE_DATE)) %>% 
   select(TRR_ID_CODE, TX_DATE, DISCHARGE_DATE, NUM_ANTI_REJ_RXED) 
-  
 
 # Combining Discharge and follow up rejections 
 pat_rej_array <- bind_rows(pat_rej_array_dis, pat_rej_array_fol, .id = "source")
@@ -247,7 +304,7 @@ pat_ctrl_array <- df_immuno_fol_calc %>%
 
 #-----------------------------------------------------------------------
 # Processing HLA Data
-
+# need karhadkar help bc i dont think there is any :(
 
 
 #-----------------------------------------------------------------------
@@ -256,11 +313,10 @@ pat_ctrl_array <- df_immuno_fol_calc %>%
 
 #-----------------------------------------------------------------------
 # Processing Deceased Donor Data
+# want to extract time to transplant, perfusion(y/n), age of donor
 
 
-
-
-
+#--------------------------------
 
 
 # ____________________________________________________________________________________
@@ -319,21 +375,48 @@ freq_long <- freq_drug_fol_antirej_indiv %>%
 #------------------------------------------------------------------------
 # Collecting Demographic Data on the Reject vs Control Patients
 #-------------------------------
+# Rejection Demographic Table Building
 pat_rej_demo_table <- pat_rej_array %>% 
   left_join(df_liver_data_filtered %>% 
               select(TRR_ID_CODE, AGE, GENDER, ETHCAT, MELD_PELD_LAB_SCORE, TXKID, TXHRT, TXLNG, TXPAN, 
                      PREV_TX, PREV_TX_ANY_N, DON_TY, COLD_ISCH), by = "TRR_ID_CODE") |> 
+  group_by(TRR_ID_CODE) %>%
+  filter(!(source == 1 & n() > 1)) %>%
+  ungroup()%>% 
   mutate(REJ_STAT = 1L) # for the following merge this will let me know what is a rejection pt
 
+# Control Demographic Table Building
 pat_ctrl_demo_table <- pat_ctrl_array %>% 
   left_join(df_liver_data_filtered %>% 
               select(TRR_ID_CODE, AGE, GENDER, ETHCAT, MELD_PELD_LAB_SCORE, TXKID, TXHRT, TXLNG, TXPAN, 
                      PREV_TX, PREV_TX_ANY_N, DON_TY, COLD_ISCH), by = "TRR_ID_CODE") |> 
   mutate(DISCHARGE_DATE = as.Date(DISCHARGE_DATE)) %>% 
-  mutate(REJ_STAT = 0L) # for the following merge this will let me know what is a nonrejection pt
+  mutate(REJ_STAT = 0L) %>% # for the following merge this will let me know what is a nonrejection pt
+  filter(!TRR_ID_CODE %in% pat_rej_demo_table$TRR_ID_CODE)
 
+# Put Together For Future Outcome based analysis
 pat_all_demo_table <- full_join(pat_rej_demo_table,pat_ctrl_demo_table)
 
+# Rituxan Demographic Table Building
+pat_ritux_demo_table <- pat_rej_demo_table %>% 
+  filter(TRR_ID_CODE %in% rituxan_id_all_vect)
+
+#-----------
+# Doing some double checking on demographic TRR_ID_CODES
+
+# 1. Duplicates within the rejection table itself
+pat_rej_demo_table %>% count(TRR_ID_CODE) %>% filter(n > 1)
+
+# 2. Duplicates within the control table itself
+pat_ctrl_demo_table %>% count(TRR_ID_CODE) %>% filter(n > 1)
+
+# 3. Patients appearing in BOTH tables
+overlap_ids <- intersect(pat_rej_demo_table$TRR_ID_CODE, pat_ctrl_demo_table$TRR_ID_CODE)
+length(overlap_ids)
+
+df_liver_data_filtered %>% count(TRR_ID_CODE) %>% filter(n>1)
+
+#---------------------------------------------------
 # calculating bitch ass values for the below table
 
 demo_label1 = c(
@@ -379,301 +462,154 @@ ref_value1 = c(
   "PREV_TX_ANY_N" # 3
 )
 
-# calculations to fill out demographics table
-#-----------
-# Rejection variables calculation + dataframe column
+#----------------------------------------
+#__________________________________________________-
+# Demographic Table Functions
+#-----------------------------------
 
-age_rej_med <- median(pat_rej_demo_table$AGE, na.rm = TRUE)
-gen_rej_count <- pat_rej_demo_table |> # number of dudes
-  filter(GENDER == "M") |> 
-  nrow()
-race_wt_rej_count <- pat_rej_demo_table |> 
-  filter(ETHCAT == "1") |> 
-  nrow()
-race_bl_rej_count <- pat_rej_demo_table |> 
-  filter(ETHCAT == "2") |> 
-  nrow()
-race_his_rej_count <- pat_rej_demo_table |> 
-  filter(ETHCAT == "4") |> 
-  nrow()
-race_asia_rej_count <- pat_rej_demo_table |> 
-  filter(ETHCAT == "5") |> 
-  nrow()
-race_other_rej_count <- nrow(pat_rej_demo_table) - sum(race_wt_rej_count, race_bl_rej_count, race_his_rej_count, race_asia_rej_count)
-meld_rej_med <- median(pat_rej_demo_table$MELD_PELD_LAB_SCORE, na.rm = TRUE)
-txkid_rej_count <- pat_rej_demo_table |> 
-  filter(TXKID %in% c("L","R","E")) |> 
-  nrow()
-txhrt_rej_count <- pat_rej_demo_table |> 
-  filter(TXHRT  == "Y") |> 
-  nrow()
-txlng_rej_count <- pat_rej_demo_table |> 
-  filter(TXLNG %in% c("L","R","E")) |> 
-  nrow()
-txpan_rej_count <- pat_rej_demo_table |> 
-  filter(TXPAN %in% c("L","R","E")) |> 
-  nrow()
-txliv_rej_count <- nrow(pat_rej_demo_table) - sum(txkid_rej_count,txhrt_rej_count,txlng_rej_count,txpan_rej_count)
-prev_liver_rej <- pat_rej_demo_table |> 
-  filter(PREV_TX == "Y") |> 
-  nrow()
-prev_tx_1_rej_count <- pat_rej_demo_table |> 
-  filter(PREV_TX_ANY_N == "1") |> 
-  nrow()
-prev_tx_2_rej_count <- pat_rej_demo_table |> 
-  filter(PREV_TX_ANY_N == "2") |> 
-  nrow()
-prev_tx_3_rej_count <- pat_rej_demo_table |> 
-  filter(PREV_TX_ANY_N == "3") |> 
-  nrow()
-prev_tx_0_rej_count <- sum(is.na(pat_rej_demo_table$PREV_TX_ANY_N))
-cold_isch_time_rej <- median(pat_rej_demo_table$COLD_ISCH, na.rm = TRUE)
-liv_don_rej <- pat_rej_demo_table |> 
-  filter(DON_TY == "L") |> 
-  nrow()
-
-mean_rej <- c(
-  nrow(pat_rej_demo_table), # gives me a count of n
-  age_rej_med,           # 1  Recipient Age
-  gen_rej_count,         # 2  Male Gender
-  NA,                    # 3  "Race, n(%)" header
-  race_wt_rej_count,     # 4  White
-  race_bl_rej_count,     # 5  Black
-  race_his_rej_count,    # 6  Hispanic
-  race_asia_rej_count,   # 7  Asian 
-  race_other_rej_count,  # 8  Other/Multiracial
-  meld_rej_med,          # 9  MELD
-  NA,                    # 10 "Organ Transplanted, n(%)" header
-  txliv_rej_count,       # 11 Liver
-  txkid_rej_count,       # 12 Liver and Kidney
-  txhrt_rej_count,       # 13 Liver and Heart
-  txlng_rej_count,       # 14 Liver and Lung
-  txpan_rej_count,       # 15 Liver and Pancreas
-  liv_don_rej,           # 16 Living Donor 
-  cold_isch_time_rej,    # 17 Cold Ischemic Time 
-  prev_liver_rej,      # 18 Previous Liver Transplants
-  NA,                    # 19 "Previous Any Transplants, n(%)" header
-  prev_tx_0_rej_count,  # 20 0
-  prev_tx_1_rej_count,   # 21 1
-  prev_tx_2_rej_count,   # 22 2
-  prev_tx_3_rej_count    # 23 3
-)
-
-#--------------------------------------
-#control
-
-age_ctrl_med <- median(pat_ctrl_demo_table$AGE, na.rm = TRUE)
-gen_ctrl_count <- pat_ctrl_demo_table |> # number of dudes
-  filter(GENDER == "M") |> 
-  nrow()
-race_wt_ctrl_count <- pat_ctrl_demo_table |> 
-  filter(ETHCAT == "1") |> 
-  nrow()
-race_bl_ctrl_count <- pat_ctrl_demo_table |> 
-  filter(ETHCAT == "2") |> 
-  nrow()
-race_his_ctrl_count <- pat_ctrl_demo_table |> 
-  filter(ETHCAT == "4") |> 
-  nrow()
-race_asia_ctrl_count <- pat_ctrl_demo_table |> 
-  filter(ETHCAT == "5") |> 
-  nrow()
-race_other_ctrl_count <- nrow(pat_ctrl_demo_table) - sum(race_wt_ctrl_count, race_bl_ctrl_count, race_his_ctrl_count, race_asia_ctrl_count)
-meld_ctrl_med <- median(pat_ctrl_demo_table$MELD_PELD_LAB_SCORE, na.rm = TRUE)
-txkid_ctrl_count <- pat_ctrl_demo_table |> 
-  filter(TXKID %in% c("L","R","E")) |> 
-  nrow()
-txhrt_ctrl_count <- pat_ctrl_demo_table |> 
-  filter(TXHRT  == "Y") |> 
-  nrow()
-txlng_ctrl_count <- pat_ctrl_demo_table |> 
-  filter(TXLNG %in% c("L","R","E")) |> 
-  nrow()
-txpan_ctrl_count <- pat_ctrl_demo_table |> 
-  filter(TXPAN %in% c("L","R","E")) |> 
-  nrow()
-txliv_ctrl_count <- nrow(pat_ctrl_demo_table) - sum(txkid_ctrl_count,txhrt_ctrl_count,txlng_ctrl_count,txpan_ctrl_count)
-prev_liver_ctrl <- pat_ctrl_demo_table |> 
-  filter(PREV_TX == "Y") |> 
-  nrow()
-prev_tx_1_ctrl_count <- pat_ctrl_demo_table |> 
-  filter(PREV_TX_ANY_N == "1") |> 
-  nrow()
-prev_tx_2_ctrl_count <- pat_ctrl_demo_table |> 
-  filter(PREV_TX_ANY_N == "2") |> 
-  nrow()
-prev_tx_3_ctrl_count <- pat_ctrl_demo_table |> 
-  filter(PREV_TX_ANY_N == "3") |> 
-  nrow()
-prev_tx_0_ctrl_count <- sum(is.na(pat_ctrl_demo_table$PREV_TX_ANY_N))
-cold_isch_time_ctrl <- median(pat_ctrl_demo_table$COLD_ISCH, na.rm = TRUE)
-liv_don_ctrl <- pat_ctrl_demo_table |> 
-  filter(DON_TY == "L") |> 
-  nrow()
-
-mean_ctrl <- c(
-  nrow(pat_ctrl_demo_table),
-  age_ctrl_med,           # 1  Recipient Age
-  gen_ctrl_count,         # 2  Male Gender
-  NA,                     # 3  "Race, n(%)" header
-  race_wt_ctrl_count,     # 4  White
-  race_bl_ctrl_count,     # 5  Black
-  race_his_ctrl_count,    # 6  Hispanic
-  race_asia_ctrl_count,   # 7  Asian 
-  race_other_ctrl_count,  # 8  Other/Multiracial
-  meld_ctrl_med,          # 9  MELD
-  NA,                     # 10 "Organ Transplanted, n(%)" header
-  txliv_ctrl_count,       # 11 Liver
-  txkid_ctrl_count,       # 12 Liver and Kidney
-  txhrt_ctrl_count,       # 13 Liver and Heart
-  txlng_ctrl_count,       # 14 Liver and Lung
-  txpan_ctrl_count,       # 15 Liver and Pancreas
-  liv_don_ctrl,           # 16 Living Donor 
-  cold_isch_time_ctrl,    # 17 Cold Ischemic Time 
-  prev_liver_ctrl,        # 18 Previous Liver Transplants
-  NA,                     # 19 "Previous Any Transplants, n(%)" header
-  prev_tx_0_ctrl_count,   # 20 0
-  prev_tx_1_ctrl_count,   # 21 1
-  prev_tx_2_ctrl_count,   # 22 2
-  prev_tx_3_ctrl_count    # 23 3
-)
-
-#----------------------------------------------------------------------
-# IQR + Percents for demographic data
-
-# Rejections
-num_rej <- nrow(pat_rej_demo_table)
-
-age_rej_q1  <- quantile(pat_rej_demo_table$AGE, 0.25, na.rm = TRUE)
-age_rej_q3  <- quantile(pat_rej_demo_table$AGE, 0.75, na.rm = TRUE)
-age_rej_qstring <- paste0(" (", age_rej_q1, "–", age_rej_q3, ")")
-
-gen_rej_perc <- 100*gen_rej_count/num_rej
-
-race_wt_rej_perc <- 100*race_wt_rej_count/num_rej
-race_bl_rej_perc <- 100*race_bl_rej_count/num_rej
-race_his_rej_perc <- 100*race_his_rej_count/num_rej
-race_asia_rej_perc <- 100*race_asia_rej_count/num_rej
-race_other_rej_perc <- 100*race_other_rej_count/num_rej
-
-meld_rej_q1 <- quantile(pat_rej_demo_table$MELD_PELD_LAB_SCORE, 0.25, na.rm = TRUE)
-meld_rej_q3  <- quantile(pat_rej_demo_table$MELD_PELD_LAB_SCORE, 0.75, na.rm = TRUE)
-meld_rej_qstring <- paste0( " (", meld_rej_q1, "–", meld_rej_q3, ")")
-
-txliv_rej_perc <- 100*txliv_rej_count/num_rej
-txkid_rej_perc <- 100*txkid_rej_count/num_rej
-txhrt_rej_perc <- 100*txhrt_rej_count/num_rej
-txlng_rej_perc <- 100*txlng_rej_count/num_rej
-txpan_rej_perc <- 100*txpan_rej_count/num_rej
-
-liv_don_rej_perc <- liv_don_rej/num_rej
-
-cold_isch_time_rej_q1 <- quantile(pat_rej_demo_table$COLD_ISCH, 0.25, na.rm = TRUE)
-cold_isch_time_rej_q3 <- quantile(pat_rej_demo_table$COLD_ISCH, 0.75, na.rm = TRUE)
-isch_rej_qstring <- paste0(" (", cold_isch_time_rej_q1, "–", cold_isch_time_rej_q3, ")")
-
-prev_liv_rej_perc <- 100*prev_liver_rej/num_rej
-
-prev_tx_0_rej_perc <- 100*prev_tx_0_rej_count/num_rej
-prev_tx_1_rej_perc <- 100*prev_tx_1_rej_count/num_rej
-prev_tx_2_rej_perc <- 100*prev_tx_2_rej_count/num_rej
-prev_tx_3_rej_perc <- 100*prev_tx_3_rej_count/num_rej
-
-std_rej <- data.frame(
-  std_rej = c(
-    NA,
-    age_rej_qstring,       # 1  Recipient Age IQR
-    gen_rej_perc,          # 2  Male Gender %
-    NA,                    # 3  Race header
-    race_wt_rej_perc,      # 4  White %
-    race_bl_rej_perc,      # 5  Black %
-    race_his_rej_perc,     # 6  Hispanic %
-    race_asia_rej_perc,    # 7  Asian %
-    race_other_rej_perc,   # 8  Other/Multiracial %
-    meld_rej_qstring,      # 9  MELD IQR
-    NA,                    # 10 Organ Transplanted header
-    txliv_rej_perc,        # 11 Liver %
-    txkid_rej_perc,        # 12 Liver and Kidney %
-    txhrt_rej_perc,        # 13 Liver and Heart %
-    txlng_rej_perc,        # 14 Liver and Lung %
-    txpan_rej_perc,        # 15 Liver and Pancreas %
-    liv_don_rej_perc,      # 16 Living Donor %
-    isch_rej_qstring,      # 17 Cold Ischemic Time IQR
-    prev_liv_rej_perc,     # 18 Previous Liver Transplants %
-    NA,                    # 19 Previous Any Transplants header
-    prev_tx_0_rej_perc,    # 20 0 %
-    prev_tx_1_rej_perc,    # 21 1 %
-    prev_tx_2_rej_perc,    # 22 2 %
-    prev_tx_3_rej_perc     # 23 3 %
+# Claude simplification of my manual calculation
+# ------------------------------------------------------------------------
+# Function 1: raw counts and medians
+# ------------------------------------------------------------------------
+calc_demo_stats <- function(df) {
+  n_total <- nrow(df)
+  
+  race_wt    <- sum(df$ETHCAT == "1", na.rm = TRUE)
+  race_bl    <- sum(df$ETHCAT == "2", na.rm = TRUE)
+  race_his   <- sum(df$ETHCAT == "4", na.rm = TRUE)
+  race_asia  <- sum(df$ETHCAT == "5", na.rm = TRUE)
+  race_other <- n_total - sum(race_wt, race_bl, race_his, race_asia)
+  
+  txkid <- sum(df$TXKID %in% c("L","R","E"), na.rm = TRUE)
+  txhrt <- sum(df$TXHRT == "Y", na.rm = TRUE)
+  txlng <- sum(df$TXLNG %in% c("L","R","E"), na.rm = TRUE)
+  txpan <- sum(df$TXPAN %in% c("L","R","E"), na.rm = TRUE)
+  txliv <- n_total - sum(txkid, txhrt, txlng, txpan)
+  
+  list(
+    n            = n_total,
+    age_med      = median(df$AGE, na.rm = TRUE),
+    age_q1       = quantile(df$AGE, 0.25, na.rm = TRUE),
+    age_q3       = quantile(df$AGE, 0.75, na.rm = TRUE),
+    gen_count    = sum(df$GENDER == "M", na.rm = TRUE),
+    race_wt      = race_wt,
+    race_bl      = race_bl,
+    race_his     = race_his,
+    race_asia    = race_asia,
+    race_other   = race_other,
+    meld_med     = median(df$MELD_PELD_LAB_SCORE, na.rm = TRUE),
+    meld_q1      = quantile(df$MELD_PELD_LAB_SCORE, 0.25, na.rm = TRUE),
+    meld_q3      = quantile(df$MELD_PELD_LAB_SCORE, 0.75, na.rm = TRUE),
+    txliv        = txliv,
+    txkid        = txkid,
+    txhrt        = txhrt,
+    txlng        = txlng,
+    txpan        = txpan,
+    liv_don      = sum(df$DON_TY == "L", na.rm = TRUE),
+    cold_isch_med= median(df$COLD_ISCH, na.rm = TRUE),
+    cold_isch_q1 = quantile(df$COLD_ISCH, 0.25, na.rm = TRUE),
+    cold_isch_q3 = quantile(df$COLD_ISCH, 0.75, na.rm = TRUE),
+    prev_liver   = sum(df$PREV_TX == "Y", na.rm = TRUE),
+    prev_tx_0    = sum(is.na(df$PREV_TX_ANY_N)),
+    prev_tx_1    = sum(df$PREV_TX_ANY_N == "1", na.rm = TRUE),
+    prev_tx_2    = sum(df$PREV_TX_ANY_N == "2", na.rm = TRUE),
+    prev_tx_3    = sum(df$PREV_TX_ANY_N == "3", na.rm = TRUE)
   )
-)
+}
 
-# Controls
-num_ctrl <- nrow(pat_ctrl_demo_table)
-
-age_ctrl_q1  <- quantile(pat_ctrl_demo_table$AGE, 0.25, na.rm = TRUE)
-age_ctrl_q3  <- quantile(pat_ctrl_demo_table$AGE, 0.75, na.rm = TRUE)
-age_ctrl_qstring <- paste0(" (", age_ctrl_q1, "–", age_ctrl_q3, ")")
-
-gen_ctrl_perc <- 100*gen_ctrl_count/num_ctrl
-
-race_wt_ctrl_perc <- 100*race_wt_ctrl_count/num_ctrl
-race_bl_ctrl_perc <- 100*race_bl_ctrl_count/num_ctrl
-race_his_ctrl_perc <- 100*race_his_ctrl_count/num_ctrl
-race_asia_ctrl_perc <- 100*race_asia_ctrl_count/num_ctrl
-race_other_ctrl_perc <- 100*race_other_ctrl_count/num_ctrl
-
-meld_ctrl_q1 <- quantile(pat_ctrl_demo_table$MELD_PELD_LAB_SCORE, 0.25, na.rm = TRUE)
-meld_ctrl_q3  <- quantile(pat_ctrl_demo_table$MELD_PELD_LAB_SCORE, 0.75, na.rm = TRUE)
-meld_ctrl_qstring <- paste0( " (", meld_ctrl_q1, "–", meld_ctrl_q3, ")")
-
-txliv_ctrl_perc <- 100*txliv_ctrl_count/num_ctrl
-txkid_ctrl_perc <- 100*txkid_ctrl_count/num_ctrl
-txhrt_ctrl_perc <- 100*txhrt_ctrl_count/num_ctrl
-txlng_ctrl_perc <- 100*txlng_ctrl_count/num_ctrl
-txpan_ctrl_perc <- 100*txpan_ctrl_count/num_ctrl
-
-liv_don_ctrl_perc <- liv_don_ctrl/num_ctrl
-
-cold_isch_time_ctrl_q1 <- quantile(pat_ctrl_demo_table$COLD_ISCH, 0.25, na.rm = TRUE)
-cold_isch_time_ctrl_q3 <- quantile(pat_ctrl_demo_table$COLD_ISCH, 0.75, na.rm = TRUE)
-isch_ctrl_qstring <- paste0(" (", cold_isch_time_ctrl_q1, "–", cold_isch_time_ctrl_q3, ")")
-
-prev_liv_ctrl_perc <- 100*prev_liver_ctrl/num_ctrl
-
-prev_tx_0_ctrl_perc <- 100*prev_tx_0_ctrl_count/num_ctrl
-prev_tx_1_ctrl_perc <- 100*prev_tx_1_ctrl_count/num_ctrl
-prev_tx_2_ctrl_perc <- 100*prev_tx_2_ctrl_count/num_ctrl
-prev_tx_3_ctrl_perc <- 100*prev_tx_3_ctrl_count/num_ctrl
-
-std_ctrl <- data.frame(
-  std_ctrl = c(
-    NA,
-    age_ctrl_qstring,       # 1  Recipient Age IQR
-    gen_ctrl_perc,          # 2  Male Gender %
-    NA,                     # 3  Race header
-    race_wt_ctrl_perc,      # 4  White %
-    race_bl_ctrl_perc,      # 5  Black %
-    race_his_ctrl_perc,     # 6  Hispanic %
-    race_asia_ctrl_perc,    # 7  Asian %
-    race_other_ctrl_perc,   # 8  Other/Multiracial %
-    meld_ctrl_qstring,      # 9  MELD IQR
-    NA,                     # 10 Organ Transplanted header
-    txliv_ctrl_perc,        # 11 Liver %
-    txkid_ctrl_perc,        # 12 Liver and Kidney %
-    txhrt_ctrl_perc,        # 13 Liver and Heart %
-    txlng_ctrl_perc,        # 14 Liver and Lung %
-    txpan_ctrl_perc,        # 15 Liver and Pancreas %
-    liv_don_ctrl_perc,      # 16 Living Donor %
-    isch_ctrl_qstring,      # 17 Cold Ischemic Time IQR
-    prev_liv_ctrl_perc,     # 18 Previous Liver Transplants %
-    NA,                     # 19 Previous Any Transplants header
-    prev_tx_0_ctrl_perc,    # 20 0 %
-    prev_tx_1_ctrl_perc,    # 21 1 %
-    prev_tx_2_ctrl_perc,    # 22 2 %
-    prev_tx_3_ctrl_perc     # 23 3 %
+# ------------------------------------------------------------------------
+# Function 2: IQR strings + percentages, built FROM the stats list above
+# (takes the output of calc_demo_stats, so no re-filtering of the df needed)
+# ------------------------------------------------------------------------
+calc_demo_std <- function(s) {
+  pct <- function(count) 100 * count / s$n
+  
+  list(
+    age_qstring   = paste0(" (", s$age_q1, "\u2013", s$age_q3, ")"),
+    gen_perc      = pct(s$gen_count),
+    race_wt_perc  = pct(s$race_wt),
+    race_bl_perc  = pct(s$race_bl),
+    race_his_perc = pct(s$race_his),
+    race_asia_perc= pct(s$race_asia),
+    race_other_perc = pct(s$race_other),
+    meld_qstring  = paste0(" (", s$meld_q1, "\u2013", s$meld_q3, ")"),
+    txliv_perc    = pct(s$txliv),
+    txkid_perc    = pct(s$txkid),
+    txhrt_perc    = pct(s$txhrt),
+    txlng_perc    = pct(s$txlng),
+    txpan_perc    = pct(s$txpan),
+    liv_don_perc  = pct(s$liv_don / s$n),
+    isch_qstring  = paste0(" (", s$cold_isch_q1, "\u2013", s$cold_isch_q3, ")"),
+    prev_liv_perc = pct(s$prev_liver),
+    prev_tx_0_perc = pct(s$prev_tx_0),
+    prev_tx_1_perc = pct(s$prev_tx_1),
+    prev_tx_2_perc = pct(s$prev_tx_2),
+    prev_tx_3_perc = pct(s$prev_tx_3)
   )
-)
+}
+
+# ------------------------------------------------------------------------
+# Assemble the mean_* and std_* vectors in demo_label1 order
+# ------------------------------------------------------------------------
+build_mean_vector <- function(s) {
+  c(
+    s$n,
+    s$age_med,
+    s$gen_count,
+    NA,
+    s$race_wt, s$race_bl, s$race_his, s$race_asia, s$race_other,
+    s$meld_med,
+    NA,
+    s$txliv, s$txkid, s$txhrt, s$txlng, s$txpan,
+    s$liv_don,
+    s$cold_isch_med,
+    s$prev_liver,
+    NA,
+    s$prev_tx_0, s$prev_tx_1, s$prev_tx_2, s$prev_tx_3
+  )
+}
+
+build_std_vector <- function(s, std) {
+  c(
+    NA,
+    std$age_qstring,
+    std$gen_perc,
+    NA,
+    std$race_wt_perc, std$race_bl_perc, std$race_his_perc, std$race_asia_perc, std$race_other_perc,
+    std$meld_qstring,
+    NA,
+    std$txliv_perc, std$txkid_perc, std$txhrt_perc, std$txlng_perc, std$txpan_perc,
+    std$liv_don_perc,
+    std$isch_qstring,
+    std$prev_liv_perc,
+    NA,
+    std$prev_tx_0_perc, std$prev_tx_1_perc, std$prev_tx_2_perc, std$prev_tx_3_perc
+  )
+}
+
+# ------------------------------------------------------------------------
+# Running Demographic Functions
+# ------------------------------------------------------------------------
+rej_stats  <- calc_demo_stats(pat_rej_demo_table)
+ctrl_stats <- calc_demo_stats(pat_ctrl_demo_table)
+ritux_stats <- calc_demo_stats(pat_ritux_demo_table)
+
+rej_std  <- calc_demo_std(rej_stats)
+ctrl_std <- calc_demo_std(ctrl_stats)
+ritux_std <- calc_demo_std(ritux_stats)
+
+num_rej  <- rej_stats$n
+num_ctrl <- ctrl_stats$n
+num_ritux <- ritux_stats$n
+
+mean_rej  <- build_mean_vector(rej_stats)
+mean_ctrl <- build_mean_vector(ctrl_stats)
+mean_ritux <- build_mean_vector(ritux_stats)
+
+std_rej  <- data.frame(std_rej  = build_std_vector(rej_stats, rej_std))
+std_ctrl <- data.frame(std_ctrl = build_std_vector(ctrl_stats, ctrl_std))
+std_ritux <- data.frame(std_ritux = build_std_vector(ritux_stats, ritux_std))
+
 # ------------------------------------------------------------------------
 # Tibble Demographic Data 
 
@@ -683,7 +619,9 @@ tbl_data <- tibble(
   mean_rej,
   std_rej,
   mean_ctrl,
-  std_ctrl
+  std_ctrl,
+  mean_ritux,
+  std_ritux
 )
 
 # Final Table once I upload the HLA and PRA
@@ -750,6 +688,8 @@ format_table1 <- function(df) {
       # round mean_rej/mean_ctrl to integers wherever they represent counts (not medians)
       mean_rej_fmt  = if_else(is_median, NA_character_,
                               format(round(mean_rej), big.mark = ",", scientific = FALSE)),
+      mean_ritux_fmt  = if_else(is_median, NA_character_,
+                              format(round(mean_ritux), big.mark = ",", scientific = FALSE)),
       mean_ctrl_fmt = if_else(is_median, NA_character_,
                               format(round(mean_ctrl), big.mark = ",", scientific = FALSE)),
       Rejection = case_when(
@@ -758,6 +698,13 @@ format_table1 <- function(df) {
         is_median ~ paste0(format(mean_rej, big.mark = ","), " ", std_rej),
         TRUE ~ paste0(mean_rej_fmt,
                       " (", sprintf("%.1f", as.numeric(std_rej)), "%)")
+      ),
+      Rituxan = case_when(
+        is_header ~ NA_character_,
+        demo_label1 == "n" ~ mean_ritux_fmt,
+        is_median ~ paste0(format(mean_ritux, big.mark = ","), " ", std_ritux),
+        TRUE ~ paste0(mean_ritux_fmt,
+                      " (", sprintf("%.1f", as.numeric(std_ritux)), "%)")
       ),
       Control = case_when(
         is_header ~ NA_character_,
@@ -769,7 +716,7 @@ format_table1 <- function(df) {
       Variable = if_else(is_header, demo_label1,
                          paste0("    ", demo_label1))
     ) %>%
-    select(Variable, Rejection, Control, is_header)
+    select(Variable, Rejection, Rituxan, Control, is_header)
 }
 
 demo_tbl <- format_table1(df)
@@ -780,6 +727,7 @@ demo_tbl %>%
   cols_label(
     Variable = "Characteristic",
     Rejection = paste0("Rejection (n = ", num_rej, ")"),
+    Rituxan = paste0("Rituxan (n = ", num_ritux, ")"),
     Control = paste0("Control (n = ", num_ctrl, ")")
   ) %>%
   tab_style(
@@ -790,7 +738,7 @@ demo_tbl %>%
     style = cell_text(align = "left"),
     locations = cells_column_labels(columns = Variable)
   ) %>%
-  cols_align(align = "center", columns = c(Rejection, Control)) %>%
+  cols_align(align = "center", columns = c(Rejection, Rituxan, Control)) %>%
   tab_options(
     table.font.size = 13,
     data_row.padding = px(4),
@@ -798,6 +746,65 @@ demo_tbl %>%
   ) %>%
   tab_source_note("Values are n (%) or median (IQR) as indicated.")
 #----------------------------------------------------
+# format_table1 <- function(df) {
+#   tbl_data %>%
+#     filter(demo_label1 != "n") %>%
+#     mutate(
+#       is_header = is.na(ref_value1) & is.na(std_rej),
+#       is_median = str_detect(demo_label1, "median\\(IQR\\)") |
+#         (!is_header & str_detect(std_rej, "^\\(")),
+#       # round mean_rej/mean_ctrl to integers wherever they represent counts (not medians)
+#       mean_rej_fmt  = if_else(is_median, NA_character_,
+#                               format(round(mean_rej), big.mark = ",", scientific = FALSE)),
+#       mean_ctrl_fmt = if_else(is_median, NA_character_,
+#                               format(round(mean_ctrl), big.mark = ",", scientific = FALSE)),
+#       Rejection = case_when(
+#         is_header ~ NA_character_,
+#         demo_label1 == "n" ~ mean_rej_fmt,
+#         is_median ~ paste0(format(mean_rej, big.mark = ","), " ", std_rej),
+#         TRUE ~ paste0(mean_rej_fmt,
+#                       " (", sprintf("%.1f", as.numeric(std_rej)), "%)")
+#       ),
+#       Control = case_when(
+#         is_header ~ NA_character_,
+#         demo_label1 == "n" ~ mean_ctrl_fmt,
+#         is_median ~ paste0(format(mean_ctrl, big.mark = ","), " ", std_ctrl),
+#         TRUE ~ paste0(mean_ctrl_fmt,
+#                       " (", sprintf("%.1f", as.numeric(std_ctrl)), "%)")
+#       ),
+#       Variable = if_else(is_header, demo_label1,
+#                          paste0("    ", demo_label1))
+#     ) %>%
+#     select(Variable, Rejection, Control, is_header)
+# }
+# 
+# demo_tbl <- format_table1(df)
+# 
+# demo_tbl %>%
+#   select(-is_header) %>%
+#   gt() %>%
+#   cols_label(
+#     Variable = "Characteristic",
+#     Rejection = paste0("Rejection (n = ", num_rej, ")"),
+#     Control = paste0("Control (n = ", num_ctrl, ")")
+#   ) %>%
+#   tab_style(
+#     style = cell_text(weight = "bold"),
+#     locations = cells_body(rows = demo_tbl$is_header)
+#   ) %>%
+#   tab_style(
+#     style = cell_text(align = "left"),
+#     locations = cells_column_labels(columns = Variable)
+#   ) %>%
+#   cols_align(align = "center", columns = c(Rejection, Control)) %>%
+#   tab_options(
+#     table.font.size = 13,
+#     data_row.padding = px(4),
+#     column_labels.font.weight = "bold"
+#   ) %>%
+#   tab_source_note("Values are n (%) or median (IQR) as indicated.")
+
+#-------------------
 
 
 
