@@ -583,7 +583,7 @@ calc_demo_std <- function(s) {
     txhrt_perc    = pct(s$txhrt),
     txlng_perc    = pct(s$txlng),
     txpan_perc    = pct(s$txpan),
-    liv_don_perc  = pct(s$liv_don / s$n),
+    liv_don_perc  = pct(s$liv_don),
     isch_qstring  = paste0(" (", s$cold_isch_q1, "\u2013", s$cold_isch_q3, ")"),
     prev_liv_perc = pct(s$prev_liver),
     prev_tx_0_perc = pct(s$prev_tx_0),
