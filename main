@@ -530,39 +530,56 @@ calc_demo_stats <- function(df) {
   race_bl    <- sum(df$ETHCAT == "2", na.rm = TRUE)
   race_his   <- sum(df$ETHCAT == "4", na.rm = TRUE)
   race_asia  <- sum(df$ETHCAT == "5", na.rm = TRUE)
-  race_other <- n_total - sum(race_wt, race_bl, race_his, race_asia)
+  race_denom <- sum(!is.na(df$ETHCAT))
+  race_other <- race_denom - sum(race_wt, race_bl, race_his, race_asia)
   
   txkid <- sum(df$TXKID %in% c("L","R","E"), na.rm = TRUE)
   txhrt <- sum(df$TXHRT == "Y", na.rm = TRUE)
   txlng <- sum(df$TXLNG %in% c("L","R","E"), na.rm = TRUE)
   txpan <- sum(df$TXPAN %in% c("L","R","E"), na.rm = TRUE)
-  txliv <- n_total - sum(txkid, txhrt, txlng, txpan)
+  # organ-transplanted denominator: patients with non-NA info in ANY of the organ columns
+  organ_denom <- sum(!is.na(df$TXKID) | !is.na(df$TXHRT) | !is.na(df$TXLNG) | !is.na(df$TXPAN))
+  txliv <- organ_denom - sum(txkid, txhrt, txlng, txpan)
   
   list(
     n            = n_total,
+    
     age_med      = median(df$AGE, na.rm = TRUE),
     age_q1       = quantile(df$AGE, 0.25, na.rm = TRUE),
     age_q3       = quantile(df$AGE, 0.75, na.rm = TRUE),
+    
     gen_count    = sum(df$GENDER == "M", na.rm = TRUE),
+    gen_denom    = sum(!is.na(df$GENDER)),
+    
     race_wt      = race_wt,
     race_bl      = race_bl,
     race_his     = race_his,
     race_asia    = race_asia,
     race_other   = race_other,
+    race_denom   = race_denom,
+    
     meld_med     = median(df$MELD_PELD_LAB_SCORE, na.rm = TRUE),
     meld_q1      = quantile(df$MELD_PELD_LAB_SCORE, 0.25, na.rm = TRUE),
     meld_q3      = quantile(df$MELD_PELD_LAB_SCORE, 0.75, na.rm = TRUE),
+    
     txliv        = txliv,
     txkid        = txkid,
     txhrt        = txhrt,
     txlng        = txlng,
     txpan        = txpan,
+    organ_denom  = organ_denom,
+    
     liv_don      = sum(df$DON_TY == "L", na.rm = TRUE),
+    liv_don_denom= sum(!is.na(df$DON_TY)),
+    
     cold_isch_med= median(df$COLD_ISCH, na.rm = TRUE),
     cold_isch_q1 = quantile(df$COLD_ISCH, 0.25, na.rm = TRUE),
     cold_isch_q3 = quantile(df$COLD_ISCH, 0.75, na.rm = TRUE),
+    
     prev_liver   = sum(df$PREV_TX == "Y", na.rm = TRUE),
-    prev_tx_0    = sum(is.na(df$PREV_TX_ANY_N)),
+    prev_liver_denom = sum(!is.na(df$PREV_TX)),
+    
+    prev_tx_0    = sum(is.na(df$PREV_TX_ANY_N)),   # NA here IS meaningful (= 0 prior tx), kept as-is
     prev_tx_1    = sum(df$PREV_TX_ANY_N == "1", na.rm = TRUE),
     prev_tx_2    = sum(df$PREV_TX_ANY_N == "2", na.rm = TRUE),
     prev_tx_3    = sum(df$PREV_TX_ANY_N == "3", na.rm = TRUE),
@@ -574,9 +591,11 @@ calc_demo_stats <- function(df) {
     hla_4        = sum(df$MM_TOTAL == 4, na.rm = TRUE),
     hla_5        = sum(df$MM_TOTAL == 5, na.rm = TRUE),
     hla_6        = sum(df$MM_TOTAL == 6, na.rm = TRUE),
+    hla_denom    = sum(!is.na(df$MM_TOTAL)),
     
     perf_n       = sum(df$LI_MACHINE_PERFUSION == "Y", na.rm = TRUE),
-    perf_typed_n = sum(!is.na(df$LI_MACHINE_PERFUSION_TY)),  # denominator for normo/hypo %
+    perf_denom   = sum(!is.na(df$LI_MACHINE_PERFUSION)),
+    perf_typed_n = sum(!is.na(df$LI_MACHINE_PERFUSION_TY)),
     perf_normo   = sum(df$LI_MACHINE_PERFUSION_TY == "1", na.rm = TRUE),
     perf_hypo    = sum(df$LI_MACHINE_PERFUSION_TY == "2", na.rm = TRUE)
   )
@@ -587,42 +606,52 @@ calc_demo_stats <- function(df) {
 # (takes the output of calc_demo_stats, so no re-filtering of the df needed)
 # ------------------------------------------------------------------------
 calc_demo_std <- function(s) {
-  pct <- function(count) 100 * count / s$n
+  # generic safe percent: returns NA instead of NaN/Inf if denom is 0
+  pct <- function(count, denom) {
+    if (is.na(denom) || denom == 0) return(NA_real_)
+    100 * count / denom
+  }
   
   list(
     age_qstring   = paste0(" (", s$age_q1, "\u2013", s$age_q3, ")"),
-    gen_perc      = pct(s$gen_count),
-    race_wt_perc  = pct(s$race_wt),
-    race_bl_perc  = pct(s$race_bl),
-    race_his_perc = pct(s$race_his),
-    race_asia_perc= pct(s$race_asia),
-    race_other_perc = pct(s$race_other),
+    
+    gen_perc      = pct(s$gen_count, s$gen_denom),
+    
+    race_wt_perc    = pct(s$race_wt, s$race_denom),
+    race_bl_perc    = pct(s$race_bl, s$race_denom),
+    race_his_perc   = pct(s$race_his, s$race_denom),
+    race_asia_perc  = pct(s$race_asia, s$race_denom),
+    race_other_perc = pct(s$race_other, s$race_denom),
+    
     meld_qstring  = paste0(" (", s$meld_q1, "\u2013", s$meld_q3, ")"),
-    txliv_perc    = pct(s$txliv),
-    txkid_perc    = pct(s$txkid),
-    txhrt_perc    = pct(s$txhrt),
-    txlng_perc    = pct(s$txlng),
-    txpan_perc    = pct(s$txpan),
-    liv_don_perc  = pct(s$liv_don),
+    
+    txliv_perc    = pct(s$txliv, s$organ_denom),
+    txkid_perc    = pct(s$txkid, s$organ_denom),
+    txhrt_perc    = pct(s$txhrt, s$organ_denom),
+    txlng_perc    = pct(s$txlng, s$organ_denom),
+    txpan_perc    = pct(s$txpan, s$organ_denom),
+    
+    liv_don_perc  = pct(s$liv_don, s$liv_don_denom),
+    
     isch_qstring  = paste0(" (", s$cold_isch_q1, "\u2013", s$cold_isch_q3, ")"),
     
-    prev_liv_perc = pct(s$prev_liver),
-    prev_tx_0_perc = pct(s$prev_tx_0),
-    prev_tx_1_perc = pct(s$prev_tx_1),
-    prev_tx_2_perc = pct(s$prev_tx_2),
-    prev_tx_3_perc = pct(s$prev_tx_3),
+    prev_liv_perc  = pct(s$prev_liver, s$prev_liver_denom),
+    prev_tx_0_perc = pct(s$prev_tx_0, s$n),   # NA in PREV_TX_ANY_N counts as "0 prior", so denom stays n
+    prev_tx_1_perc = pct(s$prev_tx_1, s$n),
+    prev_tx_2_perc = pct(s$prev_tx_2, s$n),
+    prev_tx_3_perc = pct(s$prev_tx_3, s$n),
     
-    hla_0_perc     = pct(s$hla_0),
-    hla_1_perc     = pct(s$hla_1),
-    hla_2_perc     = pct(s$hla_2),
-    hla_3_perc     = pct(s$hla_3),
-    hla_4_perc     = pct(s$hla_4),
-    hla_5_perc     = pct(s$hla_5),
-    hla_6_perc     = pct(s$hla_6),
+    hla_0_perc = pct(s$hla_0, s$hla_denom),
+    hla_1_perc = pct(s$hla_1, s$hla_denom),
+    hla_2_perc = pct(s$hla_2, s$hla_denom),
+    hla_3_perc = pct(s$hla_3, s$hla_denom),
+    hla_4_perc = pct(s$hla_4, s$hla_denom),
+    hla_5_perc = pct(s$hla_5, s$hla_denom),
+    hla_6_perc = pct(s$hla_6, s$hla_denom),
     
-    perf_n_perc     = pct(s$perf_n),
-    perf_normo_perc = 100 * s$perf_normo / s$perf_typed_n,
-    perf_hypo_perc  = 100 * s$perf_hypo  / s$perf_typed_n
+    perf_n_perc     = pct(s$perf_n, s$perf_denom),
+    perf_normo_perc = pct(s$perf_normo, s$perf_typed_n),
+    perf_hypo_perc  = pct(s$perf_hypo, s$perf_typed_n)
   )
 }
 
@@ -644,9 +673,9 @@ build_mean_vector <- function(s) {
     s$prev_liver,
     NA,
     s$prev_tx_0, s$prev_tx_1, s$prev_tx_2, s$prev_tx_3,
-    NA,                                                   # "HLA Mismatch Leve, n(%)" header
+    NA,                                  # HLA header
     s$hla_0, s$hla_1, s$hla_2, s$hla_3, s$hla_4, s$hla_5, s$hla_6,
-    NA,                                                   # "Liver Perfusion, n(%)" header
+    s$perf_n,                            # Liver Perfusion, n(%) — now a real count
     s$perf_normo, s$perf_hypo
   )
 }
@@ -666,10 +695,10 @@ build_std_vector <- function(s, std) {
     std$prev_liv_perc,
     NA,
     std$prev_tx_0_perc, std$prev_tx_1_perc, std$prev_tx_2_perc, std$prev_tx_3_perc,
-    NA,                                                   # HLA header
+    NA,                                  # HLA header
     std$hla_0_perc, std$hla_1_perc, std$hla_2_perc, std$hla_3_perc,
     std$hla_4_perc, std$hla_5_perc, std$hla_6_perc,
-    NA,                                                   # Perfusion header
+    std$perf_n_perc,                     # Liver Perfusion, n(%)
     std$perf_normo_perc, std$perf_hypo_perc
   )
 }
@@ -710,31 +739,6 @@ tbl_data <- tibble(
   mean_ritux,
   std_ritux
 )
-
-# Final Table once I upload the HLA and PRA
-# demo_label2 = c(
-#   "Recipient Age (y), median(IQR)",
-#   "Male Gender, n(%)",
-#   "Race, n(%)",
-#   "White", "Black", "Hispanic", "Asian", "Other/Multiracial",
-#   "MELD, median(IQR)",
-#   "Organ Transplanted, n(%)",
-#   "Liver", "Liver and Kidney", "Liver and Heart", "Liver and Lung", "Liver and Pancreas",
-#   "Living Donor, n(%)",
-#   "Cold Ischemic Time (hr), median(IQR)",
-#   "Previous Liver Transplants, n(%)",
-#   "0", "1", "2", "3",
-#   "Previous Any Transplants, n(%)",
-#   "0", "1", "2", "3",
-#   "Peak PRA, n(%)",
-#   "0%", "1%-20%", "21%-80%", "81%-100%",
-#   "HLA Mismatch Level, n(%)",
-#   "0", "1", "2", "3", "4", "5", "6",
-#   "L-EPTS at Graft Failure, n(%)",
-#   "0%-10%", "11%-20%", "21%-30%", "31%-40%", "41%-50%",
-#   "51%-60%", "61%-70%", "71%-80%", "81%-90%", "91%-100%",
-#   "Delayed Graft Function, n(%)"
-# )
 
 #---------------------------------------------------------------------------------
 # Follow Up Anti rejection tables
@@ -833,65 +837,12 @@ demo_tbl %>%
   ) %>%
   tab_source_note("Values are n (%) or median (IQR) as indicated.")
 #----------------------------------------------------
-# format_table1 <- function(df) {
-#   tbl_data %>%
-#     filter(demo_label1 != "n") %>%
-#     mutate(
-#       is_header = is.na(ref_value1) & is.na(std_rej),
-#       is_median = str_detect(demo_label1, "median\\(IQR\\)") |
-#         (!is_header & str_detect(std_rej, "^\\(")),
-#       # round mean_rej/mean_ctrl to integers wherever they represent counts (not medians)
-#       mean_rej_fmt  = if_else(is_median, NA_character_,
-#                               format(round(mean_rej), big.mark = ",", scientific = FALSE)),
-#       mean_ctrl_fmt = if_else(is_median, NA_character_,
-#                               format(round(mean_ctrl), big.mark = ",", scientific = FALSE)),
-#       Rejection = case_when(
-#         is_header ~ NA_character_,
-#         demo_label1 == "n" ~ mean_rej_fmt,
-#         is_median ~ paste0(format(mean_rej, big.mark = ","), " ", std_rej),
-#         TRUE ~ paste0(mean_rej_fmt,
-#                       " (", sprintf("%.1f", as.numeric(std_rej)), "%)")
-#       ),
-#       Control = case_when(
-#         is_header ~ NA_character_,
-#         demo_label1 == "n" ~ mean_ctrl_fmt,
-#         is_median ~ paste0(format(mean_ctrl, big.mark = ","), " ", std_ctrl),
-#         TRUE ~ paste0(mean_ctrl_fmt,
-#                       " (", sprintf("%.1f", as.numeric(std_ctrl)), "%)")
-#       ),
-#       Variable = if_else(is_header, demo_label1,
-#                          paste0("    ", demo_label1))
-#     ) %>%
-#     select(Variable, Rejection, Control, is_header)
-# }
-# 
-# demo_tbl <- format_table1(df)
-# 
-# demo_tbl %>%
-#   select(-is_header) %>%
-#   gt() %>%
-#   cols_label(
-#     Variable = "Characteristic",
-#     Rejection = paste0("Rejection (n = ", num_rej, ")"),
-#     Control = paste0("Control (n = ", num_ctrl, ")")
-#   ) %>%
-#   tab_style(
-#     style = cell_text(weight = "bold"),
-#     locations = cells_body(rows = demo_tbl$is_header)
-#   ) %>%
-#   tab_style(
-#     style = cell_text(align = "left"),
-#     locations = cells_column_labels(columns = Variable)
-#   ) %>%
-#   cols_align(align = "center", columns = c(Rejection, Control)) %>%
-#   tab_options(
-#     table.font.size = 13,
-#     data_row.padding = px(4),
-#     column_labels.font.weight = "bold"
-#   ) %>%
-#   tab_source_note("Values are n (%) or median (IQR) as indicated.")
 
-#-------------------
+
+
+df_deceased_check <- df_deceased_don_fil2 |> 
+  filter(TRR_ID_CODE %in% rituxan_id_all_vect)
+
 
 
 
