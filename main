@@ -125,7 +125,7 @@ df_deceased_don_fil <- df_deceased_don%>%
 
 df_hla_fil <- df_hla %>% 
   filter(TRR_ID_CODE %in% tx_ids_to_keep)
-  
+
 df_pra_fil <- df_pra %>% 
   filter(TRR_ID_CODE %in% tx_ids_to_keep)
 
@@ -189,7 +189,7 @@ df_immuno_fol <- df_immuno_fol %>%
   # combo therapy rx'ed?
   mutate(NUM_ANTI_REJ_RXED = 0L) |>
   mutate(NUM_ANTI_REJ_RXED = rowSums(across(all_of(COLS_TO_CHECK)) == 1, na.rm = TRUE))
-  
+
 
 # store data so that I dont have to keep calculating it
 df_immuno_fol_calc <- df_immuno_fol
@@ -276,7 +276,7 @@ pat_ctrl_array <- df_immuno_fol_calc %>%
   select(
     TRR_ID_CODE, TRR_FOL_ID_CODE, TX_DATE, DISCHARGE_DATE, PX_STAT_DATE_FOL, 
     FOL_DATE_DAYS_DELTA, REJECT_RUNNING_COUNT, NUM_ANTI_REJ_RXED, COLS_TO_CHECK
-    ) %>% 
+  ) %>% 
   mutate(FOLLOW_UP_NUM = 1L) |>
   group_by(TRR_ID_CODE) %>%
   slice_max(order_by = PX_STAT_DATE_FOL, n = 1, with_ties = FALSE) %>%
@@ -819,7 +819,7 @@ format_table1 <- function() {
       mean_rej_fmt  = if_else(is_median, NA_character_,
                               format(round(mean_rej), big.mark = ",", scientific = FALSE)),
       mean_ritux_fmt  = if_else(is_median, NA_character_,
-                              format(round(mean_ritux), big.mark = ",", scientific = FALSE)),
+                                format(round(mean_ritux), big.mark = ",", scientific = FALSE)),
       mean_ctrl_fmt = if_else(is_median, NA_character_,
                               format(round(mean_ctrl), big.mark = ",", scientific = FALSE)),
       Rejection = case_when(
@@ -904,8 +904,15 @@ std_ctrl <- data.frame(std_ctrl = build_std_vector(ctrl_stats, ctrl_std))
 # Binary categorical vars (single yes/no row) -> chi-square, falling back to
 #   Fisher's exact when any expected cell count is small
 # Multi-level categorical vars (Race, Organ, Prev Tx count, HLA MM, Perfusion
-#   type) -> ONE chi-square test across the full contingency table, reported
-#   once on the group header row (standard Table 1 convention)
+#   type) -> ONE chi-square/Fisher test across the full contingency table,
+#   reported once on the group header row (standard Table 1 convention)
+#
+# NOTE: test_multilevel() derives its category levels from whatever is
+# actually observed in EITHER group being compared (rather than assuming
+# both sides share identical categories). This avoids silently misaligning
+# columns, or erroring out entirely, when one arm has zero patients in a
+# given category (e.g. zero Hispanic patients in a small treatment arm,
+# or zero Heart-transplant patients in a control arm).
 
 calc_pvalues <- function(df_rej, df_ctrl) {
   
@@ -929,6 +936,9 @@ calc_pvalues <- function(df_rej, df_ctrl) {
   }
   
   test_multilevel <- function(x, y) {
+    lv <- sort(unique(c(as.character(x), as.character(y))))
+    x <- factor(as.character(x), levels = lv)
+    y <- factor(as.character(y), levels = lv)
     tab <- rbind(table(x), table(y))
     if (any(rowSums(tab) == 0) || any(colSums(tab) == 0)) return(NA_real_)
     tryCatch(
@@ -1093,8 +1103,106 @@ demo_tbl2 %>%
   ) %>%
   tab_source_note("Values are n (%) or median (IQR) as indicated. P-values from Wilcoxon rank-sum (continuous), chi-square, or Fisher's exact tests (categorical) as appropriate.")
 
+#===============================================================================
+# Running Demographic Functions #3 - Combined Therapy vs No Rejection (Control)
+# ------------------------------------------------------------------------
+rej_stats  <- calc_demo_stats(pat_combined_demo_table)
+ctrl_stats <- calc_demo_stats(pat_ctrl_demo_table)
+
+rej_std  <- calc_demo_std(rej_stats)
+ctrl_std <- calc_demo_std(ctrl_stats)
+
+num_rej  <- rej_stats$n
+num_ctrl <- ctrl_stats$n
+
+mean_rej  <- build_mean_vector(rej_stats)
+mean_ctrl <- build_mean_vector(ctrl_stats)
+
+std_rej  <- data.frame(std_rej  = build_std_vector(rej_stats, rej_std))
+std_ctrl <- data.frame(std_ctrl = build_std_vector(ctrl_stats, ctrl_std))
+
+pval_combined_norej <- calc_pvalues(pat_combined_demo_table, pat_ctrl_demo_table)
+
+# ------------------------------------------------------------------------
+# Tibble Demographic Data (Combined vs No Rejection, with p-values)
+# ------------------------------------------------------------------------
+tbl_data <- tibble(
+  demo_label1,
+  ref_value1,
+  mean_rej,
+  std_rej,
+  mean_ctrl,
+  std_ctrl,
+  pval_combined_norej
+)
+
+#------------------------------------------
+# Demographic Table 3 (Combined Therapy / No Rejection)
+format_table3 <- function() {
+  tbl_data %>%
+    filter(demo_label1 != "n") %>%
+    mutate(
+      is_header = is.na(ref_value1) & is.na(std_rej),
+      is_median = str_detect(demo_label1, "median\\(IQR\\)") |
+        (!is_header & str_detect(std_rej, "^\\(")),
+      mean_rej_fmt  = if_else(is_median, NA_character_,
+                              format(round(mean_rej), big.mark = ",", scientific = FALSE)),
+      mean_ctrl_fmt = if_else(is_median, NA_character_,
+                              format(round(mean_ctrl), big.mark = ",", scientific = FALSE)),
+      `Combined Therapy` = case_when(
+        is_header ~ NA_character_,
+        demo_label1 == "n" ~ mean_rej_fmt,
+        is_median ~ paste0(format(mean_rej, big.mark = ","), " ", std_rej),
+        TRUE ~ paste0(mean_rej_fmt,
+                      " (", sprintf("%.1f", as.numeric(std_rej)), "%)")
+      ),
+      `No Rejection` = case_when(
+        is_header ~ NA_character_,
+        demo_label1 == "n" ~ mean_ctrl_fmt,
+        is_median ~ paste0(format(mean_ctrl, big.mark = ","), " ", std_ctrl),
+        TRUE ~ paste0(mean_ctrl_fmt,
+                      " (", sprintf("%.1f", as.numeric(std_ctrl)), "%)")
+      ),
+      `P value` = case_when(
+        is.na(pval_combined_norej) ~ NA_character_,
+        pval_combined_norej < 0.001 ~ "<0.001",
+        TRUE ~ sprintf("%.3f", pval_combined_norej)
+      ),
+      Variable = if_else(is_header, demo_label1,
+                         paste0("    ", demo_label1))
+    ) %>%
+    select(Variable, `Combined Therapy`, `No Rejection`, `P value`, is_header)
+}
+
+demo_tbl3 <- format_table3()
+
+demo_tbl3 %>%
+  select(-is_header) %>%
+  gt() %>%
+  cols_label(
+    Variable = "Characteristic",
+    `Combined Therapy` = paste0("Combined Therapy (n = ", num_rej, ")"),
+    `No Rejection` = paste0("No Rejection (n = ", num_ctrl, ")"),
+    `P value` = "P value"
+  ) %>%
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(rows = demo_tbl3$is_header)
+  ) %>%
+  tab_style(
+    style = cell_text(align = "left"),
+    locations = cells_column_labels(columns = Variable)
+  ) %>%
+  cols_align(align = "center", columns = c(`Combined Therapy`, `No Rejection`, `P value`)) %>%
+  tab_options(
+    table.font.size = 13,
+    data_row.padding = px(4),
+    column_labels.font.weight = "bold"
+  ) %>%
+  tab_source_note("Values are n (%) or median (IQR) as indicated. P-values from Wilcoxon rank-sum (continuous), chi-square, or Fisher's exact tests (categorical) as appropriate.")
+
 # ___________________________________________________________________________
-# Debugging
+# Debugging (scratch checks, safe to remove once satisfied with results)
 
 tab_check <- rbind(
   table(factor(pat_combined_demo_table$LI_MACHINE_PERFUSION_TY, levels = c("1","2"))),
@@ -1102,5 +1210,3 @@ tab_check <- rbind(
 )
 print(tab_check)
 fisher.test(tab_check)
-
-
