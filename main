@@ -320,7 +320,6 @@ simulect_id_all_vect <- monotherapy_reject %>%
   filter(SIMULECT_ANTIREJ == 1) %>%
   pull(TRR_ID_CODE)
 
-
 #------------------------------------------------------------------------------
 # Creating the combined arm for comparison
 arm2_ID_vect <- c(simulect_id_all_vect, thymo_id_all_vect, rituxan_id_all_vect)
@@ -468,6 +467,14 @@ pat_all_demo_table <- full_join(pat_rej_demo_table,pat_ctrl_demo_table)
 # Rituxan Demographic Table Building
 pat_ritux_demo_table <- pat_rej_demo_table %>% 
   filter(TRR_ID_CODE %in% rituxan_id_all_vect)
+
+# Steroid Demographic Table Building
+pat_steroid_demo_table <- pat_rej_demo_table |> 
+  filter(TRR_ID_CODE %in% steroid_id_all_vect)
+
+# Combined Arm Demographic Table Building
+pat_combined_demo_table <- pat_rej_demo_table |> 
+  filter(TRR_ID_CODE %in% arm2_ID_vect)
 
 #-----------
 # Doing some double checking on demographic TRR_ID_CODES
@@ -797,8 +804,9 @@ post_tx_anti_rej_table %>%
   kable(caption = "Frequency of Anti-Rejection Therapies Used While Admitted s/p Liver Transplant") %>%
   kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
 
-#------------------------------------------
-# Demographic Table
+#===============================================================================
+# Demographic Table 1
+#-------------------------------------------------------------------------------
 
 format_table1 <- function(df) {
   tbl_data %>%
@@ -841,9 +849,9 @@ format_table1 <- function(df) {
     select(Variable, Rejection, Rituxan, Control, is_header)
 }
 
-demo_tbl <- format_table1(df)
+demo_tbl1 <- format_table1(df)
 
-demo_tbl %>%
+demo_tbl1 %>%
   select(-is_header) %>%
   gt() %>%
   cols_label(
@@ -869,7 +877,96 @@ demo_tbl %>%
   tab_source_note("Values are n (%) or median (IQR) as indicated.")
 #----------------------------------------------------
 
+#===============================================================================
+# Running Demographic Functions #2 - Steroid vs Combined Therapy
+# ------------------------------------------------------------------------
+rej_stats  <- calc_demo_stats(pat_combined_demo_table)
+ctrl_stats <- calc_demo_stats(pat_steroid_demo_table)
 
+rej_std  <- calc_demo_std(rej_stats)
+ctrl_std <- calc_demo_std(ctrl_stats)
+
+num_rej  <- rej_stats$n
+num_ctrl <- ctrl_stats$n
+
+mean_rej  <- build_mean_vector(rej_stats)
+mean_ctrl <- build_mean_vector(ctrl_stats)
+
+std_rej  <- data.frame(std_rej  = build_std_vector(rej_stats, rej_std))
+std_ctrl <- data.frame(std_ctrl = build_std_vector(ctrl_stats, ctrl_std))
+
+# ------------------------------------------------------------------------
+# Tibble Demographic Data 
+
+tbl_data <- tibble(
+  demo_label1,
+  ref_value1,
+  mean_rej,
+  std_rej,
+  mean_ctrl,
+  std_ctrl
+)
+
+#------------------------------------------
+# Demographic Table
+
+format_table2 <- function(df) {
+  tbl_data %>%
+    filter(demo_label1 != "n") %>%
+    mutate(
+      is_header = is.na(ref_value1) & is.na(std_rej),
+      is_median = str_detect(demo_label1, "median\\(IQR\\)") |
+        (!is_header & str_detect(std_rej, "^\\(")),
+      # round mean_rej/mean_ctrl to integers wherever they represent counts (not medians)
+      mean_rej_fmt  = if_else(is_median, NA_character_,
+                              format(round(mean_rej), big.mark = ",", scientific = FALSE)),
+      mean_ctrl_fmt = if_else(is_median, NA_character_,
+                              format(round(mean_ctrl), big.mark = ",", scientific = FALSE)),
+      Combined = case_when(
+        is_header ~ NA_character_,
+        demo_label1 == "n" ~ mean_rej_fmt,
+        is_median ~ paste0(format(mean_rej, big.mark = ","), " ", std_rej),
+        TRUE ~ paste0(mean_rej_fmt,
+                      " (", sprintf("%.1f", as.numeric(std_rej)), "%)")
+      ),
+      Steroid = case_when(
+        is_header ~ NA_character_,
+        demo_label1 == "n" ~ mean_ctrl_fmt,
+        is_median ~ paste0(format(mean_ctrl, big.mark = ","), " ", std_ctrl),
+        TRUE ~ paste0(mean_ctrl_fmt,
+                      " (", sprintf("%.1f", as.numeric(std_ctrl)), "%)")
+      ),
+      Variable = if_else(is_header, demo_label1,
+                         paste0("    ", demo_label1))
+    ) %>%
+    select(Variable, Combined, Steroid, is_header)
+}
+
+demo_tbl2 <- format_table2(df)
+
+demo_tbl2 %>%
+  select(-is_header) %>%
+  gt() %>%
+  cols_label(
+    Variable = "Characteristic",
+    Combined = paste0("Combined (n = ", num_rej, ")"),
+    Steroid = paste0("Steroid (n = ", num_ctrl, ")")
+  ) %>%
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(rows = demo_tbl$is_header)
+  ) %>%
+  tab_style(
+    style = cell_text(align = "left"),
+    locations = cells_column_labels(columns = Variable)
+  ) %>%
+  cols_align(align = "center", columns = c(Combined, Steroid)) %>%
+  tab_options(
+    table.font.size = 13,
+    data_row.padding = px(4),
+    column_labels.font.weight = "bold"
+  ) %>%
+  tab_source_note("Values are n (%) or median (IQR) as indicated.")
 
 
 # ___________________________________________________________________________
