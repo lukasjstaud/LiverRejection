@@ -808,7 +808,7 @@ post_tx_anti_rej_table %>%
 # Demographic Table 1
 #-------------------------------------------------------------------------------
 
-format_table1 <- function(df) {
+format_table1 <- function() {
   tbl_data %>%
     filter(demo_label1 != "n") %>%
     mutate(
@@ -849,7 +849,7 @@ format_table1 <- function(df) {
     select(Variable, Rejection, Rituxan, Control, is_header)
 }
 
-demo_tbl1 <- format_table1(df)
+demo_tbl1 <- format_table1()
 
 demo_tbl1 %>%
   select(-is_header) %>%
@@ -862,7 +862,7 @@ demo_tbl1 %>%
   ) %>%
   tab_style(
     style = cell_text(weight = "bold"),
-    locations = cells_body(rows = demo_tbl$is_header)
+    locations = cells_body(rows = demo_tbl1$is_header)
   ) %>%
   tab_style(
     style = cell_text(align = "left"),
@@ -896,28 +896,147 @@ std_rej  <- data.frame(std_rej  = build_std_vector(rej_stats, rej_std))
 std_ctrl <- data.frame(std_ctrl = build_std_vector(ctrl_stats, ctrl_std))
 
 # ------------------------------------------------------------------------
-# Tibble Demographic Data 
+#------------------------------------------------------------------------
+# Statistical Testing: Rejection vs Control
+# ------------------------------------------------------------------------
+# Continuous vars (median/IQR rows) -> Wilcoxon rank-sum test (matches your
+#   nonparametric median/IQR reporting; swap for t.test() if you want means)
+# Binary categorical vars (single yes/no row) -> chi-square, falling back to
+#   Fisher's exact when any expected cell count is small
+# Multi-level categorical vars (Race, Organ, Prev Tx count, HLA MM, Perfusion
+#   type) -> ONE chi-square test across the full contingency table, reported
+#   once on the group header row (standard Table 1 convention)
 
+calc_pvalues <- function(df_rej, df_ctrl) {
+  
+  test_cont <- function(var) {
+    x <- df_rej[[var]]; y <- df_ctrl[[var]]
+    if (sum(!is.na(x)) < 2 || sum(!is.na(y)) < 2) return(NA_real_)
+    tryCatch(wilcox.test(x, y)$p.value, error = function(e) NA_real_)
+  }
+  
+  test_binary <- function(var, target_val) {
+    a <- sum(df_rej[[var]]  == target_val, na.rm = TRUE)
+    b <- sum(!is.na(df_rej[[var]]))  - a
+    c <- sum(df_ctrl[[var]] == target_val, na.rm = TRUE)
+    d <- sum(!is.na(df_ctrl[[var]])) - c
+    tab <- matrix(c(a, b, c, d), nrow = 2)
+    if (sum(tab) == 0) return(NA_real_)
+    tryCatch(
+      if (any(tab < 5)) fisher.test(tab)$p.value else chisq.test(tab)$p.value,
+      error = function(e) NA_real_
+    )
+  }
+  
+  test_multilevel <- function(x, y) {
+    tab <- rbind(table(x), table(y))
+    if (any(rowSums(tab) == 0) || any(colSums(tab) == 0)) return(NA_real_)
+    tryCatch(
+      if (any(tab < 5)) {
+        fisher.test(tab, simulate.p.value = ncol(tab) > 2)$p.value
+      } else {
+        chisq.test(tab)$p.value
+      },
+      error = function(e) NA_real_
+    )
+  }
+  
+  # --- Race groups (mirrors calc_demo_stats bucketing) ---
+  race_group <- function(df) {
+    case_when(
+      df$ETHCAT == "1" ~ "White",
+      df$ETHCAT == "2" ~ "Black",
+      df$ETHCAT == "4" ~ "Hispanic",
+      df$ETHCAT == "5" ~ "Asian",
+      !is.na(df$ETHCAT) ~ "Other",
+      TRUE ~ NA_character_
+    )
+  }
+  
+  # --- Organ transplanted groups (mirrors calc_demo_stats bucketing) ---
+  organ_group <- function(df) {
+    has_data <- !is.na(df$TXKID) | !is.na(df$TXHRT) | !is.na(df$TXLNG) | !is.na(df$TXPAN)
+    grp <- case_when(
+      df$TXKID %in% c("L","R","E") ~ "Kidney",
+      df$TXHRT == "Y"              ~ "Heart",
+      df$TXLNG %in% c("L","R","E") ~ "Lung",
+      df$TXPAN %in% c("L","R","E") ~ "Pancreas",
+      TRUE ~ "Liver only"
+    )
+    if_else(has_data, grp, NA_character_)
+  }
+  
+  p_age    <- test_cont("AGE")
+  p_gender <- test_binary("GENDER", "M")
+  p_race   <- test_multilevel(race_group(df_rej), race_group(df_ctrl))
+  p_meld   <- test_cont("MELD_PELD_LAB_SCORE")
+  p_organ  <- test_multilevel(organ_group(df_rej), organ_group(df_ctrl))
+  p_livdon <- test_binary("DON_TY", "L")
+  p_isch   <- test_cont("COLD_ISCH")
+  p_prev_liv <- test_binary("PREV_TX", "Y")
+  p_prev_any <- test_multilevel(
+    factor(replace(df_rej$PREV_TX_ANY_N, is.na(df_rej$PREV_TX_ANY_N), "0")),
+    factor(replace(df_ctrl$PREV_TX_ANY_N, is.na(df_ctrl$PREV_TX_ANY_N), "0"))
+  )
+  p_hla    <- test_multilevel(
+    factor(df_rej$MM_TOTAL,  levels = 0:6),
+    factor(df_ctrl$MM_TOTAL, levels = 0:6)
+  )
+  p_perf_used <- test_binary("LI_MACHINE_PERFUSION", "Y")
+  p_perf_ty   <- test_multilevel(
+    factor(df_rej$LI_MACHINE_PERFUSION_TY,  levels = c("1","2")),
+    factor(df_ctrl$LI_MACHINE_PERFUSION_TY, levels = c("1","2"))
+  )
+  
+  # Build vector aligned to demo_label1 order. NA on rows where no single
+  # test applies (headers, individual levels within a multi-level block —
+  # the p-value is reported once, on the block's header row instead).
+  c(
+    NA,          # n
+    p_age,
+    p_gender,
+    p_race,
+    NA, NA, NA, NA, NA,
+    p_meld,
+    p_organ,
+    NA, NA, NA, NA, NA,
+    p_livdon,
+    p_isch,
+    p_prev_liv,
+    p_prev_any,
+    NA, NA, NA, NA,
+    p_hla,
+    NA, NA, NA, NA, NA, NA, NA,
+    p_perf_used, # <- Liver Perfusion header now tests usage (Y/N), matches perf_n_perc
+    p_perf_ty,   # <- Normothermic row now carries the type p-value
+    NA           # <- Hypothermic (still no separate p, shares the type test above)
+  )
+}
+
+pval_rej_ctrl <- calc_pvalues(pat_combined_demo_table, pat_steroid_demo_table)
+
+# ------------------------------------------------------------------------
+# Tibble Demographic Data (now including p-values)
+# ------------------------------------------------------------------------
 tbl_data <- tibble(
   demo_label1,
   ref_value1,
   mean_rej,
   std_rej,
   mean_ctrl,
-  std_ctrl
+  std_ctrl,
+  pval_rej_ctrl
 )
 
 #------------------------------------------
-# Demographic Table
-
-format_table2 <- function(df) {
+# Demographic Table (relabeled: Combined / Steroid)
+format_table2 <- function() {
   tbl_data %>%
     filter(demo_label1 != "n") %>%
     mutate(
       is_header = is.na(ref_value1) & is.na(std_rej),
       is_median = str_detect(demo_label1, "median\\(IQR\\)") |
         (!is_header & str_detect(std_rej, "^\\(")),
-      # round mean_rej/mean_ctrl to integers wherever they represent counts (not medians)
       mean_rej_fmt  = if_else(is_median, NA_character_,
                               format(round(mean_rej), big.mark = ",", scientific = FALSE)),
       mean_ctrl_fmt = if_else(is_median, NA_character_,
@@ -936,13 +1055,18 @@ format_table2 <- function(df) {
         TRUE ~ paste0(mean_ctrl_fmt,
                       " (", sprintf("%.1f", as.numeric(std_ctrl)), "%)")
       ),
+      `P value` = case_when(
+        is.na(pval_rej_ctrl) ~ NA_character_,
+        pval_rej_ctrl < 0.001 ~ "<0.001",
+        TRUE ~ sprintf("%.3f", pval_rej_ctrl)
+      ),
       Variable = if_else(is_header, demo_label1,
                          paste0("    ", demo_label1))
     ) %>%
-    select(Variable, Combined, Steroid, is_header)
+    select(Variable, Combined, Steroid, `P value`, is_header)
 }
 
-demo_tbl2 <- format_table2(df)
+demo_tbl2 <- format_table2()
 
 demo_tbl2 %>%
   select(-is_header) %>%
@@ -950,23 +1074,33 @@ demo_tbl2 %>%
   cols_label(
     Variable = "Characteristic",
     Combined = paste0("Combined (n = ", num_rej, ")"),
-    Steroid = paste0("Steroid (n = ", num_ctrl, ")")
+    Steroid = paste0("Steroid (n = ", num_ctrl, ")"),
+    `P value` = "P value"
   ) %>%
   tab_style(
     style = cell_text(weight = "bold"),
-    locations = cells_body(rows = demo_tbl$is_header)
+    locations = cells_body(rows = demo_tbl2$is_header)
   ) %>%
   tab_style(
     style = cell_text(align = "left"),
     locations = cells_column_labels(columns = Variable)
   ) %>%
-  cols_align(align = "center", columns = c(Combined, Steroid)) %>%
+  cols_align(align = "center", columns = c(Combined, Steroid, `P value`)) %>%
   tab_options(
     table.font.size = 13,
     data_row.padding = px(4),
     column_labels.font.weight = "bold"
   ) %>%
-  tab_source_note("Values are n (%) or median (IQR) as indicated.")
-
+  tab_source_note("Values are n (%) or median (IQR) as indicated. P-values from Wilcoxon rank-sum (continuous), chi-square, or Fisher's exact tests (categorical) as appropriate.")
 
 # ___________________________________________________________________________
+# Debugging
+
+tab_check <- rbind(
+  table(factor(pat_combined_demo_table$LI_MACHINE_PERFUSION_TY, levels = c("1","2"))),
+  table(factor(pat_steroid_demo_table$LI_MACHINE_PERFUSION_TY, levels = c("1","2")))
+)
+print(tab_check)
+fisher.test(tab_check)
+
+
