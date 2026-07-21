@@ -98,8 +98,7 @@ df_liver_fol <- read.csv("~/Local Documents/AOT/Analysis/FilteredData/liver_foll
 #-----------------------------------------------
 # ===============================================================================
 # Filters of index data
-# NOTE: loaded data is already filtered by 10 year date range at this point
-
+#------------------------------------------------------------------------
 # ---------------------------------------------------------------
 # Filter1 - Age filter
 
@@ -360,7 +359,6 @@ arm2_ID_vect <- c(simulect_id_all_vect, thymo_id_all_vect, rituxan_id_all_vect)
 ctrl_id_vect <- pat_ctrl_array %>%
   pull(TRR_ID_CODE)
 
-
 # =============================================================================
 # HLA MISMATCH CALCULATION (A, B, DR loci) — 0 to 6 scale
 # Assumes df is your data frame with the raw HLA typing columns
@@ -532,7 +530,7 @@ length(overlap_ids)
 df_liver_data_filtered %>% count(TRR_ID_CODE) %>% filter(n>1)
 
 #---------------------------------------------------
-# calculating bitch ass values for the below table
+# calculating demographic table values
 
 demo_label1 = c(
   "n",
@@ -581,7 +579,6 @@ ref_value1 = c(
 #=================================================================
 # Demographic Table Functions
 #-----------------------------------
-
 # Claude simplification of my manual calculation
 # ------------------------------------------------------------------------
 # Function 1: raw counts and medians
@@ -780,6 +777,152 @@ build_std_vector <- function(s, std) {
 }
 
 # ------------------------------------------------------------------------
+# Statistical Testing Function (MOVED UP so it's defined before ANY table
+# that needs it -- Tables 4/5 [unmatched] use it before Tables 2/3 [matched]
+# used to)
+# ------------------------------------------------------------------------
+# Continuous vars (median/IQR rows) -> Wilcoxon rank-sum test (matches your
+#   nonparametric median/IQR reporting; swap for t.test() if you want means)
+# Binary categorical vars (single yes/no row) -> chi-square, falling back to
+#   Fisher's exact when any expected cell count is small
+# Multi-level categorical vars (Race, Organ, Prev Tx count, HLA MM, Perfusion
+#   type) -> ONE chi-square/Fisher test across the full contingency table,
+#   reported once on the group header row (standard Table 1 convention)
+#
+# NOTE: test_multilevel() derives its category levels from whatever is
+# actually observed in EITHER group being compared (rather than assuming
+# both sides share identical categories). This avoids silently misaligning
+# columns, or erroring out entirely, when one arm has zero patients in a
+# given category (e.g. zero Hispanic patients in a small treatment arm,
+# or zero Heart-transplant patients in a control arm).
+
+calc_pvalues <- function(df_rej, df_ctrl) {
+  
+  test_cont <- function(var) {
+    x <- df_rej[[var]]; y <- df_ctrl[[var]]
+    if (sum(!is.na(x)) < 2 || sum(!is.na(y)) < 2) return(NA_real_)
+    tryCatch(wilcox.test(x, y)$p.value, error = function(e) NA_real_)
+  }
+  
+  test_binary <- function(var, target_val) {
+    a <- sum(df_rej[[var]]  == target_val, na.rm = TRUE)
+    b <- sum(!is.na(df_rej[[var]]))  - a
+    c <- sum(df_ctrl[[var]] == target_val, na.rm = TRUE)
+    d <- sum(!is.na(df_ctrl[[var]])) - c
+    tab <- matrix(c(a, b, c, d), nrow = 2)
+    if (sum(tab) == 0) return(NA_real_)
+    tryCatch(
+      if (any(tab < 5)) fisher.test(tab)$p.value else chisq.test(tab)$p.value,
+      error = function(e) NA_real_
+    )
+  }
+  
+  test_multilevel <- function(x, y) {
+    lv <- sort(unique(c(as.character(x), as.character(y))))
+    x <- factor(as.character(x), levels = lv)
+    y <- factor(as.character(y), levels = lv)
+    tab <- rbind(table(x), table(y))
+    if (any(rowSums(tab) == 0) || any(colSums(tab) == 0)) return(NA_real_)
+    tryCatch(
+      if (any(tab < 5)) {
+        fisher.test(tab, simulate.p.value = ncol(tab) > 2)$p.value
+      } else {
+        chisq.test(tab)$p.value
+      },
+      error = function(e) NA_real_
+    )
+  }
+  
+  # --- Race groups (mirrors calc_demo_stats bucketing) ---
+  race_group <- function(df) {
+    case_when(
+      df$ETHCAT == "1" ~ "White",
+      df$ETHCAT == "2" ~ "Black",
+      df$ETHCAT == "4" ~ "Hispanic",
+      df$ETHCAT == "5" ~ "Asian",
+      !is.na(df$ETHCAT) ~ "Other",
+      TRUE ~ NA_character_
+    )
+  }
+  
+  test_diab <- function(df_rej, df_ctrl) {
+    pos_rej <- sum(as.numeric(df_rej$DIAB) %in% 2:5, na.rm = TRUE)
+    neg_rej <- sum(as.numeric(df_rej$DIAB) == 1, na.rm = TRUE)
+    
+    pos_ctrl <- sum(as.numeric(df_ctrl$DIAB) %in% 2:5, na.rm = TRUE)
+    neg_ctrl <- sum(as.numeric(df_ctrl$DIAB) == 1, na.rm = TRUE)
+    
+    tab <- matrix(c(pos_rej, neg_rej, pos_ctrl, neg_ctrl), nrow = 2)
+    if (sum(tab) == 0) return(NA_real_)
+    tryCatch(
+      if (any(tab < 5)) fisher.test(tab)$p.value else chisq.test(tab)$p.value,
+      error = function(e) NA_real_
+    )
+  }
+  
+  # --- Organ transplanted groups (mirrors calc_demo_stats bucketing) ---
+  organ_group <- function(df) {
+    has_data <- !is.na(df$TXKID) | !is.na(df$TXHRT) | !is.na(df$TXLNG) | !is.na(df$TXPAN)
+    grp <- case_when(
+      df$TXKID %in% c("L","R","E") ~ "Kidney",
+      df$TXHRT == "Y"              ~ "Heart",
+      df$TXLNG %in% c("L","R","E") ~ "Lung",
+      df$TXPAN %in% c("L","R","E") ~ "Pancreas",
+      TRUE ~ "Liver only"
+    )
+    if_else(has_data, grp, NA_character_)
+  }
+  
+  p_age    <- test_cont("AGE")
+  p_gender <- test_binary("GENDER", "M")
+  p_race   <- test_multilevel(race_group(df_rej), race_group(df_ctrl))
+  p_diab   <- test_diab(df_rej, df_ctrl)
+  p_meld   <- test_cont("MELD_PELD_LAB_SCORE")
+  p_organ  <- test_multilevel(organ_group(df_rej), organ_group(df_ctrl))
+  p_livdon <- test_binary("DON_TY", "L")
+  p_isch   <- test_cont("COLD_ISCH")
+  p_prev_liv <- test_binary("PREV_TX", "Y")
+  p_prev_any <- test_multilevel(
+    factor(replace(df_rej$PREV_TX_ANY_N, is.na(df_rej$PREV_TX_ANY_N), "0")),
+    factor(replace(df_ctrl$PREV_TX_ANY_N, is.na(df_ctrl$PREV_TX_ANY_N), "0"))
+  )
+  p_hla    <- test_multilevel(
+    factor(df_rej$MM_TOTAL,  levels = 0:6),
+    factor(df_ctrl$MM_TOTAL, levels = 0:6)
+  )
+  p_perf_used <- test_binary("LI_MACHINE_PERFUSION", "Y")
+  p_perf_ty   <- test_multilevel(
+    factor(df_rej$LI_MACHINE_PERFUSION_TY,  levels = c("1","2")),
+    factor(df_ctrl$LI_MACHINE_PERFUSION_TY, levels = c("1","2"))
+  )
+  
+  # Build vector aligned to demo_label1 order. NA on rows where no single
+  # test applies (headers, individual levels within a multi-level block —
+  # the p-value is reported once, on the block's header row instead).
+  c(
+    NA,          # n
+    p_age,
+    p_gender,
+    p_race,
+    NA, NA, NA, NA, NA,
+    p_diab,
+    p_meld,
+    p_organ,
+    NA, NA, NA, NA, NA,
+    p_livdon,
+    p_isch,
+    p_prev_liv,
+    p_prev_any,
+    NA, NA, NA, NA,
+    p_hla,
+    NA, NA, NA, NA, NA, NA, NA,
+    p_perf_used,
+    p_perf_ty,
+    NA
+  )
+}
+
+# ------------------------------------------------------------------------
 # Running Demographic Functions
 # ------------------------------------------------------------------------
 rej_stats  <- calc_demo_stats(pat_rej_demo_table)
@@ -845,7 +988,6 @@ post_tx_anti_rej_table %>%
 #===============================================================================
 # Demographic Table 1
 #-------------------------------------------------------------------------------
-
 format_table1 <- function() {
   tbl_data %>%
     filter(demo_label1 != "n") %>%
@@ -1029,6 +1171,206 @@ love.plot(
 )
 
 #===============================================================================
+# UNMATCHED Demographic Tables (no propensity score matching)
+#   Table 4: Combined vs Steroid
+#   Table 5: Combined vs No Rejection (Control)
+# Uses the raw cohorts: pat_combined_demo_table, pat_steroid_demo_table,
+# pat_ctrl_demo_table (as built in the original demographic table section,
+# BEFORE the matchit() calls). calc_pvalues() is now defined earlier in the
+# script (right after build_std_vector()), so it's safely available here.
+#-------------------------------------------------------------------------------
+
+#===============================================================================
+# Table 4: Combined vs Steroid (Unmatched)
+#-------------------------------------------------------------------------------
+
+rej_stats  <- calc_demo_stats(pat_combined_demo_table)
+ctrl_stats <- calc_demo_stats(pat_steroid_demo_table)
+
+rej_std  <- calc_demo_std(rej_stats)
+ctrl_std <- calc_demo_std(ctrl_stats)
+
+num_rej  <- rej_stats$n
+num_ctrl <- ctrl_stats$n
+
+mean_rej  <- build_mean_vector(rej_stats)
+mean_ctrl <- build_mean_vector(ctrl_stats)
+
+std_rej  <- data.frame(std_rej  = build_std_vector(rej_stats, rej_std))
+std_ctrl <- data.frame(std_ctrl = build_std_vector(ctrl_stats, ctrl_std))
+
+pval_combined_steroid_unmatched <- calc_pvalues(pat_combined_demo_table, pat_steroid_demo_table)
+
+tbl_data <- tibble(
+  demo_label1,
+  ref_value1,
+  mean_rej,
+  std_rej,
+  mean_ctrl,
+  std_ctrl,
+  pval_rej_ctrl = pval_combined_steroid_unmatched
+)
+
+format_table4 <- function() {
+  tbl_data %>%
+    filter(demo_label1 != "n") %>%
+    mutate(
+      is_header = is.na(ref_value1) & is.na(std_rej),
+      is_median = str_detect(demo_label1, "median\\(IQR\\)") |
+        (!is_header & str_detect(std_rej, "^\\(")),
+      mean_rej_fmt  = if_else(is_median, NA_character_,
+                              format(round(mean_rej), big.mark = ",", scientific = FALSE)),
+      mean_ctrl_fmt = if_else(is_median, NA_character_,
+                              format(round(mean_ctrl), big.mark = ",", scientific = FALSE)),
+      Combined = case_when(
+        is_header ~ NA_character_,
+        demo_label1 == "n" ~ mean_rej_fmt,
+        is_median ~ paste0(format(mean_rej, big.mark = ","), " ", std_rej),
+        TRUE ~ paste0(mean_rej_fmt,
+                      " (", sprintf("%.1f", as.numeric(std_rej)), "%)")
+      ),
+      Steroid = case_when(
+        is_header ~ NA_character_,
+        demo_label1 == "n" ~ mean_ctrl_fmt,
+        is_median ~ paste0(format(mean_ctrl, big.mark = ","), " ", std_ctrl),
+        TRUE ~ paste0(mean_ctrl_fmt,
+                      " (", sprintf("%.1f", as.numeric(std_ctrl)), "%)")
+      ),
+      `P value` = case_when(
+        is.na(pval_rej_ctrl) ~ NA_character_,
+        pval_rej_ctrl < 0.001 ~ "<0.001",
+        TRUE ~ sprintf("%.3f", pval_rej_ctrl)
+      ),
+      Variable = if_else(is_header, demo_label1,
+                         paste0("    ", demo_label1))
+    ) %>%
+    select(Variable, Combined, Steroid, `P value`, is_header)
+}
+
+demo_tbl4 <- format_table4()
+
+demo_tbl4 %>%
+  select(-is_header) %>%
+  gt() %>%
+  cols_label(
+    Variable = "Characteristic",
+    Combined = paste0("Combined (n = ", num_rej, ")"),
+    Steroid = paste0("Steroid (n = ", num_ctrl, ")"),
+    `P value` = "P value"
+  ) %>%
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(rows = demo_tbl4$is_header)
+  ) %>%
+  tab_style(
+    style = cell_text(align = "left"),
+    locations = cells_column_labels(columns = Variable)
+  ) %>%
+  cols_align(align = "center", columns = c(Combined, Steroid, `P value`)) %>%
+  tab_options(
+    table.font.size = 13,
+    data_row.padding = px(4),
+    column_labels.font.weight = "bold"
+  ) %>%
+  tab_header(title = "Table 4. Combined vs Steroid (Unmatched)") %>%
+  tab_source_note("Values are n (%) or median (IQR) as indicated. P-values from Wilcoxon rank-sum (continuous), chi-square, or Fisher's exact tests (categorical) as appropriate. No propensity score matching applied.")
+
+#===============================================================================
+# Table 5: Combined vs No Rejection (Unmatched)
+#-------------------------------------------------------------------------------
+
+rej_stats  <- calc_demo_stats(pat_combined_demo_table)
+ctrl_stats <- calc_demo_stats(pat_ctrl_demo_table)
+
+rej_std  <- calc_demo_std(rej_stats)
+ctrl_std <- calc_demo_std(ctrl_stats)
+
+num_rej  <- rej_stats$n
+num_ctrl <- ctrl_stats$n
+
+mean_rej  <- build_mean_vector(rej_stats)
+mean_ctrl <- build_mean_vector(ctrl_stats)
+
+std_rej  <- data.frame(std_rej  = build_std_vector(rej_stats, rej_std))
+std_ctrl <- data.frame(std_ctrl = build_std_vector(ctrl_stats, ctrl_std))
+
+pval_combined_norej_unmatched <- calc_pvalues(pat_combined_demo_table, pat_ctrl_demo_table)
+
+tbl_data <- tibble(
+  demo_label1,
+  ref_value1,
+  mean_rej,
+  std_rej,
+  mean_ctrl,
+  std_ctrl,
+  pval_combined_norej = pval_combined_norej_unmatched
+)
+
+format_table5 <- function() {
+  tbl_data %>%
+    filter(demo_label1 != "n") %>%
+    mutate(
+      is_header = is.na(ref_value1) & is.na(std_rej),
+      is_median = str_detect(demo_label1, "median\\(IQR\\)") |
+        (!is_header & str_detect(std_rej, "^\\(")),
+      mean_rej_fmt  = if_else(is_median, NA_character_,
+                              format(round(mean_rej), big.mark = ",", scientific = FALSE)),
+      mean_ctrl_fmt = if_else(is_median, NA_character_,
+                              format(round(mean_ctrl), big.mark = ",", scientific = FALSE)),
+      `Combined Therapy` = case_when(
+        is_header ~ NA_character_,
+        demo_label1 == "n" ~ mean_rej_fmt,
+        is_median ~ paste0(format(mean_rej, big.mark = ","), " ", std_rej),
+        TRUE ~ paste0(mean_rej_fmt,
+                      " (", sprintf("%.1f", as.numeric(std_rej)), "%)")
+      ),
+      `No Rejection` = case_when(
+        is_header ~ NA_character_,
+        demo_label1 == "n" ~ mean_ctrl_fmt,
+        is_median ~ paste0(format(mean_ctrl, big.mark = ","), " ", std_ctrl),
+        TRUE ~ paste0(mean_ctrl_fmt,
+                      " (", sprintf("%.1f", as.numeric(std_ctrl)), "%)")
+      ),
+      `P value` = case_when(
+        is.na(pval_combined_norej) ~ NA_character_,
+        pval_combined_norej < 0.001 ~ "<0.001",
+        TRUE ~ sprintf("%.3f", pval_combined_norej)
+      ),
+      Variable = if_else(is_header, demo_label1,
+                         paste0("    ", demo_label1))
+    ) %>%
+    select(Variable, `Combined Therapy`, `No Rejection`, `P value`, is_header)
+}
+
+demo_tbl5 <- format_table5()
+
+demo_tbl5 %>%
+  select(-is_header) %>%
+  gt() %>%
+  cols_label(
+    Variable = "Characteristic",
+    `Combined Therapy` = paste0("Combined Therapy (n = ", num_rej, ")"),
+    `No Rejection` = paste0("No Rejection (n = ", num_ctrl, ")"),
+    `P value` = "P value"
+  ) %>%
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(rows = demo_tbl5$is_header)
+  ) %>%
+  tab_style(
+    style = cell_text(align = "left"),
+    locations = cells_column_labels(columns = Variable)
+  ) %>%
+  cols_align(align = "center", columns = c(`Combined Therapy`, `No Rejection`, `P value`)) %>%
+  tab_options(
+    table.font.size = 13,
+    data_row.padding = px(4),
+    column_labels.font.weight = "bold"
+  ) %>%
+  tab_header(title = "Table 5. Combined Therapy vs No Rejection (Unmatched)") %>%
+  tab_source_note("Values are n (%) or median (IQR) as indicated. P-values from Wilcoxon rank-sum (continuous), chi-square, or Fisher's exact tests (categorical) as appropriate. No propensity score matching applied.")
+
+#===============================================================================
 # Running Demographic Functions #2 - Steroid vs Combined Therapy
 # ------------------------------------------------------------------------
 # EDIT BELOW TWO FOR PROPENSITY MATCHING!!
@@ -1046,150 +1388,6 @@ mean_ctrl <- build_mean_vector(ctrl_stats)
 
 std_rej  <- data.frame(std_rej  = build_std_vector(rej_stats, rej_std))
 std_ctrl <- data.frame(std_ctrl = build_std_vector(ctrl_stats, ctrl_std))
-
-#------------------------------------------------------------------------
-# Statistical Testing: Rejection vs Control
-# ------------------------------------------------------------------------
-# Continuous vars (median/IQR rows) -> Wilcoxon rank-sum test (matches your
-#   nonparametric median/IQR reporting; swap for t.test() if you want means)
-# Binary categorical vars (single yes/no row) -> chi-square, falling back to
-#   Fisher's exact when any expected cell count is small
-# Multi-level categorical vars (Race, Organ, Prev Tx count, HLA MM, Perfusion
-#   type) -> ONE chi-square/Fisher test across the full contingency table,
-#   reported once on the group header row (standard Table 1 convention)
-#
-# NOTE: test_multilevel() derives its category levels from whatever is
-# actually observed in EITHER group being compared (rather than assuming
-# both sides share identical categories). This avoids silently misaligning
-# columns, or erroring out entirely, when one arm has zero patients in a
-# given category (e.g. zero Hispanic patients in a small treatment arm,
-# or zero Heart-transplant patients in a control arm).
-
-calc_pvalues <- function(df_rej, df_ctrl) {
-  
-  test_cont <- function(var) {
-    x <- df_rej[[var]]; y <- df_ctrl[[var]]
-    if (sum(!is.na(x)) < 2 || sum(!is.na(y)) < 2) return(NA_real_)
-    tryCatch(wilcox.test(x, y)$p.value, error = function(e) NA_real_)
-  }
-  
-  test_binary <- function(var, target_val) {
-    a <- sum(df_rej[[var]]  == target_val, na.rm = TRUE)
-    b <- sum(!is.na(df_rej[[var]]))  - a
-    c <- sum(df_ctrl[[var]] == target_val, na.rm = TRUE)
-    d <- sum(!is.na(df_ctrl[[var]])) - c
-    tab <- matrix(c(a, b, c, d), nrow = 2)
-    if (sum(tab) == 0) return(NA_real_)
-    tryCatch(
-      if (any(tab < 5)) fisher.test(tab)$p.value else chisq.test(tab)$p.value,
-      error = function(e) NA_real_
-    )
-  }
-  
-  test_multilevel <- function(x, y) {
-    lv <- sort(unique(c(as.character(x), as.character(y))))
-    x <- factor(as.character(x), levels = lv)
-    y <- factor(as.character(y), levels = lv)
-    tab <- rbind(table(x), table(y))
-    if (any(rowSums(tab) == 0) || any(colSums(tab) == 0)) return(NA_real_)
-    tryCatch(
-      if (any(tab < 5)) {
-        fisher.test(tab, simulate.p.value = ncol(tab) > 2)$p.value
-      } else {
-        chisq.test(tab)$p.value
-      },
-      error = function(e) NA_real_
-    )
-  }
-  
-  # --- Race groups (mirrors calc_demo_stats bucketing) ---
-  race_group <- function(df) {
-    case_when(
-      df$ETHCAT == "1" ~ "White",
-      df$ETHCAT == "2" ~ "Black",
-      df$ETHCAT == "4" ~ "Hispanic",
-      df$ETHCAT == "5" ~ "Asian",
-      !is.na(df$ETHCAT) ~ "Other",
-      TRUE ~ NA_character_
-    )
-  }
-  
-  test_diab <- function(df_rej, df_ctrl) {
-    pos_rej <- sum(as.numeric(df_rej$DIAB) %in% 2:5, na.rm = TRUE)
-    neg_rej <- sum(as.numeric(df_rej$DIAB) == 1, na.rm = TRUE)
-    
-    pos_ctrl <- sum(as.numeric(df_ctrl$DIAB) %in% 2:5, na.rm = TRUE)
-    neg_ctrl <- sum(as.numeric(df_ctrl$DIAB) == 1, na.rm = TRUE)
-    
-    tab <- matrix(c(pos_rej, neg_rej, pos_ctrl, neg_ctrl), nrow = 2)
-    if (sum(tab) == 0) return(NA_real_)
-    tryCatch(
-      if (any(tab < 5)) fisher.test(tab)$p.value else chisq.test(tab)$p.value,
-      error = function(e) NA_real_
-    )
-  }
-  
-  # --- Organ transplanted groups (mirrors calc_demo_stats bucketing) ---
-  organ_group <- function(df) {
-    has_data <- !is.na(df$TXKID) | !is.na(df$TXHRT) | !is.na(df$TXLNG) | !is.na(df$TXPAN)
-    grp <- case_when(
-      df$TXKID %in% c("L","R","E") ~ "Kidney",
-      df$TXHRT == "Y"              ~ "Heart",
-      df$TXLNG %in% c("L","R","E") ~ "Lung",
-      df$TXPAN %in% c("L","R","E") ~ "Pancreas",
-      TRUE ~ "Liver only"
-    )
-    if_else(has_data, grp, NA_character_)
-  }
-  
-  p_age    <- test_cont("AGE")
-  p_gender <- test_binary("GENDER", "M")
-  p_race   <- test_multilevel(race_group(df_rej), race_group(df_ctrl))
-  p_diab   <- test_diab(df_rej, df_ctrl)
-  p_meld   <- test_cont("MELD_PELD_LAB_SCORE")
-  p_organ  <- test_multilevel(organ_group(df_rej), organ_group(df_ctrl))
-  p_livdon <- test_binary("DON_TY", "L")
-  p_isch   <- test_cont("COLD_ISCH")
-  p_prev_liv <- test_binary("PREV_TX", "Y")
-  p_prev_any <- test_multilevel(
-    factor(replace(df_rej$PREV_TX_ANY_N, is.na(df_rej$PREV_TX_ANY_N), "0")),
-    factor(replace(df_ctrl$PREV_TX_ANY_N, is.na(df_ctrl$PREV_TX_ANY_N), "0"))
-  )
-  p_hla    <- test_multilevel(
-    factor(df_rej$MM_TOTAL,  levels = 0:6),
-    factor(df_ctrl$MM_TOTAL, levels = 0:6)
-  )
-  p_perf_used <- test_binary("LI_MACHINE_PERFUSION", "Y")
-  p_perf_ty   <- test_multilevel(
-    factor(df_rej$LI_MACHINE_PERFUSION_TY,  levels = c("1","2")),
-    factor(df_ctrl$LI_MACHINE_PERFUSION_TY, levels = c("1","2"))
-  )
-  
-  # Build vector aligned to demo_label1 order. NA on rows where no single
-  # test applies (headers, individual levels within a multi-level block —
-  # the p-value is reported once, on the block's header row instead).
-  c(
-    NA,          # n
-    p_age,
-    p_gender,
-    p_race,
-    NA, NA, NA, NA, NA,
-    p_diab,
-    p_meld,
-    p_organ,
-    NA, NA, NA, NA, NA,
-    p_livdon,
-    p_isch,
-    p_prev_liv,
-    p_prev_any,
-    NA, NA, NA, NA,
-    p_hla,
-    NA, NA, NA, NA, NA, NA, NA,
-    p_perf_used,
-    p_perf_ty,
-    NA
-  )
-}
 
 pval_rej_ctrl <- calc_pvalues(pat_combined_demo_table_m_steroid, pat_steroid_demo_table_m) # EDIT HERE for match at_combined_demo_table, pat_steroid_demo_table
 
@@ -1373,6 +1571,17 @@ demo_tbl3 %>%
 #==============================================================================
 # Survival Plots 
 #-------------------------------------------------------------------------------
+
+# Helper: strip the default ggplot padding around the origin so the x and y
+# axes meet flush at (0, 0) instead of floating with a gap. Applied to the
+# $plot component of every ggsurvplot object below.
+fix_origin <- function(p) {
+  p$plot <- p$plot +
+    ggplot2::scale_x_continuous(expand = ggplot2::expansion(mult = c(0, 0.02))) +
+    ggplot2::scale_y_continuous(expand = ggplot2::expansion(mult = c(0, 0.02)), limits = c(0, 1))
+  p
+}
+
 df_survival <- df_liver_data_filtered |> 
   select(TRR_ID_CODE, TX_DATE, COMPOSITE_DEATH_DATE, RETXDATE, PTIME, PX_STAT, PX_STAT_DATE) |> 
   mutate(ONE_YEAR_TX_SURV = case_when(
@@ -1386,9 +1595,9 @@ df_survival <- df_liver_data_filtered |>
 
 df_survival <- df_survival |> 
   mutate(GROUP = case_when(
-    TRR_ID_CODE %in% steroid_id_all_vect ~ "Steroids",
-    TRR_ID_CODE %in% arm2_ID_vect ~ "Combined",
-    TRR_ID_CODE %in% ctrl_id_vect ~ "Control",
+    TRR_ID_CODE %in% steroid_ids ~ "Steroids",
+    TRR_ID_CODE %in% combined_ids_1 ~ "Combined",
+    TRR_ID_CODE %in% ctrl_ids ~ "Control",
     TRUE ~ NA_character_
   )) |> 
   mutate(GROUP = factor(GROUP, levels = c("Steroids", "Combined", "Control")))  # set ONCE, consistently
@@ -1411,7 +1620,7 @@ df_survival_1yr <- df_survival |>
 fit_1yr <- survfit(Surv(time_1yr, event_1yr) ~ GROUP, data = df_survival_1yr)
 summary(fit_1yr)
 
-ggsurvplot(
+p_1yr <- ggsurvplot(
   fit_1yr,
   data = df_survival_1yr,
   pval = TRUE,
@@ -1424,6 +1633,8 @@ ggsurvplot(
   ylab = "Survival Probability",
   title = "1-Year Kaplan-Meier Survival Curve by Group"
 )
+p_1yr <- fix_origin(p_1yr)
+print(p_1yr)
 
 summary(fit_1yr, times = 365.25)
 
@@ -1443,7 +1654,7 @@ df_survival_2yr <- df_survival |>
 
 fit_2yr <- survfit(Surv(time_2yr, event_2yr) ~ GROUP, data = df_survival_2yr)
 
-ggsurvplot(
+p_2yr <- ggsurvplot(
   fit_2yr,
   data = df_survival_2yr,
   pval = TRUE,
@@ -1456,6 +1667,8 @@ ggsurvplot(
   ylab = "Survival Probability",
   title = "2-Year Kaplan-Meier Survival Curve by Group"
 )
+p_2yr <- fix_origin(p_2yr)
+print(p_2yr)
 
 summary(fit_2yr, times = 730.5)
 
@@ -1479,7 +1692,7 @@ df_2groups_2yr <- df_survival_2yr |>
 
 fit_1yr_2grp <- survfit(Surv(time_1yr, event_1yr) ~ GROUP, data = df_2groups_1yr)
 
-ggsurvplot(
+p_1yr_2grp <- ggsurvplot(
   fit_1yr_2grp,
   data = df_2groups_1yr,
   pval = TRUE,
@@ -1492,12 +1705,14 @@ ggsurvplot(
   ylab = "Survival Probability",
   title = "1-Year Kaplan-Meier Survival Curve: Steroids vs Combined"
 )
+p_1yr_2grp <- fix_origin(p_1yr_2grp)
+print(p_1yr_2grp)
 
 ## ---- 2-YEAR PLOT ----
 
 fit_2yr_2grp <- survfit(Surv(time_2yr, event_2yr) ~ GROUP, data = df_2groups_2yr)
 
-ggsurvplot(
+p_2yr_2grp <- ggsurvplot(
   fit_2yr_2grp,
   data = df_2groups_2yr,
   pval = TRUE,
@@ -1510,6 +1725,84 @@ ggsurvplot(
   ylab = "Survival Probability",
   title = "2-Year Kaplan-Meier Survival Curve: Steroids vs Combined"
 )
+p_2yr_2grp <- fix_origin(p_2yr_2grp)
+print(p_2yr_2grp)
+
+## ---- Build a separate grouping variable for this comparison ----
+
+df_survival <- df_survival |> 
+  mutate(GROUP_COMBINED_CONTROL = case_when(
+    TRR_ID_CODE %in% combined_ids_2 ~ "Combined",
+    TRR_ID_CODE %in% ctrl_ids ~ "Control",
+    TRUE ~ NA_character_
+  )) |> 
+  mutate(GROUP_COMBINED_CONTROL = factor(GROUP_COMBINED_CONTROL, levels = c("Combined", "Control")))
+
+# Sanity check: counts and overlap
+table(df_survival$GROUP_COMBINED_CONTROL, useNA = "ifany")
+intersect(arm2_ID_vect, ctrl_id_vect)  # should be empty (character(0))
+
+## ---- Build truncated 1yr / 2yr datasets for this comparison ----
+
+df_combctrl_1yr <- df_survival |> 
+  filter(!is.na(GROUP_COMBINED_CONTROL)) |> 
+  mutate(
+    event_1yr = ifelse(PTIME <= 365.25, event, 0),
+    time_1yr  = pmin(PTIME, 365.25)
+  )
+
+df_combctrl_2yr <- df_survival |> 
+  filter(!is.na(GROUP_COMBINED_CONTROL)) |> 
+  mutate(
+    event_2yr = ifelse(PTIME <= 730.5, event, 0),
+    time_2yr  = pmin(PTIME, 730.5)
+  )
+
+## ---- 1-YEAR PLOT: Combined vs Control ----
+
+fit_1yr_combctrl <- survfit(Surv(time_1yr, event_1yr) ~ GROUP_COMBINED_CONTROL, data = df_combctrl_1yr)
+
+p_1yr_combctrl <- ggsurvplot(
+  fit_1yr_combctrl,
+  data = df_combctrl_1yr,
+  pval = TRUE,
+  conf.int = TRUE,
+  risk.table = TRUE,
+  break.time.by = 90,
+  legend.title = "Group",
+  legend.labs = c("Combined", "Control"),
+  xlab = "Time (days)",
+  ylab = "Survival Probability",
+  title = "1-Year Kaplan-Meier Survival Curve: Combined vs Control"
+)
+p_1yr_combctrl <- fix_origin(p_1yr_combctrl)
+print(p_1yr_combctrl)
+
+## ---- 2-YEAR PLOT: Combined vs Control ----
+
+fit_2yr_combctrl <- survfit(Surv(time_2yr, event_2yr) ~ GROUP_COMBINED_CONTROL, data = df_combctrl_2yr)
+
+p_2yr_combctrl <- ggsurvplot(
+  fit_2yr_combctrl,
+  data = df_combctrl_2yr,
+  pval = TRUE,
+  conf.int = TRUE,
+  risk.table = TRUE,
+  break.time.by = 180,
+  legend.title = "Group",
+  legend.labs = c("Combined", "Control"),
+  xlab = "Time (days)",
+  ylab = "Survival Probability",
+  title = "2-Year Kaplan-Meier Survival Curve: Combined vs Control"
+)
+p_2yr_combctrl <- fix_origin(p_2yr_combctrl)
+print(p_2yr_combctrl)
+
+## ---- Log-rank tests ----
+
+survdiff(Surv(time_1yr, event_1yr) ~ GROUP_COMBINED_CONTROL, data = df_combctrl_1yr)
+survdiff(Surv(time_2yr, event_2yr) ~ GROUP_COMBINED_CONTROL, data = df_combctrl_2yr)
+
 
 #------------------------------------------------------------------------------
 # Comparing Steroids alone vs Steroids + Dual Therapy
@@ -1546,7 +1839,7 @@ df_dual_2yr <- df_survival |>
 
 fit_1yr_dual <- survfit(Surv(time_1yr, event_1yr) ~ GROUP_DUAL, data = df_dual_1yr)
 
-ggsurvplot(
+p_1yr_dual <- ggsurvplot(
   fit_1yr_dual,
   data = df_dual_1yr,
   pval = TRUE,
@@ -1559,12 +1852,14 @@ ggsurvplot(
   ylab = "Survival Probability",
   title = "1-Year Kaplan-Meier Survival Curve: Steroids vs Dual Therapy"
 )
+p_1yr_dual <- fix_origin(p_1yr_dual)
+print(p_1yr_dual)
 
 ## ---- 2-YEAR PLOT: Steroids vs Dual Therapy ----
 
 fit_2yr_dual <- survfit(Surv(time_2yr, event_2yr) ~ GROUP_DUAL, data = df_dual_2yr)
 
-ggsurvplot(
+p_2yr_dual <- ggsurvplot(
   fit_2yr_dual,
   data = df_dual_2yr,
   pval = TRUE,
@@ -1577,6 +1872,8 @@ ggsurvplot(
   ylab = "Survival Probability",
   title = "2-Year Kaplan-Meier Survival Curve: Steroids vs Dual Therapy"
 )
+p_2yr_dual <- fix_origin(p_2yr_dual)
+print(p_2yr_dual)
 
 ## ---- Log-rank tests ----
 
@@ -1620,7 +1917,7 @@ df_dualcomb_2yr <- df_survival |>
 
 fit_1yr_dualcomb <- survfit(Surv(time_1yr, event_1yr) ~ GROUP_DUAL_COMBINED, data = df_dualcomb_1yr)
 
-ggsurvplot(
+p_1yr_dualcomb <- ggsurvplot(
   fit_1yr_dualcomb,
   data = df_dualcomb_1yr,
   pval = TRUE,
@@ -1633,12 +1930,14 @@ ggsurvplot(
   ylab = "Survival Probability",
   title = "1-Year Kaplan-Meier Survival Curve: Dual Therapy vs Combined"
 )
+p_1yr_dualcomb <- fix_origin(p_1yr_dualcomb)
+print(p_1yr_dualcomb)
 
 ## ---- 2-YEAR PLOT: Dual Therapy vs Combined ----
 
 fit_2yr_dualcomb <- survfit(Surv(time_2yr, event_2yr) ~ GROUP_DUAL_COMBINED, data = df_dualcomb_2yr)
 
-ggsurvplot(
+p_2yr_dualcomb <- ggsurvplot(
   fit_2yr_dualcomb,
   data = df_dualcomb_2yr,
   pval = TRUE,
@@ -1651,12 +1950,13 @@ ggsurvplot(
   ylab = "Survival Probability",
   title = "2-Year Kaplan-Meier Survival Curve: Dual Therapy vs Combined"
 )
+p_2yr_dualcomb <- fix_origin(p_2yr_dualcomb)
+print(p_2yr_dualcomb)
 
 ## ---- Log-rank tests ----
 
 survdiff(Surv(time_1yr, event_1yr) ~ GROUP_DUAL_COMBINED, data = df_dualcomb_1yr)
 survdiff(Surv(time_2yr, event_2yr) ~ GROUP_DUAL_COMBINED, data = df_dualcomb_2yr)
-
 #===============================================================================
 # Building a Graph of Meds rx'd with Steroids in Antirejection Therapy
 #-------------------------------------------------------------------------------
@@ -1693,5 +1993,4 @@ ggplot(pivot_table, aes(x = reorder(Medication, Frequency), y = Frequency)) +
   scale_y_continuous(expand = expansion(mult = c(0, 0.15)))
 
 # ===========================================================================
-# Debugging 
-
+# Debugging
