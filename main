@@ -1,6 +1,6 @@
 # 
 # This script is designed to parse patients in the UNOS database into based on rejection status:
-# @ 6 months rejection vs no rejection | @ 12 months rejection vs no rejection
+# @ 12 months rejection vs no rejection
 
 
 #===============================================================================
@@ -66,6 +66,16 @@ if (!requireNamespace("survival", quietly = TRUE)) {
 }
 library(survival)
 
+if (!requireNamespace("scales", quietly = TRUE)) {
+  install.packages("scales")
+}
+library(scales)
+
+if (!requireNamespace("MatchIt", quietly = TRUE)) install.packages("MatchIt")
+library(MatchIt)
+
+if (!requireNamespace("cobalt", quietly = TRUE)) install.packages("cobalt")
+library(cobalt)
 
 #===============================================================================
 # Reading data (adjust path and file type as needed)
@@ -86,8 +96,8 @@ df_liver_fol <- read.csv("~/Local Documents/AOT/Analysis/FilteredData/liver_foll
 #df_immuno_induc <- read.csv("C:/Users/lukas/Documents/Med School/AOT/R/Output/Filtered Data by Date/liver-immuno-discharge_unfilter.csv")
 
 #-----------------------------------------------
-# _____________________________________________________________________________
-# creating filters of index data
+# ===============================================================================
+# Filters of index data
 # NOTE: loaded data is already filtered by 10 year date range at this point
 
 # ---------------------------------------------------------------
@@ -334,6 +344,13 @@ dual_therapy_id_vect <- pat_rej_array %>%
   pull(TRR_ID_CODE)
 
 #------------------------------------------------------------------------------
+# Collecting TRR_CODE of patients that used Rituxan ANY in anti-rejection therapy
+
+rituxan_any_id_vect <- pat_rej_array %>%
+  filter(RITUXAN_ANTIREJ == 1) %>%
+  pull(TRR_ID_CODE)
+
+#------------------------------------------------------------------------------
 # Creating the combined arm for comparison
 arm2_ID_vect <- c(simulect_id_all_vect, thymo_id_all_vect, rituxan_id_all_vect)
 
@@ -464,7 +481,7 @@ freq_long <- freq_drug_fol_antirej_indiv %>%
 pat_rej_demo_table <- pat_rej_array %>% 
   left_join(df_liver_data_filtered %>% 
               select(TRR_ID_CODE, AGE, GENDER, ETHCAT, MELD_PELD_LAB_SCORE, TXKID, TXHRT, TXLNG, TXPAN, 
-                     PREV_TX, PREV_TX_ANY_N, DON_TY, COLD_ISCH), by = "TRR_ID_CODE") |> 
+                     PREV_TX, PREV_TX_ANY_N, DON_TY, COLD_ISCH, DIAB), by = "TRR_ID_CODE") |> 
   group_by(TRR_ID_CODE) %>%
   filter(!(source == 1 & n() > 1)) %>%
   ungroup()%>% 
@@ -476,7 +493,7 @@ pat_rej_demo_table <- pat_rej_array %>%
 pat_ctrl_demo_table <- pat_ctrl_array %>% 
   left_join(df_liver_data_filtered %>% 
               select(TRR_ID_CODE, AGE, GENDER, ETHCAT, MELD_PELD_LAB_SCORE, TXKID, TXHRT, TXLNG, TXPAN, 
-                     PREV_TX, PREV_TX_ANY_N, DON_TY, COLD_ISCH), by = "TRR_ID_CODE") |> 
+                     PREV_TX, PREV_TX_ANY_N, DON_TY, COLD_ISCH, DIAB), by = "TRR_ID_CODE") |> 
   mutate(DISCHARGE_DATE = as.Date(DISCHARGE_DATE)) %>% 
   mutate(REJ_STAT = 0L) %>% # for the following merge this will let me know what is a nonrejection pt
   filter(!TRR_ID_CODE %in% pat_rej_demo_table$TRR_ID_CODE) |> 
@@ -488,7 +505,7 @@ pat_all_demo_table <- full_join(pat_rej_demo_table,pat_ctrl_demo_table)
 
 # Rituxan Demographic Table Building
 pat_ritux_demo_table <- pat_rej_demo_table %>% 
-  filter(TRR_ID_CODE %in% rituxan_id_all_vect)
+  filter(TRR_ID_CODE %in% rituxan_any_id_vect)
 
 # Steroid Demographic Table Building
 pat_steroid_demo_table <- pat_rej_demo_table |> 
@@ -523,6 +540,7 @@ demo_label1 = c(
   "Male Gender, n(%)",
   "Race, n(%)",
   "White", "Black", "Hispanic", "Asian", "Other/Multiracial",
+  "Diabetes, n(%)",
   "MELD, median(IQR)",
   "Organ Transplanted, n(%)",
   "Liver", "Liver and Kidney", "Liver and Heart", "Liver and Lung", "Liver and Pancreas",
@@ -540,39 +558,23 @@ demo_label1 = c(
 ref_value1 = c(
   "",
   "AGE",
-  "GENDER", # 1 - MALE, 2 - FEMALE
-  "", # RACE ROW
-  "ETHCAT", #1 - WHITE
-  "ETHCAT", # 2 - BLACK
-  "ETHCAT", # 4 - HISPANIC/LATINO
-  "ETHCAT", # 5 - ASIAN
-  "ETHCAT", # 6,7,9,998 - OTHER
-  "MELD_PELD_LAB_SCORE", # TX MELD
-  "", # ORGAN TRANSPLANTED, n(%)
-  "", # LIVER NEED TO CALC TOTAL CONSIDERED THEN SUBTRACT THE BELOW
-  "TXKID", # R,L,E
-  "TXHRT",
-  "TXLNG", #-R,L,E
-  "TXPAN", #-R,L,E
-  "DON_TY", # LIVING DONOR
-  "COLD_ISCH", #ISCHEMIA TIME
-  "PREV_TX", #PREVIOUS LIVER TX
-  "", # PREVIOUS ANY TX
-  "PREV_TX_ANY_N", # 0
-  "PREV_TX_ANY_N", # 1
-  "PREV_TX_ANY_N", # 2
-  "PREV_TX_ANY_N", # 3
-  "", #HLA Mismatch Leve, n(%)"
-  "MM_TOTAL", # 0
-  "MM_TOTAL", # 1
-  "MM_TOTAL", # 2
-  "MM_TOTAL", # 3
-  "MM_TOTAL", # 4
-  "MM_TOTAL", # 5
-  "MM_TOTAL", # 6
-  "LI_MACHINE_PERFUSION", # Liver Perfusion, n(%) <- now a real row, not a header
-  "LI_MACHINE_PERFUSION_TY", # 1 Normothermic
-  "LI_MACHINE_PERFUSION_TY"  # 2 Hypothermic
+  "GENDER",
+  "",
+  "ETHCAT", "ETHCAT", "ETHCAT", "ETHCAT", "ETHCAT",
+  "DIAB",
+  "MELD_PELD_LAB_SCORE",
+  "",
+  "",
+  "TXKID", "TXHRT", "TXLNG", "TXPAN",
+  "DON_TY",
+  "COLD_ISCH",
+  "PREV_TX",
+  "",
+  "PREV_TX_ANY_N", "PREV_TX_ANY_N", "PREV_TX_ANY_N", "PREV_TX_ANY_N",
+  "",
+  "MM_TOTAL", "MM_TOTAL", "MM_TOTAL", "MM_TOTAL", "MM_TOTAL", "MM_TOTAL", "MM_TOTAL",
+  "LI_MACHINE_PERFUSION",
+  "LI_MACHINE_PERFUSION_TY", "LI_MACHINE_PERFUSION_TY"
 )
 
 
@@ -593,6 +595,12 @@ calc_demo_stats <- function(df) {
   race_asia  <- sum(df$ETHCAT == "5", na.rm = TRUE)
   race_denom <- sum(!is.na(df$ETHCAT))
   race_other <- race_denom - sum(race_wt, race_bl, race_his, race_asia)
+  
+  # Diabetes: 1 = negative, 2-5 = positive, 998 = unknown, true NA = missing
+  # (unknown and missing both excluded from denom)
+  diab_pos <- sum(as.numeric(df$DIAB) %in% 2:5, na.rm = TRUE)
+  diab_neg <- sum(as.numeric(df$DIAB) == 1, na.rm = TRUE)
+  diab_denom <- diab_pos + diab_neg
   
   txkid <- sum(df$TXKID %in% c("L","R","E"), na.rm = TRUE)
   txhrt <- sum(df$TXHRT == "Y", na.rm = TRUE)
@@ -618,6 +626,9 @@ calc_demo_stats <- function(df) {
     race_asia    = race_asia,
     race_other   = race_other,
     race_denom   = race_denom,
+    
+    diab_pos     = diab_pos,
+    diab_denom   = diab_denom,
     
     meld_med     = median(df$MELD_PELD_LAB_SCORE, na.rm = TRUE),
     meld_q1      = quantile(df$MELD_PELD_LAB_SCORE, 0.25, na.rm = TRUE),
@@ -684,6 +695,8 @@ calc_demo_std <- function(s) {
     race_asia_perc  = pct(s$race_asia, s$race_denom),
     race_other_perc = pct(s$race_other, s$race_denom),
     
+    diab_perc = pct(s$diab_pos, s$diab_denom),
+    
     meld_qstring  = paste0(" (", s$meld_q1, "\u2013", s$meld_q3, ")"),
     
     txliv_perc    = pct(s$txliv, s$organ_denom),
@@ -726,6 +739,7 @@ build_mean_vector <- function(s) {
     s$gen_count,
     NA,
     s$race_wt, s$race_bl, s$race_his, s$race_asia, s$race_other,
+    s$diab_pos,
     s$meld_med,
     NA,
     s$txliv, s$txkid, s$txhrt, s$txlng, s$txpan,
@@ -748,6 +762,7 @@ build_std_vector <- function(s, std) {
     std$gen_perc,
     NA,
     std$race_wt_perc, std$race_bl_perc, std$race_his_perc, std$race_asia_perc, std$race_other_perc,
+    std$diab_perc,
     std$meld_qstring,
     NA,
     std$txliv_perc, std$txkid_perc, std$txhrt_perc, std$txlng_perc, std$txpan_perc,
@@ -898,13 +913,127 @@ demo_tbl1 %>%
     column_labels.font.weight = "bold"
   ) %>%
   tab_source_note("Values are n (%) or median (IQR) as indicated.")
-#----------------------------------------------------
+
+# ==============================================================================
+# Propensity Score Matching: Combined vs Steroid, Combined vs Control
+# ------------------------------------------------------------------------------
+
+# --- Step 0: Helper to build a matching-ready data frame ---
+# Recodes DIAB into a clean binary indicator (998/NA excluded, same logic as Table 1)
+prep_match_df <- function(df) {
+  df %>%
+    mutate(
+      DIAB_BIN = case_when(
+        as.numeric(DIAB) %in% 2:5 ~ 1,
+        as.numeric(DIAB) == 1     ~ 0,
+        TRUE                      ~ NA_real_
+      ),
+      GENDER = factor(GENDER),
+      ETHCAT = factor(ETHCAT),
+      DON_TY = factor(DON_TY)
+    )
+}
+
+# --- Step 1: Covariates for the propensity model ---
+# Adjust this list to whatever's clinically relevant to include
+match_covariates <- c("AGE", "GENDER", "ETHCAT", "MELD_PELD_LAB_SCORE", "DIAB_BIN", "COLD_ISCH")
+
+match_formula <- as.formula(paste("treat ~", paste(match_covariates, collapse = " + ")))
+
+# ------------------------------------------------------------------------------
+# Comparison 1: Combined vs Steroid
+# ------------------------------------------------------------------------------
+match_df_combined_steroid <- bind_rows(
+  prep_match_df(pat_combined_demo_table) %>% mutate(treat = 1),
+  prep_match_df(pat_steroid_demo_table)  %>% mutate(treat = 0)
+) %>%
+  select(TRR_ID_CODE, treat, all_of(match_covariates)) %>%
+  drop_na()   # MatchIt needs complete cases on the matching covariates
+
+set.seed(1234)  # reproducibility of the matching algorithm
+
+m_combined_steroid <- matchit(
+  match_formula,
+  data     = match_df_combined_steroid,
+  method   = "nearest",
+  distance = "logit",
+  ratio    = 1
+)
+
+summary(m_combined_steroid)  # check balance (Std. Mean Diff should shrink toward 0)
+
+matched_combined_steroid <- match.data(m_combined_steroid)
+
+# Pull matched IDs back into your existing demo tables
+combined_ids_1 <- matched_combined_steroid %>% filter(treat == 1) %>% pull(TRR_ID_CODE)
+steroid_ids    <- matched_combined_steroid %>% filter(treat == 0) %>% pull(TRR_ID_CODE)
+
+pat_combined_demo_table_m_steroid <- pat_combined_demo_table %>% filter(TRR_ID_CODE %in% combined_ids_1)
+pat_steroid_demo_table_m          <- pat_steroid_demo_table  %>% filter(TRR_ID_CODE %in% steroid_ids)
+
+# ------------------------------------------------------------------------------
+# Comparison 2: Combined vs Control (No Rejection)
+# ------------------------------------------------------------------------------
+match_df_combined_ctrl <- bind_rows(
+  prep_match_df(pat_combined_demo_table) %>% mutate(treat = 1),
+  prep_match_df(pat_ctrl_demo_table)     %>% mutate(treat = 0)
+) %>%
+  select(TRR_ID_CODE, treat, all_of(match_covariates)) %>%
+  drop_na()
+
+set.seed(1234)
+
+m_combined_ctrl <- matchit(
+  match_formula,
+  data     = match_df_combined_ctrl,
+  method   = "nearest",
+  distance = "logit",
+  ratio    = 1
+)
+
+summary(m_combined_ctrl)
+
+matched_combined_ctrl <- match.data(m_combined_ctrl)
+
+combined_ids_2 <- matched_combined_ctrl %>% filter(treat == 1) %>% pull(TRR_ID_CODE)
+ctrl_ids       <- matched_combined_ctrl %>% filter(treat == 0) %>% pull(TRR_ID_CODE)
+
+pat_combined_demo_table_m_ctrl <- pat_combined_demo_table %>% filter(TRR_ID_CODE %in% combined_ids_2)
+pat_ctrl_demo_table_m          <- pat_ctrl_demo_table     %>% filter(TRR_ID_CODE %in% ctrl_ids)
+
+# ==============================================================================
+# Love Plots: Covariate Balance Before/After Matching
+# ------------------------------------------------------------------------------
+# --- Combined vs Steroid ---
+love.plot(
+  m_combined_steroid,
+  binary   = "std",              # standardized diff for binary vars too
+  stats    = "mean.diffs",
+  abs      = TRUE,                # absolute value of std. mean diff (easier to read)
+  var.order = "unadjusted",       # sorts by size of the pre-match imbalance
+  thresholds = c(m = 0.1),        # draws a reference line at the common 0.1 cutoff
+  title    = "Covariate Balance: Combined vs Steroid",
+  sample.names = c("Unmatched", "Matched")
+)
+
+# --- Combined vs Control ---
+love.plot(
+  m_combined_ctrl,
+  binary   = "std",
+  stats    = "mean.diffs",
+  abs      = TRUE,
+  var.order = "unadjusted",
+  thresholds = c(m = 0.1),
+  title    = "Covariate Balance: Combined vs Control",
+  sample.names = c("Unmatched", "Matched")
+)
 
 #===============================================================================
 # Running Demographic Functions #2 - Steroid vs Combined Therapy
 # ------------------------------------------------------------------------
-rej_stats  <- calc_demo_stats(pat_combined_demo_table)
-ctrl_stats <- calc_demo_stats(pat_steroid_demo_table)
+# EDIT BELOW TWO FOR PROPENSITY MATCHING!!
+rej_stats  <- calc_demo_stats(pat_combined_demo_table_m_steroid) #pat_combined_demo_table
+ctrl_stats <- calc_demo_stats(pat_steroid_demo_table_m) #pat_steroid_demo_table
 
 rej_std  <- calc_demo_std(rej_stats)
 ctrl_std <- calc_demo_std(ctrl_stats)
@@ -918,7 +1047,6 @@ mean_ctrl <- build_mean_vector(ctrl_stats)
 std_rej  <- data.frame(std_rej  = build_std_vector(rej_stats, rej_std))
 std_ctrl <- data.frame(std_ctrl = build_std_vector(ctrl_stats, ctrl_std))
 
-# ------------------------------------------------------------------------
 #------------------------------------------------------------------------
 # Statistical Testing: Rejection vs Control
 # ------------------------------------------------------------------------
@@ -986,6 +1114,21 @@ calc_pvalues <- function(df_rej, df_ctrl) {
     )
   }
   
+  test_diab <- function(df_rej, df_ctrl) {
+    pos_rej <- sum(as.numeric(df_rej$DIAB) %in% 2:5, na.rm = TRUE)
+    neg_rej <- sum(as.numeric(df_rej$DIAB) == 1, na.rm = TRUE)
+    
+    pos_ctrl <- sum(as.numeric(df_ctrl$DIAB) %in% 2:5, na.rm = TRUE)
+    neg_ctrl <- sum(as.numeric(df_ctrl$DIAB) == 1, na.rm = TRUE)
+    
+    tab <- matrix(c(pos_rej, neg_rej, pos_ctrl, neg_ctrl), nrow = 2)
+    if (sum(tab) == 0) return(NA_real_)
+    tryCatch(
+      if (any(tab < 5)) fisher.test(tab)$p.value else chisq.test(tab)$p.value,
+      error = function(e) NA_real_
+    )
+  }
+  
   # --- Organ transplanted groups (mirrors calc_demo_stats bucketing) ---
   organ_group <- function(df) {
     has_data <- !is.na(df$TXKID) | !is.na(df$TXHRT) | !is.na(df$TXLNG) | !is.na(df$TXPAN)
@@ -1002,6 +1145,7 @@ calc_pvalues <- function(df_rej, df_ctrl) {
   p_age    <- test_cont("AGE")
   p_gender <- test_binary("GENDER", "M")
   p_race   <- test_multilevel(race_group(df_rej), race_group(df_ctrl))
+  p_diab   <- test_diab(df_rej, df_ctrl)
   p_meld   <- test_cont("MELD_PELD_LAB_SCORE")
   p_organ  <- test_multilevel(organ_group(df_rej), organ_group(df_ctrl))
   p_livdon <- test_binary("DON_TY", "L")
@@ -1030,6 +1174,7 @@ calc_pvalues <- function(df_rej, df_ctrl) {
     p_gender,
     p_race,
     NA, NA, NA, NA, NA,
+    p_diab,
     p_meld,
     p_organ,
     NA, NA, NA, NA, NA,
@@ -1040,13 +1185,13 @@ calc_pvalues <- function(df_rej, df_ctrl) {
     NA, NA, NA, NA,
     p_hla,
     NA, NA, NA, NA, NA, NA, NA,
-    p_perf_used, # <- Liver Perfusion header now tests usage (Y/N), matches perf_n_perc
-    p_perf_ty,   # <- Normothermic row now carries the type p-value
-    NA           # <- Hypothermic (still no separate p, shares the type test above)
+    p_perf_used,
+    p_perf_ty,
+    NA
   )
 }
 
-pval_rej_ctrl <- calc_pvalues(pat_combined_demo_table, pat_steroid_demo_table)
+pval_rej_ctrl <- calc_pvalues(pat_combined_demo_table_m_steroid, pat_steroid_demo_table_m) # EDIT HERE for match at_combined_demo_table, pat_steroid_demo_table
 
 # ------------------------------------------------------------------------
 # Tibble Demographic Data (now including p-values)
@@ -1129,8 +1274,9 @@ demo_tbl2 %>%
 #===============================================================================
 # Running Demographic Functions #3 - Combined Therapy vs No Rejection (Control)
 # ------------------------------------------------------------------------
-rej_stats  <- calc_demo_stats(pat_combined_demo_table)
-ctrl_stats <- calc_demo_stats(pat_ctrl_demo_table)
+# EDIT BELOW FOR PROPENSITY MATCHING
+rej_stats  <- calc_demo_stats(pat_combined_demo_table_m_ctrl) #pat_combined_demo_table
+ctrl_stats <- calc_demo_stats(pat_ctrl_demo_table_m) #pat_ctrl_demo_table
 
 rej_std  <- calc_demo_std(rej_stats)
 ctrl_std <- calc_demo_std(ctrl_stats)
@@ -1144,7 +1290,7 @@ mean_ctrl <- build_mean_vector(ctrl_stats)
 std_rej  <- data.frame(std_rej  = build_std_vector(rej_stats, rej_std))
 std_ctrl <- data.frame(std_ctrl = build_std_vector(ctrl_stats, ctrl_std))
 
-pval_combined_norej <- calc_pvalues(pat_combined_demo_table, pat_ctrl_demo_table)
+pval_combined_norej <- calc_pvalues(pat_combined_demo_table_m_ctrl, pat_ctrl_demo_table_m) #EDIT here for match pat_combined_demo_table, pat_ctrl_demo_table
 
 # ------------------------------------------------------------------------
 # Tibble Demographic Data (Combined vs No Rejection, with p-values)
@@ -1511,8 +1657,40 @@ ggsurvplot(
 survdiff(Surv(time_1yr, event_1yr) ~ GROUP_DUAL_COMBINED, data = df_dualcomb_1yr)
 survdiff(Surv(time_2yr, event_2yr) ~ GROUP_DUAL_COMBINED, data = df_dualcomb_2yr)
 
+#===============================================================================
+# Building a Graph of Meds rx'd with Steroids in Antirejection Therapy
+#-------------------------------------------------------------------------------
+dual_therapy_array <- pat_rej_array |> 
+  filter(TRR_ID_CODE %in% dual_therapy_id_vect)
 
+dual_therapy_array |>
+  summarise(across(c(THYMOGLOBULIN_ANTIREJ, RITUXAN_ANTIREJ, ATGAM_ANTIREJ, SIMULECT_ANTIREJ), ~ sum(.x > 0, na.rm = TRUE)))
 
+med_cols <- c("THYMOGLOBULIN_ANTIREJ", "RITUXAN_ANTIREJ", "ATGAM_ANTIREJ", "SIMULECT_ANTIREJ")
+
+pivot_table <- dual_therapy_array %>%
+  summarise(across(all_of(med_cols), ~ sum(.x > 0, na.rm = TRUE))) %>%
+  pivot_longer(everything(), names_to = "Medication", values_to = "Frequency") %>%
+  arrange(desc(Frequency))
+
+pivot_table <- pivot_table %>%
+  mutate(Percent = Frequency / sum(Frequency))
+
+ggplot(pivot_table, aes(x = reorder(Medication, Frequency), y = Frequency)) +
+  geom_col(fill = "steelblue") +
+  geom_text(
+    aes(label = paste0(Frequency, " (", percent(Percent, accuracy = 0.1), ")")),
+    hjust = -0.1,
+    size = 3.5
+  ) +
+  coord_flip() +
+  labs(
+    title = "Frequency of Combination Anti-Rejection Rx with Steroids",
+    x = "Secondary Medication",
+    y = "Frequency"
+  ) +
+  theme_minimal() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15)))
 
 # ===========================================================================
 # Debugging 
