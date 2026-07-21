@@ -3,10 +3,9 @@
 # @ 6 months rejection vs no rejection | @ 12 months rejection vs no rejection
 
 
-#_________________________________________________________________________________
+#===============================================================================
 # Load required libraries
 #---------------------------------
-
 if (!requireNamespace("ggplot2", quietly = TRUE)) {
   install.packages("ggplot2")
 }
@@ -56,10 +55,20 @@ if (!requireNamespace("tibble", quietly = TRUE)) {
   install.packages("tibble")
 }
 library(tibble)
-#-----------------
-# ______________________________________________________________________________
-# Reading data (adjust path and file type as needed)
 
+if (!requireNamespace("survminer", quietly = TRUE)) {
+  install.packages("survminer")
+}
+library(survminer)
+
+if (!requireNamespace("survival", quietly = TRUE)) {
+  install.packages("survival")
+}
+library(survival)
+
+
+#===============================================================================
+# Reading data (adjust path and file type as needed)
 #------------------------
 # Mac loading
 df_immuno_fol_read <- read.csv("~/Local Documents/AOT/Analysis/FilteredData/liver_immuno_followup.csv", stringsAsFactors = FALSE)
@@ -291,7 +300,6 @@ monotherapy_reject <- pat_rej_array |>
 # -----------------------------------------------------------------------------
 # Collecting TRR_CODE of patients that used Rituxan ONLY in anti-rejection therapy
 
-# During in patient stay
 rituxan_id_all_vect <- monotherapy_reject %>%
   filter(RITUXAN_ANTIREJ == 1) %>%
   pull(TRR_ID_CODE)
@@ -299,7 +307,6 @@ rituxan_id_all_vect <- monotherapy_reject %>%
 #--------------------------------------------------------------------------------
 # Collecting TRR_CODE of patients that used Steroids ONLY in anti-rejection therapy
 
-# During in patient stay
 steroid_id_all_vect <- monotherapy_reject %>%
   filter(STEROIDS_ANTIREJ == 1) %>%
   pull(TRR_ID_CODE)
@@ -307,7 +314,6 @@ steroid_id_all_vect <- monotherapy_reject %>%
 #--------------------------------------------------------------------------------
 # Collecting TRR_CODE of patients that used Thymoglobulin ONLY in anti-rejection therapy
 
-# During in patient stay
 thymo_id_all_vect <- monotherapy_reject %>%
   filter(THYMOGLOBULIN_ANTIREJ == 1) %>%
   pull(TRR_ID_CODE)
@@ -315,14 +321,28 @@ thymo_id_all_vect <- monotherapy_reject %>%
 #--------------------------------------------------------------------------------
 # Collecting TRR_CODE of patients that used SIMULECT ONLY in anti-rejection therapy
 
-# During in patient stay
 simulect_id_all_vect <- monotherapy_reject %>%
   filter(SIMULECT_ANTIREJ == 1) %>%
   pull(TRR_ID_CODE)
 
 #------------------------------------------------------------------------------
+# Collecting TRR_CODE of patients that used STEROID + Combo Therapy in anti-rejection therapy
+
+dual_therapy_id_vect <- pat_rej_array %>%
+  filter(STEROIDS_ANTIREJ == 1) %>%
+  filter(SIMULECT_ANTIREJ == 1 | THYMOGLOBULIN_ANTIREJ == 1 | RITUXAN_ANTIREJ == 1) |> 
+  pull(TRR_ID_CODE)
+
+#------------------------------------------------------------------------------
 # Creating the combined arm for comparison
 arm2_ID_vect <- c(simulect_id_all_vect, thymo_id_all_vect, rituxan_id_all_vect)
+
+#--------------------------------------------------------------------------------
+# Collecting TRR_CODE of control patients that were NEVER treated for anti-rejection therapy
+
+ctrl_id_vect <- pat_ctrl_array %>%
+  pull(TRR_ID_CODE)
+
 
 # =============================================================================
 # HLA MISMATCH CALCULATION (A, B, DR loci) — 0 to 6 scale
@@ -365,8 +385,9 @@ df_hla_calc <- df_hla_fil %>%
   ungroup() %>% 
   select(TRR_ID_CODE, MM_A, MM_B, MM_DR, MM_TOTAL)
 
-#-----------------------------------------------------------------------
+#===============================================================================
 # Processing PRA Data
+#------------------------------------------------------------------------------- 
 # CANNOT DO, physcians/centers stopped reporting PRA around mid-March 2015 :(
 
 # df_pra_invest <- df_pra %>% 
@@ -374,14 +395,15 @@ df_hla_calc <- df_hla_fil %>%
 #               select(TRR_ID_CODE, TX_DATE), by = "TRR_ID_CODE") %>% 
 #   select(TRR_ID_CODE,PRA1,PRA2,TX_DATE)
 
-#-----------------------------------------------------------------------
+#===============================================================================
 # Processing Deceased Donor Data
+#------------------------------------------------------------------------------
 # want to extract time to transplant, perfusion(y/n), age of donor, 
 
 df_deceased_don_fil2 <- df_deceased_don_fil %>% 
   left_join(df_liver_data_filtered |> 
               select(DONOR_ID, TRR_ID_CODE), by = "DONOR_ID") |> 
-  select(TRR_ID_CODE, AGE_DON, LI_MACHINE_PERFUSION, LI_MACHINE_PERFUSION_TY, LI_FIBROSIS) # may want to look at viral stats too in the future
+  select(TRR_ID_CODE, AGE_DON, LI_MACHINE_PERFUSION, LI_MACHINE_PERFUSION_TY, LI_FIBROSIS, NON_HRT_DON) # may want to look at viral stats too in the future
 
 # =============================================================================
 # Graphing
@@ -433,7 +455,7 @@ freq_long <- freq_drug_fol_antirej_indiv %>%
 # ggsave("C:/Users/lukas/Documents/Med School/AOT/R/Output/Graphs/immuno_induction_rej_frequency_bar_plot.png", width = 8, height = 6)
 # 
 #------------------------------------
-#_________________________________________________________________________________
+#===============================================================================
 # Tables
 #------------------------------------------------------------------------
 # Collecting Demographic Data on the Reject vs Control Patients
@@ -475,6 +497,7 @@ pat_steroid_demo_table <- pat_rej_demo_table |>
 # Combined Arm Demographic Table Building
 pat_combined_demo_table <- pat_rej_demo_table |> 
   filter(TRR_ID_CODE %in% arm2_ID_vect)
+
 
 #-----------
 # Doing some double checking on demographic TRR_ID_CODES
@@ -553,7 +576,7 @@ ref_value1 = c(
 )
 
 
-#__________________________________________________-
+#=================================================================
 # Demographic Table Functions
 #-----------------------------------
 
@@ -1201,12 +1224,296 @@ demo_tbl3 %>%
   ) %>%
   tab_source_note("Values are n (%) or median (IQR) as indicated. P-values from Wilcoxon rank-sum (continuous), chi-square, or Fisher's exact tests (categorical) as appropriate.")
 
-# ___________________________________________________________________________
-# Debugging (scratch checks, safe to remove once satisfied with results)
+#==============================================================================
+# Survival Plots 
+#-------------------------------------------------------------------------------
+df_survival <- df_liver_data_filtered |> 
+  select(TRR_ID_CODE, TX_DATE, COMPOSITE_DEATH_DATE, RETXDATE, PTIME, PX_STAT, PX_STAT_DATE) |> 
+  mutate(ONE_YEAR_TX_SURV = case_when(
+    PTIME >= 365.25 ~ 1,
+    PTIME < 365.25 ~ 0
+  )) |> 
+  mutate(TWO_YEAR_TX_SURV = case_when(
+    PTIME >= 730.5 ~ 1,
+    PTIME < 730.5 ~ 0
+  ))
 
-tab_check <- rbind(
-  table(factor(pat_combined_demo_table$LI_MACHINE_PERFUSION_TY, levels = c("1","2"))),
-  table(factor(pat_steroid_demo_table$LI_MACHINE_PERFUSION_TY, levels = c("1","2")))
+df_survival <- df_survival |> 
+  mutate(GROUP = case_when(
+    TRR_ID_CODE %in% steroid_id_all_vect ~ "Steroids",
+    TRR_ID_CODE %in% arm2_ID_vect ~ "Combined",
+    TRR_ID_CODE %in% ctrl_id_vect ~ "Control",
+    TRUE ~ NA_character_
+  )) |> 
+  mutate(GROUP = factor(GROUP, levels = c("Steroids", "Combined", "Control")))  # set ONCE, consistently
+
+# Sanity check: make sure nothing got dropped
+table(df_survival$GROUP, useNA = "ifany")
+
+# Event indicator based on actual death status, not just PTIME threshold
+df_survival <- df_survival |> 
+  mutate(event = ifelse(PX_STAT == "D", 1, 0))  # confirm "D" is your death code
+
+## ---- 1-YEAR ----
+
+df_survival_1yr <- df_survival |> 
+  mutate(
+    event_1yr = ifelse(PTIME <= 365.25, event, 0),
+    time_1yr  = pmin(PTIME, 365.25)
+  )
+
+fit_1yr <- survfit(Surv(time_1yr, event_1yr) ~ GROUP, data = df_survival_1yr)
+summary(fit_1yr)
+
+ggsurvplot(
+  fit_1yr,
+  data = df_survival_1yr,
+  pval = TRUE,
+  conf.int = TRUE,
+  risk.table = TRUE,
+  break.time.by = 90,
+  legend.title = "Group",
+  legend.labs = c("Steroids", "Combined", "Control"),
+  xlab = "Time (days)",
+  ylab = "Survival Probability",
+  title = "1-Year Kaplan-Meier Survival Curve by Group"
 )
-print(tab_check)
-fisher.test(tab_check)
+
+summary(fit_1yr, times = 365.25)
+
+df_2groups_1yr <- df_survival_1yr |> 
+  filter(GROUP %in% c("Steroids", "Combined")) |> 
+  droplevels()  # removes "Control" as an unused factor level
+
+survdiff(Surv(time_1yr, event_1yr) ~ GROUP, data = df_2groups_1yr)
+
+## ---- 2-YEAR ----
+
+df_survival_2yr <- df_survival |> 
+  mutate(
+    event_2yr = ifelse(PTIME <= 730.5, event, 0),
+    time_2yr  = pmin(PTIME, 730.5)
+  )
+
+fit_2yr <- survfit(Surv(time_2yr, event_2yr) ~ GROUP, data = df_survival_2yr)
+
+ggsurvplot(
+  fit_2yr,
+  data = df_survival_2yr,
+  pval = TRUE,
+  conf.int = TRUE,
+  risk.table = TRUE,
+  break.time.by = 180,
+  legend.title = "Group",
+  legend.labs = c("Steroids", "Combined", "Control"),
+  xlab = "Time (days)",
+  ylab = "Survival Probability",
+  title = "2-Year Kaplan-Meier Survival Curve by Group"
+)
+
+summary(fit_2yr, times = 730.5)
+
+df_2groups_2yr <- df_survival_2yr |> 
+  filter(GROUP %in% c("Steroids", "Combined")) |> 
+  droplevels()
+
+survdiff(Surv(time_2yr, event_2yr) ~ GROUP, data = df_2groups_2yr)
+
+#-----------------------------------------------------------------
+# Filter to Steroids vs Combined only
+df_2groups_1yr <- df_survival_1yr |> 
+  filter(GROUP %in% c("Steroids", "Combined")) |> 
+  droplevels()
+
+df_2groups_2yr <- df_survival_2yr |> 
+  filter(GROUP %in% c("Steroids", "Combined")) |> 
+  droplevels()
+
+## ---- 1-YEAR PLOT ----
+
+fit_1yr_2grp <- survfit(Surv(time_1yr, event_1yr) ~ GROUP, data = df_2groups_1yr)
+
+ggsurvplot(
+  fit_1yr_2grp,
+  data = df_2groups_1yr,
+  pval = TRUE,
+  conf.int = TRUE,
+  risk.table = TRUE,
+  break.time.by = 90,
+  legend.title = "Group",
+  legend.labs = c("Steroids", "Combined"),
+  xlab = "Time (days)",
+  ylab = "Survival Probability",
+  title = "1-Year Kaplan-Meier Survival Curve: Steroids vs Combined"
+)
+
+## ---- 2-YEAR PLOT ----
+
+fit_2yr_2grp <- survfit(Surv(time_2yr, event_2yr) ~ GROUP, data = df_2groups_2yr)
+
+ggsurvplot(
+  fit_2yr_2grp,
+  data = df_2groups_2yr,
+  pval = TRUE,
+  conf.int = TRUE,
+  risk.table = TRUE,
+  break.time.by = 180,
+  legend.title = "Group",
+  legend.labs = c("Steroids", "Combined"),
+  xlab = "Time (days)",
+  ylab = "Survival Probability",
+  title = "2-Year Kaplan-Meier Survival Curve: Steroids vs Combined"
+)
+
+#------------------------------------------------------------------------------
+# Comparing Steroids alone vs Steroids + Dual Therapy
+
+df_survival <- df_survival |> 
+  mutate(GROUP_DUAL = case_when(
+    TRR_ID_CODE %in% steroid_id_all_vect ~ "Steroids",
+    TRR_ID_CODE %in% dual_therapy_id_vect ~ "Dual Therapy",
+    TRUE ~ NA_character_
+  )) |> 
+  mutate(GROUP_DUAL = factor(GROUP_DUAL, levels = c("Steroids", "Dual Therapy")))
+
+# Sanity check: make sure counts look right and there's no overlap
+table(df_survival$GROUP_DUAL, useNA = "ifany")
+intersect(steroid_id_all_vect, dual_therapy_id_vect)  # should be empty (character(0))
+
+## ---- Build truncated 1yr / 2yr datasets for this comparison ----
+
+df_dual_1yr <- df_survival |> 
+  filter(!is.na(GROUP_DUAL)) |> 
+  mutate(
+    event_1yr = ifelse(PTIME <= 365.25, event, 0),
+    time_1yr  = pmin(PTIME, 365.25)
+  )
+
+df_dual_2yr <- df_survival |> 
+  filter(!is.na(GROUP_DUAL)) |> 
+  mutate(
+    event_2yr = ifelse(PTIME <= 730.5, event, 0),
+    time_2yr  = pmin(PTIME, 730.5)
+  )
+
+## ---- 1-YEAR PLOT: Steroids vs Dual Therapy ----
+
+fit_1yr_dual <- survfit(Surv(time_1yr, event_1yr) ~ GROUP_DUAL, data = df_dual_1yr)
+
+ggsurvplot(
+  fit_1yr_dual,
+  data = df_dual_1yr,
+  pval = TRUE,
+  conf.int = TRUE,
+  risk.table = TRUE,
+  break.time.by = 90,
+  legend.title = "Group",
+  legend.labs = c("Steroids", "Dual Therapy"),
+  xlab = "Time (days)",
+  ylab = "Survival Probability",
+  title = "1-Year Kaplan-Meier Survival Curve: Steroids vs Dual Therapy"
+)
+
+## ---- 2-YEAR PLOT: Steroids vs Dual Therapy ----
+
+fit_2yr_dual <- survfit(Surv(time_2yr, event_2yr) ~ GROUP_DUAL, data = df_dual_2yr)
+
+ggsurvplot(
+  fit_2yr_dual,
+  data = df_dual_2yr,
+  pval = TRUE,
+  conf.int = TRUE,
+  risk.table = TRUE,
+  break.time.by = 180,
+  legend.title = "Group",
+  legend.labs = c("Steroids", "Dual Therapy"),
+  xlab = "Time (days)",
+  ylab = "Survival Probability",
+  title = "2-Year Kaplan-Meier Survival Curve: Steroids vs Dual Therapy"
+)
+
+## ---- Log-rank tests ----
+
+survdiff(Surv(time_1yr, event_1yr) ~ GROUP_DUAL, data = df_dual_1yr)
+survdiff(Surv(time_2yr, event_2yr) ~ GROUP_DUAL, data = df_dual_2yr)
+
+library(survival)
+library(survminer)
+
+## ---- Build a separate grouping variable for this comparison ----
+
+df_survival <- df_survival |> 
+  mutate(GROUP_DUAL_COMBINED = case_when(
+    TRR_ID_CODE %in% dual_therapy_id_vect ~ "Dual Therapy",
+    TRR_ID_CODE %in% arm2_ID_vect ~ "Combined",
+    TRUE ~ NA_character_
+  )) |> 
+  mutate(GROUP_DUAL_COMBINED = factor(GROUP_DUAL_COMBINED, levels = c("Dual Therapy", "Combined")))
+
+# Sanity check: counts and overlap
+table(df_survival$GROUP_DUAL_COMBINED, useNA = "ifany")
+intersect(dual_therapy_id_vect, arm2_ID_vect)  # should be empty (character(0))
+
+## ---- Build truncated 1yr / 2yr datasets for this comparison ----
+
+df_dualcomb_1yr <- df_survival |> 
+  filter(!is.na(GROUP_DUAL_COMBINED)) |> 
+  mutate(
+    event_1yr = ifelse(PTIME <= 365.25, event, 0),
+    time_1yr  = pmin(PTIME, 365.25)
+  )
+
+df_dualcomb_2yr <- df_survival |> 
+  filter(!is.na(GROUP_DUAL_COMBINED)) |> 
+  mutate(
+    event_2yr = ifelse(PTIME <= 730.5, event, 0),
+    time_2yr  = pmin(PTIME, 730.5)
+  )
+
+## ---- 1-YEAR PLOT: Dual Therapy vs Combined ----
+
+fit_1yr_dualcomb <- survfit(Surv(time_1yr, event_1yr) ~ GROUP_DUAL_COMBINED, data = df_dualcomb_1yr)
+
+ggsurvplot(
+  fit_1yr_dualcomb,
+  data = df_dualcomb_1yr,
+  pval = TRUE,
+  conf.int = TRUE,
+  risk.table = TRUE,
+  break.time.by = 90,
+  legend.title = "Group",
+  legend.labs = c("Dual Therapy", "Combined"),
+  xlab = "Time (days)",
+  ylab = "Survival Probability",
+  title = "1-Year Kaplan-Meier Survival Curve: Dual Therapy vs Combined"
+)
+
+## ---- 2-YEAR PLOT: Dual Therapy vs Combined ----
+
+fit_2yr_dualcomb <- survfit(Surv(time_2yr, event_2yr) ~ GROUP_DUAL_COMBINED, data = df_dualcomb_2yr)
+
+ggsurvplot(
+  fit_2yr_dualcomb,
+  data = df_dualcomb_2yr,
+  pval = TRUE,
+  conf.int = TRUE,
+  risk.table = TRUE,
+  break.time.by = 180,
+  legend.title = "Group",
+  legend.labs = c("Dual Therapy", "Combined"),
+  xlab = "Time (days)",
+  ylab = "Survival Probability",
+  title = "2-Year Kaplan-Meier Survival Curve: Dual Therapy vs Combined"
+)
+
+## ---- Log-rank tests ----
+
+survdiff(Surv(time_1yr, event_1yr) ~ GROUP_DUAL_COMBINED, data = df_dualcomb_1yr)
+survdiff(Surv(time_2yr, event_2yr) ~ GROUP_DUAL_COMBINED, data = df_dualcomb_2yr)
+
+
+
+
+# ===========================================================================
+# Debugging 
+
