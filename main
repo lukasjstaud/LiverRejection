@@ -171,7 +171,7 @@ df_immuno_fol <- df_immuno_fol %>% # telling R to treat columns as a date and so
     TX_DATE = as.Date(TX_DATE)
   ) %>% # sets csv values in these columns as date data types
   mutate(FOL_DATE_DAYS_DELTA = time_length(interval(TX_DATE, PX_STAT_DATE_FOL), "days")) %>% # new column with post op days
-  filter(abs(FOL_DATE_DAYS_DELTA) < 365.24219) %>% # filters for follow ups + 1 year
+  filter(FOL_DATE_DAYS_DELTA >= 0 & FOL_DATE_DAYS_DELTA < 365.24219) %>% # filters for follow ups + 1 year
   arrange(PX_STAT_DATE_FOL) # orders based on follow up date
 
 #_________________________________________________________________________________
@@ -398,7 +398,8 @@ df_hla_calc <- df_hla_fil %>%
     )
   ) %>%
   ungroup() %>% 
-  select(TRR_ID_CODE, MM_A, MM_B, MM_DR, MM_TOTAL)
+  select(TRR_ID_CODE, MM_A, MM_B, MM_DR, MM_TOTAL) |> 
+  distinct(TRR_ID_CODE, .keep_all = TRUE)
 
 #===============================================================================
 # Processing PRA Data
@@ -1078,7 +1079,8 @@ prep_match_df <- function(df) {
 
 # --- Step 1: Covariates for the propensity model ---
 # Adjust this list to whatever's clinically relevant to include
-match_covariates <- c("AGE", "GENDER", "ETHCAT", "MELD_PELD_LAB_SCORE", "DIAB_BIN", "COLD_ISCH")
+match_covariates <- c("AGE", "GENDER", "ETHCAT", "MELD_PELD_LAB_SCORE", 
+                      "DIAB_BIN", "COLD_ISCH", "MM_TOTAL")
 
 match_formula <- as.formula(paste("treat ~", paste(match_covariates, collapse = " + ")))
 
@@ -1596,7 +1598,7 @@ df_survival <- df_liver_data_filtered |>
 df_survival <- df_survival |> 
   mutate(GROUP = case_when(
     TRR_ID_CODE %in% steroid_ids ~ "Steroids",
-    TRR_ID_CODE %in% combined_ids_1 ~ "Combined",
+    TRR_ID_CODE %in% combined_ids_2 ~ "Combined",
     TRR_ID_CODE %in% ctrl_ids ~ "Control",
     TRUE ~ NA_character_
   )) |> 
@@ -1957,6 +1959,197 @@ print(p_2yr_dualcomb)
 
 survdiff(Surv(time_1yr, event_1yr) ~ GROUP_DUAL_COMBINED, data = df_dualcomb_1yr)
 survdiff(Surv(time_2yr, event_2yr) ~ GROUP_DUAL_COMBINED, data = df_dualcomb_2yr)
+
+#===============================================================================
+# Hazard Ratio Analysis: 2-Year Mortality
+#-------------------------------------------------------------------------------
+# Fits Cox proportional-hazards models on the truncated 2-year survival
+# datasets already built in the "Survival Plots" section:
+#   df_survival_2yr   - all 3 arms (Steroids / Combined / Control)
+#   df_2groups_2yr    - Steroids vs Combined
+#   df_combctrl_2yr   - Combined vs Control
+#   df_dual_2yr       - Steroids vs Dual Therapy
+#   df_dualcomb_2yr   - Dual Therapy vs Combined
+#
+# Reports unadjusted HRs with 95% CI and p-values, checks the proportional-
+# hazards (PH) assumption via cox.zph(), builds a summary gt table, and
+# draws forest plots. An optional covariate-adjusted section follows.
+#-------------------------------------------------------------------------------
+
+# --- Helper: run coxph on a 2-group comparison and return a tidy summary row ---
+run_coxph_2yr <- function(data, group_var, label) {
+  form <- as.formula(paste0("Surv(time_2yr, event_2yr) ~ ", group_var))
+  fit <- coxph(form, data = data)
+  s <- summary(fit)
+  
+  # A 2-level factor group variable gives exactly one coefficient row
+  hr    <- s$conf.int[1, "exp(coef)"]
+  ci_lo <- s$conf.int[1, "lower .95"]
+  ci_hi <- s$conf.int[1, "upper .95"]
+  pval  <- s$coefficients[1, "Pr(>|z|)"]
+  
+  # Proportional-hazards assumption check
+  zph  <- tryCatch(cox.zph(fit), error = function(e) NULL)
+  ph_p <- if (!is.null(zph)) zph$table[1, "p"] else NA_real_
+  
+  tibble(
+    Comparison = label,
+    n          = fit$n,
+    events     = fit$nevent,
+    HR         = hr,
+    CI_lower   = ci_lo,
+    CI_upper   = ci_hi,
+    p_value    = pval,
+    ph_test_p  = ph_p
+  )
+}
+
+# --- Run on each pre-built 2-group / 2-year dataset ---
+hr_steroid_combined <- run_coxph_2yr(df_2groups_2yr,  "GROUP",                  "Combined vs Steroids")
+hr_combined_control <- run_coxph_2yr(df_combctrl_2yr, "GROUP_COMBINED_CONTROL", "Combined vs Control")
+hr_steroid_dual      <- run_coxph_2yr(df_dual_2yr,     "GROUP_DUAL",             "Dual Therapy vs Steroids")
+hr_dual_combined     <- run_coxph_2yr(df_dualcomb_2yr, "GROUP_DUAL_COMBINED",    "Combined vs Dual Therapy")
+
+hr_results_2yr <- bind_rows(
+  hr_steroid_combined,
+  hr_combined_control,
+  hr_steroid_dual,
+  hr_dual_combined
+)
+
+hr_results_2yr
+
+# --- Overall 3-arm model (Steroids as reference) ---
+fit_3arm_2yr <- coxph(Surv(time_2yr, event_2yr) ~ GROUP, data = df_survival_2yr)
+summary(fit_3arm_2yr)
+cox.zph(fit_3arm_2yr)
+
+# ------------------------------------------------------------------------
+# Formatted HR Table
+# ------------------------------------------------------------------------
+hr_table_2yr <- hr_results_2yr %>%
+  mutate(
+    `HR (95% CI)` = sprintf("%.2f (%.2f\u2013%.2f)", HR, CI_lower, CI_upper),
+    `P value` = case_when(
+      p_value < 0.001 ~ "<0.001",
+      TRUE ~ sprintf("%.3f", p_value)
+    ),
+    `PH test P` = case_when(
+      is.na(ph_test_p) ~ NA_character_,
+      ph_test_p < 0.001 ~ "<0.001",
+      TRUE ~ sprintf("%.3f", ph_test_p)
+    )
+  ) %>%
+  select(Comparison, n, events, `HR (95% CI)`, `P value`, `PH test P`)
+
+hr_table_2yr %>%
+  gt() %>%
+  cols_label(
+    Comparison   = "Comparison",
+    n            = "N",
+    events       = "Deaths",
+    `HR (95% CI)`= "Hazard Ratio (95% CI)",
+    `P value`    = "P value",
+    `PH test P`  = "PH Assumption P"
+  ) %>%
+  tab_header(title = "Hazard Ratios for 2-Year Mortality (Unadjusted)") %>%
+  tab_options(
+    table.font.size = 13,
+    data_row.padding = px(4),
+    column_labels.font.weight = "bold"
+  ) %>%
+  tab_source_note("HRs from unadjusted Cox proportional-hazards models, follow-up truncated at 2 years. PH Assumption P from cox.zph(); p < 0.05 suggests the proportional-hazards assumption may not hold, in which case consider a time-varying covariate or stratified model.")
+
+# ------------------------------------------------------------------------
+# Forest Plots
+# ------------------------------------------------------------------------
+# 3-arm model, Steroids as reference (shows Combined and Control each vs Steroids)
+ggforest(fit_3arm_2yr, data = df_survival_2yr)
+
+# Individual pairwise forest plots
+ggforest(coxph(Surv(time_2yr, event_2yr) ~ GROUP_COMBINED_CONTROL, data = df_combctrl_2yr), data = df_combctrl_2yr)
+ggforest(coxph(Surv(time_2yr, event_2yr) ~ GROUP_DUAL,             data = df_dual_2yr),     data = df_dual_2yr)
+ggforest(coxph(Surv(time_2yr, event_2yr) ~ GROUP_DUAL_COMBINED,    data = df_dualcomb_2yr), data = df_dualcomb_2yr)
+
+#===============================================================================
+# OPTIONAL: Covariate-Adjusted Hazard Ratios
+#-------------------------------------------------------------------------------
+# Merges in recipient covariates (age, gender, MELD, cold ischemia time,
+# diabetes) from df_liver_data_filtered and re-fits each comparison
+# adjusting for these. Run this section if you want adjusted (vs crude) HRs;
+# adjust the covariate list below to whatever's clinically relevant.
+
+covariates_for_adj <- df_liver_data_filtered %>%
+  select(TRR_ID_CODE, AGE, GENDER, MELD_PELD_LAB_SCORE, COLD_ISCH, DIAB) %>%
+  mutate(
+    DIAB_BIN = case_when(
+      as.numeric(DIAB) %in% 2:5 ~ 1,
+      as.numeric(DIAB) == 1     ~ 0,
+      TRUE                      ~ NA_real_
+    ),
+    GENDER = factor(GENDER)
+  )
+
+adj_formula_suffix <- " + AGE + GENDER + MELD_PELD_LAB_SCORE + COLD_ISCH + DIAB_BIN"
+
+run_coxph_adj_2yr <- function(data, group_var, label) {
+  data_adj <- data %>% left_join(covariates_for_adj, by = "TRR_ID_CODE")
+  form <- as.formula(paste0("Surv(time_2yr, event_2yr) ~ ", group_var, adj_formula_suffix))
+  fit <- coxph(form, data = data_adj)
+  s <- summary(fit)
+  
+  # group term is the first coefficient row since it's listed first in the formula
+  hr    <- s$conf.int[1, "exp(coef)"]
+  ci_lo <- s$conf.int[1, "lower .95"]
+  ci_hi <- s$conf.int[1, "upper .95"]
+  pval  <- s$coefficients[1, "Pr(>|z|)"]
+  
+  tibble(
+    Comparison = label,
+    n          = fit$n,
+    events     = fit$nevent,
+    HR         = hr,
+    CI_lower   = ci_lo,
+    CI_upper   = ci_hi,
+    p_value    = pval
+  )
+}
+
+hr_adj_results_2yr <- bind_rows(
+  run_coxph_adj_2yr(df_2groups_2yr,  "GROUP",                  "Combined vs Steroids (adjusted)"),
+  run_coxph_adj_2yr(df_combctrl_2yr, "GROUP_COMBINED_CONTROL", "Combined vs Control (adjusted)"),
+  run_coxph_adj_2yr(df_dual_2yr,     "GROUP_DUAL",             "Dual Therapy vs Steroids (adjusted)"),
+  run_coxph_adj_2yr(df_dualcomb_2yr, "GROUP_DUAL_COMBINED",    "Combined vs Dual Therapy (adjusted)")
+)
+
+hr_adj_results_2yr
+
+hr_adj_table_2yr <- hr_adj_results_2yr %>%
+  mutate(
+    `HR (95% CI)` = sprintf("%.2f (%.2f\u2013%.2f)", HR, CI_lower, CI_upper),
+    `P value` = case_when(
+      p_value < 0.001 ~ "<0.001",
+      TRUE ~ sprintf("%.3f", p_value)
+    )
+  ) %>%
+  select(Comparison, n, events, `HR (95% CI)`, `P value`)
+
+hr_adj_table_2yr %>%
+  gt() %>%
+  cols_label(
+    Comparison    = "Comparison",
+    n             = "N",
+    events        = "Deaths",
+    `HR (95% CI)` = "Adjusted Hazard Ratio (95% CI)",
+    `P value`     = "P value"
+  ) %>%
+  tab_header(title = "Covariate-Adjusted Hazard Ratios for 2-Year Mortality") %>%
+  tab_options(
+    table.font.size = 13,
+    data_row.padding = px(4),
+    column_labels.font.weight = "bold"
+  ) %>%
+  tab_source_note("Adjusted for recipient age, gender, MELD score, cold ischemic time, and diabetes status.")
 #===============================================================================
 # Building a Graph of Meds rx'd with Steroids in Antirejection Therapy
 #-------------------------------------------------------------------------------
@@ -1992,5 +2185,583 @@ ggplot(pivot_table, aes(x = reorder(Medication, Frequency), y = Frequency)) +
   theme_minimal() +
   scale_y_continuous(expand = expansion(mult = c(0, 0.15)))
 
+#==============================================================================
+# Designing a better chi vs fisher test function
+#------------------------------------------------------------------------------
+safe_chisq_or_fisher <- function(tab) {
+  expected <- outer(rowSums(tab), colSums(tab)) / sum(tab)
+  if (any(expected < 5)) {
+    fisher.test(tab)
+  } else {
+    chisq.test(tab)
+  }
+}
+
+#===============================================================================
+# Year-2 Anti-Rejection Treatment, Stratified by First-Year Treatment Group
+#-------------------------------------------------------------------------------
+# Design: patients are classified into Combined / Steroid / Control based on
+# their FIRST-YEAR anti-rejection treatment (arm2_ID_vect, steroid_id_all_vect,
+# ctrl_id_vect -- already built earlier in the script). This section looks at
+# what anti-rejection treatment, if any, each group received specifically
+# during YEAR 2 (day 365.25 to day 730.5 post-transplant) -- i.e. a landmark
+# analysis at 1 year, not a cumulative 0-2yr window.
+#
+# Depends on objects already built earlier: tx_ids_to_keep,
+# df_liver_data_filtered, df_immuno_fol_read, COLS_TO_CHECK, COL_TAIL,
+# arm2_ID_vect, steroid_id_all_vect, ctrl_id_vect.
+#-------------------------------------------------------------------------------
+
+# --- Step 1: Landmark cohort -- patients known to still be followed at day 365 ---
+# (avoids immortal-time bias: someone who died on day 200 was never actually
+# "at risk" for a year-2 rejection event)
+landmark_ids_yr1 <- df_liver_data_filtered %>%
+  filter(PTIME >= 365.25) %>%
+  pull(TRR_ID_CODE)
+
+# --- Step 2: Build the YEAR-2-ONLY follow-up window (not cumulative from TX) ---
+df_immuno_fol_yr2 <- df_immuno_fol_read %>%
+  filter(TRR_ID_CODE %in% tx_ids_to_keep) %>%
+  filter(TRR_ID_CODE %in% landmark_ids_yr1) %>%   # restrict to patients at risk through yr2
+  left_join(df_liver_data_filtered %>%
+              select(TRR_ID_CODE, TX_DATE, DISCHARGE_DATE), by = "TRR_ID_CODE") %>%
+  filter(!is.na(TX_DATE)) %>%
+  mutate(
+    PX_STAT_DATE_FOL = as.Date(PX_STAT_DATE_FOL),
+    TX_DATE = as.Date(TX_DATE)
+  ) %>%
+  mutate(FOL_DATE_DAYS_DELTA = time_length(interval(TX_DATE, PX_STAT_DATE_FOL), "days")) %>%
+  filter(FOL_DATE_DAYS_DELTA > 365.25 & FOL_DATE_DAYS_DELTA <= 730.5) %>%   # YEAR 2 ONLY
+  arrange(PX_STAT_DATE_FOL) %>%
+  mutate(NUM_ANTI_REJ_RXED_ROW = rowSums(across(all_of(COLS_TO_CHECK)) == 1, na.rm = TRUE))
+
+# --- Step 3: Per-patient summary of year-2 anti-rejection treatment ---
+df_yr2_patient_summary <- df_immuno_fol_yr2 %>%
+  group_by(TRR_ID_CODE) %>%
+  summarise(
+    across(all_of(COLS_TO_CHECK), ~ as.integer(any(.x == 1, na.rm = TRUE))),
+    NUM_FOLLOWUPS_YR2 = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    NUM_DRUGS_YR2    = rowSums(across(all_of(COLS_TO_CHECK))),
+    ANY_ANTI_REJ_YR2 = as.integer(NUM_DRUGS_YR2 >= 1)
+  )
+
+# --- Step 4: Attach first-year group label to the FULL landmark cohort ---
+# (left_join so patients with zero year-2 follow-up rows still show up,
+# coded as no documented year-2 rejection treatment)
+all_ids_by_group <- bind_rows(
+  tibble(TRR_ID_CODE = arm2_ID_vect,         FIRST_YEAR_GROUP = "Combined"),
+  tibble(TRR_ID_CODE = steroid_id_all_vect,  FIRST_YEAR_GROUP = "Steroid"),
+  tibble(TRR_ID_CODE = ctrl_id_vect,         FIRST_YEAR_GROUP = "Control")
+) %>%
+  filter(TRR_ID_CODE %in% landmark_ids_yr1) %>%   # keep only those at risk through yr2
+  mutate(FIRST_YEAR_GROUP = factor(FIRST_YEAR_GROUP, levels = c("Steroid", "Combined", "Control")))
+
+df_yr2_by_group <- all_ids_by_group %>%
+  left_join(df_yr2_patient_summary, by = "TRR_ID_CODE") %>%
+  mutate(
+    HAS_YR2_FOLLOWUP = !is.na(NUM_FOLLOWUPS_YR2),
+    ANY_ANTI_REJ_YR2 = coalesce(ANY_ANTI_REJ_YR2, 0L),
+    across(all_of(COLS_TO_CHECK), ~ coalesce(.x, 0L))
+  )
+
+# NOTE: patients with HAS_YR2_FOLLOWUP == FALSE have no recorded follow-up
+# visit in the year-2 window at all (lost to follow-up, or data gap) -- they
+# are coded as ANY_ANTI_REJ_YR2 = 0 by default, which assumes "no visit" means
+# "no rejection," not "unknown." Check N_with_yr2_followup below before
+# trusting the rates too far if that number is much smaller than N.
+
+# ------------------------------------------------------------------------
+# Step 5: Group-level summary -- rate of year-2 anti-rejection treatment
+# ------------------------------------------------------------------------
+year2_group_summary <- df_yr2_by_group %>%
+  group_by(FIRST_YEAR_GROUP) %>%
+  summarise(
+    N                    = n(),
+    N_with_yr2_followup  = sum(HAS_YR2_FOLLOWUP),
+    N_rejected_yr2       = sum(ANY_ANTI_REJ_YR2),
+    Pct_rejected_yr2     = 100 * N_rejected_yr2 / N,
+    .groups = "drop"
+  )
+
+year2_group_summary %>%
+  gt() %>%
+  fmt_number(columns = Pct_rejected_yr2, decimals = 1) %>%
+  cols_label(
+    FIRST_YEAR_GROUP    = "First-Year Group",
+    N                   = "N (landmark cohort)",
+    N_with_yr2_followup = "N with Yr2 Follow-up",
+    N_rejected_yr2      = "N Treated for Rejection in Yr2",
+    Pct_rejected_yr2     = "% Treated in Yr2"
+  ) %>%
+  tab_header(title = "Anti-Rejection Treatment During Year 2, by First-Year Treatment Group") %>%
+  tab_options(
+    table.font.size = 13,
+    data_row.padding = px(4),
+    column_labels.font.weight = "bold"
+  ) %>%
+  tab_source_note("Landmark cohort restricted to patients with PTIME >= 365.25 days (still followed at 1 year). Year 2 defined as day 365.25-730.5 post-transplant.")
+
+# --- Chi-square test: does year-2 rejection-treatment rate differ by group? ---
+tab_yr2 <- table(df_yr2_by_group$FIRST_YEAR_GROUP, df_yr2_by_group$ANY_ANTI_REJ_YR2)
+tab_yr2
+safe_chisq_or_fisher(tab_yr2)
+
+# ------------------------------------------------------------------------
+# Step 6: Which drugs were used in year 2, by first-year group
+# ------------------------------------------------------------------------
+drug_freq_by_group_yr2 <- df_yr2_by_group %>%
+  select(FIRST_YEAR_GROUP, all_of(COLS_TO_CHECK)) %>%
+  group_by(FIRST_YEAR_GROUP) %>%
+  summarise(across(all_of(COLS_TO_CHECK), sum), .groups = "drop") %>%
+  pivot_longer(-FIRST_YEAR_GROUP, names_to = "Drug", values_to = "Frequency") %>%
+  mutate(Drug = str_remove(Drug, COL_TAIL)) %>%
+  arrange(FIRST_YEAR_GROUP, desc(Frequency))
+
+drug_freq_by_group_yr2 %>%
+  filter(Frequency > 0) %>%
+  arrange(FIRST_YEAR_GROUP, desc(Frequency)) %>%
+  kable(caption = "Year-2 Anti-Rejection Drug Use, by First-Year Treatment Group") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+# Bar chart, faceted by first-year group
+drug_freq_by_group_yr2 %>%
+  filter(Frequency > 0) %>%
+  ggplot(aes(x = reorder(Drug, Frequency), y = Frequency, fill = FIRST_YEAR_GROUP)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  facet_wrap(~ FIRST_YEAR_GROUP, scales = "free_y") +
+  labs(
+    title = "Year-2 Anti-Rejection Drug Use by First-Year Treatment Group",
+    x = "Drug",
+    y = "Number of Patients Treated in Year 2"
+  ) +
+  theme_minimal()
+
+# ------------------------------------------------------------------------
+# Step 7: Patient-level detail table, if you want to inspect
+# individual records rather than just group summaries
+# ------------------------------------------------------------------------
+df_yr2_by_group %>%
+  select(TRR_ID_CODE, FIRST_YEAR_GROUP, HAS_YR2_FOLLOWUP, ANY_ANTI_REJ_YR2, NUM_DRUGS_YR2, all_of(COLS_TO_CHECK)) %>%
+  arrange(FIRST_YEAR_GROUP, desc(ANY_ANTI_REJ_YR2)) %>%
+  head(20)
+
+
+#===============================================================================
+# Statistical Analysis: Year-2 Anti-Rejection Treatment by First-Year Group
+#-------------------------------------------------------------------------------
+# Logistic regression on ANY_ANTI_REJ_YR2 (treated for rejection in year 2:
+# yes/no) as a function of FIRST_YEAR_GROUP (Steroid / Combined / Control),
+# unadjusted and adjusted for recipient covariates. Reports odds ratios (OR),
+# 95% CI, and p-values for each pairwise group comparison, plus an overall
+# likelihood-ratio test for whether FIRST_YEAR_GROUP matters at all.
+#
+# Depends on df_yr2_by_group (built in the previous section) and
+# df_liver_data_filtered (for covariates).
+#-------------------------------------------------------------------------------
+
+# --- Step 1: Attach covariates to the year-2 analysis dataset ---
+# MM_TOTAL (HLA mismatch, 0-6 scale) comes from df_hla_calc, computed
+# separately in the HLA mismatch section earlier in the script -- joined
+# in here alongside the recipient/donor covariates from df_liver_data_filtered.
+covariates_yr2 <- df_liver_data_filtered %>%
+  select(TRR_ID_CODE, AGE, GENDER, MELD_PELD_LAB_SCORE, COLD_ISCH, DIAB) %>%
+  mutate(
+    DIAB_BIN = case_when(
+      as.numeric(DIAB) %in% 2:5 ~ 1,
+      as.numeric(DIAB) == 1     ~ 0,
+      TRUE                      ~ NA_real_
+    ),
+    GENDER = factor(GENDER)
+  ) %>%
+  left_join(df_hla_calc %>% select(TRR_ID_CODE, MM_TOTAL), by = "TRR_ID_CODE")
+
+df_yr2_model <- df_yr2_by_group %>%
+  left_join(covariates_yr2, by = "TRR_ID_CODE") %>%
+  mutate(FIRST_YEAR_GROUP = relevel(FIRST_YEAR_GROUP, ref = "Control"))  # Control as reference
+
+# ------------------------------------------------------------------------
+# Helper: tidy a glm(family = binomial) fit into OR / 95% CI / p-value rows
+# ------------------------------------------------------------------------
+tidy_glm_or <- function(fit) {
+  co  <- summary(fit)$coefficients
+  ci  <- suppressMessages(confint.default(fit))  # Wald CIs (fast, matches rest of script's approach)
+  
+  tibble(
+    term     = rownames(co),
+    OR       = exp(co[, "Estimate"]),
+    CI_lower = exp(ci[, 1]),
+    CI_upper = exp(ci[, 2]),
+    p_value  = co[, "Pr(>|z|)"]
+  ) %>%
+    filter(term != "(Intercept)")
+}
+
+# ------------------------------------------------------------------------
+# Step 2: Unadjusted model -- FIRST_YEAR_GROUP only, Control as reference
+# ------------------------------------------------------------------------
+fit_unadj <- glm(ANY_ANTI_REJ_YR2 ~ FIRST_YEAR_GROUP, data = df_yr2_model, family = binomial)
+summary(fit_unadj)
+
+# Overall test: does FIRST_YEAR_GROUP matter at all? (LR test vs null model)
+fit_null <- glm(ANY_ANTI_REJ_YR2 ~ 1, data = df_yr2_model, family = binomial)
+anova(fit_null, fit_unadj, test = "LRT")
+
+or_unadj <- tidy_glm_or(fit_unadj) %>%
+  mutate(Model = "Unadjusted")
+
+# ------------------------------------------------------------------------
+# Step 3: Adjusted model -- FIRST_YEAR_GROUP + covariates
+# ------------------------------------------------------------------------
+fit_adj <- glm(
+  ANY_ANTI_REJ_YR2 ~ FIRST_YEAR_GROUP + AGE + GENDER + MELD_PELD_LAB_SCORE + COLD_ISCH + DIAB_BIN + MM_TOTAL,
+  data = df_yr2_model,
+  family = binomial
+)
+summary(fit_adj)
+
+or_adj <- tidy_glm_or(fit_adj) %>%
+  filter(str_detect(term, "^FIRST_YEAR_GROUP")) %>%   # keep only the group comparisons, drop covariate rows
+  mutate(Model = "Adjusted")
+
+# ------------------------------------------------------------------------
+# Step 4: Pairwise comparison the reference level doesn't give directly
+# (Combined vs Steroid) -- relevel and refit
+# ------------------------------------------------------------------------
+df_yr2_model_steroid_ref <- df_yr2_model %>%
+  mutate(FIRST_YEAR_GROUP = relevel(FIRST_YEAR_GROUP, ref = "Steroid"))
+
+fit_unadj_steroid_ref <- glm(ANY_ANTI_REJ_YR2 ~ FIRST_YEAR_GROUP, data = df_yr2_model_steroid_ref, family = binomial)
+fit_adj_steroid_ref <- glm(
+  ANY_ANTI_REJ_YR2 ~ FIRST_YEAR_GROUP + AGE + GENDER + MELD_PELD_LAB_SCORE + COLD_ISCH + DIAB_BIN + MM_TOTAL,
+  data = df_yr2_model_steroid_ref,
+  family = binomial
+)
+
+or_unadj_combined_vs_steroid <- tidy_glm_or(fit_unadj_steroid_ref) %>%
+  filter(term == "FIRST_YEAR_GROUPCombined") %>%
+  mutate(term = "FIRST_YEAR_GROUPCombined (ref = Steroid)", Model = "Unadjusted")
+
+or_adj_combined_vs_steroid <- tidy_glm_or(fit_adj_steroid_ref) %>%
+  filter(term == "FIRST_YEAR_GROUPCombined") %>%
+  mutate(term = "FIRST_YEAR_GROUPCombined (ref = Steroid)", Model = "Adjusted")
+
+# ------------------------------------------------------------------------
+# Step 5: Combine all three pairwise comparisons into one results table
+# ------------------------------------------------------------------------
+or_results_yr2 <- bind_rows(or_unadj, or_adj, or_unadj_combined_vs_steroid, or_adj_combined_vs_steroid) %>%
+  mutate(
+    Comparison = case_when(
+      term == "FIRST_YEAR_GROUPSteroid"                    ~ "Steroid vs Control",
+      term == "FIRST_YEAR_GROUPCombined"                    ~ "Combined vs Control",
+      term == "FIRST_YEAR_GROUPCombined (ref = Steroid)"    ~ "Combined vs Steroid",
+      TRUE ~ term
+    )
+  ) %>%
+  select(Comparison, Model, OR, CI_lower, CI_upper, p_value)
+
+or_results_yr2
+
+# ------------------------------------------------------------------------
+# Formatted OR Table
+# ------------------------------------------------------------------------
+or_table_yr2 <- or_results_yr2 %>%
+  mutate(
+    `OR (95% CI)` = sprintf("%.2f (%.2f\u2013%.2f)", OR, CI_lower, CI_upper),
+    `P value` = case_when(
+      p_value < 0.001 ~ "<0.001",
+      TRUE ~ sprintf("%.3f", p_value)
+    )
+  ) %>%
+  select(Comparison, Model, `OR (95% CI)`, `P value`) %>%
+  arrange(Comparison, Model)
+
+or_table_yr2 %>%
+  gt(groupname_col = "Comparison") %>%
+  cols_label(
+    Model         = "Model",
+    `OR (95% CI)`= "Odds Ratio (95% CI)",
+    `P value`    = "P value"
+  ) %>%
+  tab_header(title = "Odds of Anti-Rejection Treatment in Year 2, by First-Year Treatment Group") %>%
+  tab_options(
+    table.font.size = 13,
+    data_row.padding = px(4),
+    column_labels.font.weight = "bold",
+    row_group.font.weight = "bold"
+  ) %>%
+  tab_source_note("OR > 1 indicates higher odds of being treated for rejection in year 2 relative to the comparison group. Adjusted model controls for recipient age, gender, MELD score, cold ischemic time, diabetes status, and HLA mismatch level (MM_TOTAL). Landmark cohort restricted to patients followed through 1 year (PTIME >= 365.25).")
+
+# ------------------------------------------------------------------------
+# Step 6: Model diagnostics
+# ------------------------------------------------------------------------
+# Check for (quasi-)separation -- very large |estimate| or SE is a red flag
+# given the group sizes here may be modest
+summary(fit_adj)$coefficients
+
+# Check adjusted model fit
+performance_ok <- fit_adj$converged
+performance_ok
+
+# Overall LR test for FIRST_YEAR_GROUP in the adjusted model
+fit_adj_no_group <- glm(
+  ANY_ANTI_REJ_YR2 ~ AGE + GENDER + MELD_PELD_LAB_SCORE + COLD_ISCH + DIAB_BIN + MM_TOTAL,
+  data = df_yr2_model,
+  family = binomial
+)
+anova(fit_adj_no_group, fit_adj, test = "LRT")
+
+#===============================================================================
+# Year-2 Graft Failure, Stratified by First-Year Treatment Group
+#-------------------------------------------------------------------------------
+# Mirrors the "Year-2 Anti-Rejection Treatment" landmark analysis, but for
+# graft failure as the outcome, using GRF_FAIL_DATE directly rather than
+# reconstructing it from death/retransplant dates.
+#
+# Design: patients are classified into Combined / Steroid / Control based on
+# FIRST-YEAR anti-rejection treatment (arm2_ID_vect, steroid_id_all_vect,
+# ctrl_id_vect -- already built earlier). This section asks: among patients
+# whose graft was known to still be functioning at 1 year, what fraction in
+# each group went on to have graft failure specifically DURING year 2
+# (day 365.25-730.5)?
+#
+# Depends on: df_liver_data_filtered (with GRF_FAIL_DATE, TX_DATE,
+# PX_STAT_DATE), arm2_ID_vect, steroid_id_all_vect, ctrl_id_vect, df_hla_calc.
+#-------------------------------------------------------------------------------
+
+# --- Step 1: Build graft failure time + event from GRF_FAIL_DATE ---
+df_graft_time <- df_liver_data_filtered %>%
+  select(TRR_ID_CODE, TX_DATE, GRF_FAIL_DATE, PX_STAT_DATE) %>%
+  mutate(
+    TX_DATE       = as.Date(TX_DATE),
+    GRF_FAIL_DATE = as.Date(GRF_FAIL_DATE),
+    PX_STAT_DATE  = as.Date(PX_STAT_DATE),
+    GRF_FAIL_EVENT = as.integer(!is.na(GRF_FAIL_DATE)),
+    GRF_TIME_DAYS  = if_else(
+      GRF_FAIL_EVENT == 1,
+      as.numeric(GRF_FAIL_DATE - TX_DATE),
+      as.numeric(PX_STAT_DATE  - TX_DATE)   # censored at last known status date
+    )
+  )
+
+# Sanity checks
+summary(df_graft_time$GRF_TIME_DAYS)
+sum(is.na(df_graft_time$GRF_TIME_DAYS))
+table(df_graft_time$GRF_FAIL_EVENT, useNA = "ifany")
+
+# --- Step 2: Landmark cohort -- graft known functioning through day 365 ---
+# (either failed AFTER day 365, or censored/still followed after day 365;
+# excludes anyone whose graft already failed within year 1, since they were
+# never "at risk" for a year-2 graft failure event)
+landmark_ids_grf_yr1 <- df_graft_time %>%
+  filter(GRF_TIME_DAYS >= 365.25) %>%
+  pull(TRR_ID_CODE)
+
+# --- Step 3: Year-2 graft failure flag, restricted to the landmark cohort ---
+df_graft_yr2 <- df_graft_time %>%
+  filter(TRR_ID_CODE %in% landmark_ids_grf_yr1) %>%
+  mutate(
+    ANY_GRF_FAIL_YR2 = if_else(
+      GRF_FAIL_EVENT == 1 & GRF_TIME_DAYS <= 730.5,
+      1L, 0L
+    )
+  )
+
+# --- Step 4: Attach first-year group label to the landmark cohort ---
+all_ids_by_group_grf <- bind_rows(
+  tibble(TRR_ID_CODE = arm2_ID_vect,        FIRST_YEAR_GROUP = "Combined"),
+  tibble(TRR_ID_CODE = steroid_id_all_vect, FIRST_YEAR_GROUP = "Steroid"),
+  tibble(TRR_ID_CODE = ctrl_id_vect,        FIRST_YEAR_GROUP = "Control")
+) %>%
+  filter(TRR_ID_CODE %in% landmark_ids_grf_yr1) %>%
+  mutate(FIRST_YEAR_GROUP = factor(FIRST_YEAR_GROUP, levels = c("Steroid", "Combined", "Control")))
+
+df_graft_yr2_by_group <- all_ids_by_group_grf %>%
+  left_join(df_graft_yr2 %>% select(TRR_ID_CODE, ANY_GRF_FAIL_YR2, GRF_TIME_DAYS), by = "TRR_ID_CODE")
+
+# ------------------------------------------------------------------------
+# Step 5: Group-level summary -- rate of year-2 graft failure
+# ------------------------------------------------------------------------
+year2_grf_group_summary <- df_graft_yr2_by_group %>%
+  group_by(FIRST_YEAR_GROUP) %>%
+  summarise(
+    N                = n(),
+    N_grf_fail_yr2   = sum(ANY_GRF_FAIL_YR2, na.rm = TRUE),
+    Pct_grf_fail_yr2 = 100 * N_grf_fail_yr2 / N,
+    .groups = "drop"
+  )
+
+year2_grf_group_summary %>%
+  gt() %>%
+  fmt_number(columns = Pct_grf_fail_yr2, decimals = 1) %>%
+  cols_label(
+    FIRST_YEAR_GROUP  = "First-Year Group",
+    N                 = "N (landmark cohort)",
+    N_grf_fail_yr2    = "N Graft Failures in Yr2",
+    Pct_grf_fail_yr2   = "% Graft Failure in Yr2"
+  ) %>%
+  tab_header(title = "Graft Failure During Year 2, by First-Year Treatment Group") %>%
+  tab_options(
+    table.font.size = 13,
+    data_row.padding = px(4),
+    column_labels.font.weight = "bold"
+  ) %>%
+  tab_source_note("Landmark cohort restricted to patients whose graft was known functioning through day 365 (GRF_TIME_DAYS >= 365.25). Year 2 defined as day 365.25-730.5 post-transplant.")
+
+# --- Chi-square / Fisher test: does year-2 graft failure rate differ by group? ---
+tab_grf_yr2 <- table(df_graft_yr2_by_group$FIRST_YEAR_GROUP, df_graft_yr2_by_group$ANY_GRF_FAIL_YR2)
+tab_grf_yr2
+safe_chisq_or_fisher(tab_grf_yr2)
+
+
+#===============================================================================
+# Statistical Analysis: Year-2 Graft Failure by First-Year Group
+#-------------------------------------------------------------------------------
+# Logistic regression on ANY_GRF_FAIL_YR2, unadjusted and adjusted, same
+# structure as the anti-rejection year-2 analysis. Requires tidy_glm_or()
+# already defined in that section -- redefined here too in case this is run
+# standalone.
+#-------------------------------------------------------------------------------
+
+tidy_glm_or <- function(fit) {
+  co  <- summary(fit)$coefficients
+  ci  <- suppressMessages(confint.default(fit))
+  
+  tibble(
+    term     = rownames(co),
+    OR       = exp(co[, "Estimate"]),
+    CI_lower = exp(ci[, 1]),
+    CI_upper = exp(ci[, 2]),
+    p_value  = co[, "Pr(>|z|)"]
+  ) %>%
+    filter(term != "(Intercept)")
+}
+
+# --- Attach covariates (reuse covariates_yr2 if already built and de-duped
+# against the fixed df_hla_calc; rebuilt here for a standalone run) ---
+covariates_grf_yr2 <- df_liver_data_filtered %>%
+  select(TRR_ID_CODE, AGE, GENDER, MELD_PELD_LAB_SCORE, COLD_ISCH, DIAB) %>%
+  mutate(
+    DIAB_BIN = case_when(
+      as.numeric(DIAB) %in% 2:5 ~ 1,
+      as.numeric(DIAB) == 1     ~ 0,
+      TRUE                      ~ NA_real_
+    ),
+    GENDER = factor(GENDER)
+  ) %>%
+  left_join(df_hla_calc %>% select(TRR_ID_CODE, MM_TOTAL), by = "TRR_ID_CODE")
+
+df_grf_yr2_model <- df_graft_yr2_by_group %>%
+  left_join(covariates_grf_yr2, by = "TRR_ID_CODE") %>%
+  mutate(FIRST_YEAR_GROUP = relevel(FIRST_YEAR_GROUP, ref = "Control"))
+
+nrow(df_graft_yr2_by_group) == nrow(df_grf_yr2_model)   # confirm no row inflation
+
+# --- Unadjusted model, Control as reference ---
+fit_grf_unadj <- glm(ANY_GRF_FAIL_YR2 ~ FIRST_YEAR_GROUP, data = df_grf_yr2_model, family = binomial)
+summary(fit_grf_unadj)
+
+fit_grf_null <- glm(ANY_GRF_FAIL_YR2 ~ 1, data = df_grf_yr2_model, family = binomial)
+anova(fit_grf_null, fit_grf_unadj, test = "LRT")
+
+or_grf_unadj <- tidy_glm_or(fit_grf_unadj) %>% mutate(Model = "Unadjusted")
+
+# --- Adjusted model ---
+fit_grf_adj <- glm(
+  ANY_GRF_FAIL_YR2 ~ FIRST_YEAR_GROUP + AGE + GENDER + MELD_PELD_LAB_SCORE + COLD_ISCH + DIAB_BIN + MM_TOTAL,
+  data = df_grf_yr2_model,
+  family = binomial
+)
+summary(fit_grf_adj)
+
+or_grf_adj <- tidy_glm_or(fit_grf_adj) %>%
+  filter(str_detect(term, "^FIRST_YEAR_GROUP")) %>%
+  mutate(Model = "Adjusted")
+
+# --- Combined vs Steroid comparison (relevel + refit) ---
+df_grf_yr2_model_steroid_ref <- df_grf_yr2_model %>%
+  mutate(FIRST_YEAR_GROUP = relevel(FIRST_YEAR_GROUP, ref = "Steroid"))
+
+fit_grf_unadj_steroid_ref <- glm(ANY_GRF_FAIL_YR2 ~ FIRST_YEAR_GROUP, data = df_grf_yr2_model_steroid_ref, family = binomial)
+fit_grf_adj_steroid_ref <- glm(
+  ANY_GRF_FAIL_YR2 ~ FIRST_YEAR_GROUP + AGE + GENDER + MELD_PELD_LAB_SCORE + COLD_ISCH + DIAB_BIN + MM_TOTAL,
+  data = df_grf_yr2_model_steroid_ref,
+  family = binomial
+)
+
+or_grf_unadj_combined_vs_steroid <- tidy_glm_or(fit_grf_unadj_steroid_ref) %>%
+  filter(term == "FIRST_YEAR_GROUPCombined") %>%
+  mutate(term = "FIRST_YEAR_GROUPCombined (ref = Steroid)", Model = "Unadjusted")
+
+or_grf_adj_combined_vs_steroid <- tidy_glm_or(fit_grf_adj_steroid_ref) %>%
+  filter(term == "FIRST_YEAR_GROUPCombined") %>%
+  mutate(term = "FIRST_YEAR_GROUPCombined (ref = Steroid)", Model = "Adjusted")
+
+# --- Combine all pairwise comparisons ---
+or_grf_results_yr2 <- bind_rows(
+  or_grf_unadj, or_grf_adj,
+  or_grf_unadj_combined_vs_steroid, or_grf_adj_combined_vs_steroid
+) %>%
+  mutate(
+    Comparison = case_when(
+      term == "FIRST_YEAR_GROUPSteroid"                 ~ "Steroid vs Control",
+      term == "FIRST_YEAR_GROUPCombined"                 ~ "Combined vs Control",
+      term == "FIRST_YEAR_GROUPCombined (ref = Steroid)" ~ "Combined vs Steroid",
+      TRUE ~ term
+    )
+  ) %>%
+  select(Comparison, Model, OR, CI_lower, CI_upper, p_value)
+
+or_grf_results_yr2
+
+# ------------------------------------------------------------------------
+# Formatted OR Table
+# ------------------------------------------------------------------------
+or_grf_table_yr2 <- or_grf_results_yr2 %>%
+  mutate(
+    `OR (95% CI)` = sprintf("%.2f (%.2f\u2013%.2f)", OR, CI_lower, CI_upper),
+    `P value` = case_when(
+      p_value < 0.001 ~ "<0.001",
+      TRUE ~ sprintf("%.3f", p_value)
+    )
+  ) %>%
+  select(Comparison, Model, `OR (95% CI)`, `P value`) %>%
+  arrange(Comparison, Model)
+
+or_grf_table_yr2 %>%
+  gt(groupname_col = "Comparison") %>%
+  cols_label(
+    Model         = "Model",
+    `OR (95% CI)`= "Odds Ratio (95% CI)",
+    `P value`    = "P value"
+  ) %>%
+  tab_header(title = "Odds of Graft Failure in Year 2, by First-Year Treatment Group") %>%
+  tab_options(
+    table.font.size = 13,
+    data_row.padding = px(4),
+    column_labels.font.weight = "bold",
+    row_group.font.weight = "bold"
+  ) %>%
+  tab_source_note("OR > 1 indicates higher odds of graft failure in year 2 relative to the comparison group. Adjusted model controls for recipient age, gender, MELD score, cold ischemic time, diabetes status, and HLA mismatch level (MM_TOTAL). Landmark cohort restricted to patients with a functioning graft through 1 year (GRF_TIME_DAYS >= 365.25).")
+
+# ------------------------------------------------------------------------
+# Model diagnostics
+# ------------------------------------------------------------------------
+summary(fit_grf_adj)$coefficients   # check for very large |estimate|/SE (separation)
+
+fit_grf_adj_no_group <- glm(
+  ANY_GRF_FAIL_YR2 ~ AGE + GENDER + MELD_PELD_LAB_SCORE + COLD_ISCH + DIAB_BIN + MM_TOTAL,
+  data = df_grf_yr2_model,
+  family = binomial
+)
+anova(fit_grf_adj_no_group, fit_grf_adj, test = "LRT")
+
 # ===========================================================================
 # Debugging
+
+df_deceased_don_fil %>% count(DONOR_ID) %>% filter(n > 1)
+
+
