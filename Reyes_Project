@@ -1,1 +1,190 @@
+# Project - Reyes
+
+# Objective: Assess KDPI and LDPI affects KALT (< 365 days) vs Liver only patients
+
+#===============================================================================
+# Load required libraries
+#---------------------------------
+if (!requireNamespace("ggplot2", quietly = TRUE)) {
+  install.packages("ggplot2")
+}
+library(ggplot2)
+
+if (!requireNamespace("haven", quietly = TRUE)) {
+  install.packages("haven")
+}
+library(haven)
+
+if (!requireNamespace("tidyr", quietly = TRUE)) {
+  install.packages("tidyr")
+}
+library(tidyr)
+
+if (!requireNamespace("dplyr", quietly = TRUE)) {
+  install.packages("dplyr")
+}
+library(dplyr)
+
+if (!requireNamespace("knitr", quietly = TRUE)) {
+  install.packages("knitr")
+}
+library(knitr)
+
+if (!requireNamespace("kableExtra", quietly = TRUE)) {
+  install.packages("kableExtra")
+}
+library(kableExtra)
+
+if (!requireNamespace("stringr", quietly = TRUE)) {
+  install.packages("stringr")
+}
+library(stringr)
+
+if (!requireNamespace("lubridate", quietly = TRUE)) {
+  install.packages("lubridate")
+}
+library(lubridate)
+
+if (!requireNamespace("gt", quietly = TRUE)) {
+  install.packages("gt")
+}
+library(gt)
+
+if (!requireNamespace("tibble", quietly = TRUE)) {
+  install.packages("tibble")
+}
+library(tibble)
+
+if (!requireNamespace("survminer", quietly = TRUE)) {
+  install.packages("survminer")
+}
+library(survminer)
+
+if (!requireNamespace("survival", quietly = TRUE)) {
+  install.packages("survival")
+}
+library(survival)
+
+if (!requireNamespace("scales", quietly = TRUE)) {
+  install.packages("scales")
+}
+library(scales)
+
+if (!requireNamespace("MatchIt", quietly = TRUE)) install.packages("MatchIt")
+library(MatchIt)
+
+if (!requireNamespace("cobalt", quietly = TRUE)) install.packages("cobalt")
+library(cobalt)
+
+#===============================================================================
+# Reading data (adjust path and file type as needed)
+#---------------------------------------------------------
+# Mac loading
+# ----------Function: read a SAS file and return it as an array ---------------
+# sas_to_array()
+#   file_path : path to a .sas7bdat file
+#   verbose   : if TRUE, prints dimensions/structure info (default FALSE)
+# Returns: a matrix/array (Option A - as.matrix of the full data as-is)
+sas_to_array <- function(file_path, verbose = FALSE, cols = NULL) {
+  
+  if (!file.exists(file_path)) {
+    stop("File not found: ", file_path)
+  }
+  
+  sas_data <- if (!is.null(cols)) {
+    read_sas(file_path, col_select = all_of(cols))
+  } else {
+    read_sas(file_path)
+  }
+  
+  sas_data <- as.data.frame(sas_data)
+  
+  if (verbose) {
+    cat("File:", file_path, "\n")
+    cat("  Dimensions:", paste(dim(sas_data), collapse = " x "), "\n")
+  }
+  
+  return(sas_data)
+}
+
+# ----------------- Setting Columns I want from each files ------------------
+
+#kidpan
+KID_COLS = c("PT_CODE", "TRR_ID_CODE", "TX_DATE", "KDPI", "DONOR_ID", "WL_ID_CODE", "REM_CD", "INIT_AGE", "INIT_DATE", "KDRI_MED", "KDRI_RAO", "TXHRT", "TXINT", "TXKID", "TXLNG", "TXPAN")
+
+#WL
+WL_COLS = c("WL_ID_CODE")
+
+# ------------------- Loading different files ------------------------------
+# Just call the function for each file and assign to its own variable
+
+df_read_liver_main <- sas_to_array("~/Local Documents/AOT/UNOS Data/Liver/liver_data.sas7bdat", verbose = TRUE)
+df_read_decease_donor<- sas_to_array("~/Local Documents/AOT/UNOS Data/Deceased Donor/deceased_donor_data.sas7bdat", verbose = TRUE)
+df_read_kidpan_main <- sas_to_array("~/Local Documents/AOT/UNOS Data/Kidney_ Pancreas_ Kidney-Pancreas/kidpan_data.sas7bdat", verbose = TRUE, cols = KID_COLS)
+df_read_kidpan_wl <- sas_to_array("~/Local Documents/AOT/UNOS Data/Kidney_ Pancreas_ Kidney-Pancreas/Waiting List History/kidpan_wlhistory_data.sas7bdat", verbose = TRUE, cols = WL_COLS)
+
+#==============================================================================
+# Filters of index data
+# ---------------------------------------------------------------
+# Filter1 - Age filter
+
+col_age_range  <- "INIT_AGE"     # <- change to your column name
+age_min <- 18            # <- change to the value you want 
+age_max <- 100         # <- change to the value you want
+
+df_read_kidpan_main$INIT_AGE <- as.numeric(df_read_kidpan_main$INIT_AGE)
+
+df_filter_kidpan_main <- df_read_kidpan_main %>%
+  filter(.data[[col_age_range]] >= age_min & .data[[col_age_range]] <= age_max)  # filters the age
+
+# ------------------------------------------------------------------------------
+#  Filter2 - Data Dates: Filter out Patients place on waitlist by date
+# 
+FILTER_DATE_COL_WL <- "INIT_DATE"
+
+wl_start_date <- "2017-04-03" # need to be aware of changes in WL weighting in 2017
+wl_end_date <- "2025-04-03"
+
+df_filter_kidpan_main <- df_filter_kidpan_main %>%
+  filter(.data[[FILTER_DATE_COL_WL]] >= wl_start_date & .data[[FILTER_DATE_COL_WL]] <= wl_end_date)
+
+# ------------------------------------------------------------------------------
+#  Filter3 - Exclusion Criteria: Dictated by Dr. Reyes' former manuscript
+#------------------------Liver Main Filters-------------------------------------
+SIM_TX_COLS = c("TXHRT", "TXINT", "TXKID", "TXLNG", "TXPAN")
+
+df_filterEC_liver_main <- df_read_liver_main |> 
+  filter(NUM_PREV_TX == "0") |> # Patients should have no HX of previous transplants any
+  filter(if_all(all_of(SIM_TX_COLS), ~ is.na(.) | trimws(.) == "")) |> # getting rid of the simultaneous transplants
+  filter(DON_TY == "C") # removing the living donor recipients
+  
+#------------------------Donor Main Filters-------------------------------------
+#-------------------------------------------------------------------------------
+#Liver donation
+
+LDRI_VAL_COL = c(
+"AGE_DON", "ETHCAT_DON", "HGT_CM_DON_CALC", "COD_CAD_DON", "SHARE_TY",
+"NON_HRT_DON", "LITYP", "COLD_ISCH"
+) #columns I need to calc LDRI
+# 1. Age of Donor (Donor Data), 2. Race of Donor (Donor Data), 3. Height of Donor (Donor Data), 4. Cause of death donor, 5. Regional/national Share of organ
+# 6. DCD 7. Partial/split liver 8. Cold Ischemia Time
+
+df_filterEC_liver_main |> # filters out patients missing component to calc LDRI
+  filter(if_all(all_of(LDRI_VAL_COL), ~ is.na(.) | trimws(.) == ""))
+
+#-------------------------------------------------------------------------------
+#Kidney donation
+
+df_filter_kidpan_main |> 
+  filter(!is.na(KDPI) & trimws(as.character(KDPI)) != "") |> 
+  filter(if_all(all_of(SIM_TX_COLS), ~ is.na(.) | trimws(.) == ""))
+  
+
+#=============================================================
+# Cross referencing patients placed on WL 
+
+
+
+
+
 
