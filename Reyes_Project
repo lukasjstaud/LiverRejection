@@ -476,8 +476,7 @@ df_esrd_cohort <- df_liver_kidney_merged |>
                             3031, 3032, 3044, 3045, 3046, 3047, 3048,
                             3049, 3053, 3062, 3063, 3064,
                             3072, 3073) ~ "Tubular and interstitial disease",
-      DGN_TCR_KIDNEY %in% c(3013, 3014, 3015, 3016, 3017,
-                            3037, 3057) ~ "Other",
+      DGN_TCR_KIDNEY %in% c(999, 3013, 3014, 3015, 3016, 3017, 3037, 3057) ~ "Other",
       TRUE ~ NA_character_
     ),
     esrd_etiology = factor(esrd_etiology, levels = c(
@@ -534,10 +533,599 @@ table1 <- df_esrd_cohort |>
 
 table1
 
+#=================================================================================
+# Table 2. Donor Characteristics by KDPI Category
+#---------------------------------------------------------------------------------
+# Requires: df_read_decease_donor (deceased donor file, loaded in full earlier)
+#           df_esrd_cohort / df_filterEC_kidpan_main (has KDPI + DONOR_ID)
+#
+# NOTE: Variable names below (HIST_HYPERTENS_DON, HIST_DIABETES_DON, CREAT_DON,
+# HCV_SEROSTATUS) are ASSUMED OPTN SAF coding. VERIFY against your data
+# dictionary before trusting this, same as the LDRI component assumptions above.
+#---------------------------------------------------------------------------------
 
+# ----------------- Columns needed from the deceased donor file -----------------
+DECEASED_DONOR_COLS <- c(
+  "DONOR_ID", "AGE_DON", "HGT_CM_DON_CALC", "WGT_KG_DON_CALC", "ETHCAT_DON",
+  "HIST_HYPERTENS_DON", "HIST_DIABETES_DON", "COD_CAD_DON",
+  "CREAT_DON", "HCV_NAT", "NON_HRT_DON"
+)
+
+# Confirm these actually exist in what you loaded — full deceased donor pull
+# earlier had no col filter, so check names first:
+setdiff(DECEASED_DONOR_COLS, names(df_read_decease_donor))
+# ^ if this returns anything, fix the name(s) above against your data dictionary
+
+df_deceased_donor_sub <- df_read_decease_donor |>
+  select(any_of(DECEASED_DONOR_COLS)) |>
+  rename(
+    AGE_DECEASED_DON   = AGE_DON,
+    HGT_CM_DECEASED    = HGT_CM_DON_CALC,
+    WGT_KG_DECEASED    = WGT_KG_DON_CALC
+  )
+
+# ------------------- Sanity check raw codes before mapping ---------------------
+table(df_deceased_donor_sub$ETHCAT_DON, useNA = "always")
+table(df_deceased_donor_sub$HIST_HYPERTENS_DON, useNA = "always")
+table(df_deceased_donor_sub$HIST_DIABETES_DON, useNA = "always")
+table(df_deceased_donor_sub$COD_CAD_DON, useNA = "always")
+table(df_deceased_donor_sub$HCV_NAT, useNA = "always")
+table(df_deceased_donor_sub$NON_HRT_DON, useNA = "always")
+
+# ------------------- Join donor demographics onto the KALT/LTA cohort ----------
+# Restricted to donors linked to df_esrd_cohort (i.e. only kidney donors for
+# patients already in the KALT/LTA analysis, not the full filtered kidney set).
+# Note: on df_esrd_cohort the kidney donor id is DONOR_ID_KIDNEY (the liver
+# donor id kept the plain DONOR_ID name from the liver-side join earlier).
+df_kdpi_donor_table <- df_esrd_cohort |>
+  select(PT_CODE, DONOR_ID_KIDNEY, KDPI, Group) |>
+  mutate(KDPI = as.numeric(KDPI) * 100) |>  # UNOS stores KDPI as 0.0-1.0; convert to 0-100 scale
+  left_join(df_deceased_donor_sub, by = c("DONOR_ID_KIDNEY" = "DONOR_ID")) |>
+  filter(!is.na(KDPI)) |>
+  mutate(
+    # --- KDPI category ---
+    KDPI_cat = case_when(
+      KDPI < 20  ~ "KDPI < 20",
+      KDPI >= 20 & KDPI <= 85 ~ "KDPI 20-85",
+      KDPI > 85  ~ "KDPI > 85"
+    ),
+    KDPI_cat = factor(KDPI_cat, levels = c("KDPI < 20", "KDPI 20-85", "KDPI > 85")),
+    
+    AGE_DECEASED_DON = as.numeric(AGE_DECEASED_DON),
+    HGT_CM_DECEASED  = as.numeric(HGT_CM_DECEASED),
+    WGT_KG_DECEASED  = as.numeric(WGT_KG_DECEASED),
+    CREAT_DON        = as.numeric(CREAT_DON),
+    
+    # --- Race/ethnicity (ASSUMED coding — verify) ---
+    race_don_label = case_when(
+      ETHCAT_DON == 1 ~ "White",
+      ETHCAT_DON == 2 ~ "Black/African American",
+      ETHCAT_DON == 4 ~ "Hispanic/Latino",
+      ETHCAT_DON == 5 ~ "Asian",
+      ETHCAT_DON %in% c(6, 7, 9) ~ "Other",
+      TRUE ~ NA_character_
+    ),
+    race_don_label = factor(race_don_label,
+                            levels = c("Black/African American", "Hispanic/Latino", "White", "Asian", "Other")),
+    
+    # --- History of hypertension ---
+    htn_don_label = case_when(
+      toupper(trimws(as.character(HIST_HYPERTENS_DON))) == "Y" ~ "Yes",
+      toupper(trimws(as.character(HIST_HYPERTENS_DON))) == "N" ~ "No",
+      TRUE ~ NA_character_
+    ),
+    htn_don_label = factor(htn_don_label, levels = c("No", "Yes")),
+    
+    # --- History of diabetes ---
+    # HIST_DIABETES_DON is numeric-coded (1=No, 2-5=Yes/type, 998=Unknown),
+    # confirmed via table(df_read_kidpan_table3$HIST_DIABETES_DON) while
+    # building Table 3 -- NOT a Y/N string like HIST_HYPERTENS_DON.
+    diab_don_label = case_when(
+      as.numeric(HIST_DIABETES_DON) == 1 ~ "No",
+      as.numeric(HIST_DIABETES_DON) %in% c(2, 3, 4, 5) ~ "Yes",
+      as.numeric(HIST_DIABETES_DON) == 998 ~ NA_character_,
+      TRUE ~ NA_character_
+    ),
+    diab_don_label = factor(diab_don_label, levels = c("No", "Yes")),
+    
+    # --- Cause of death: cerebrovascular/stroke ---
+    # ASSUMED: COD_CAD_DON == 2 is CVA/Stroke (same mapping used in LDRI section)
+    cod_cva_label = case_when(
+      COD_CAD_DON == 2 ~ "Yes",
+      !is.na(COD_CAD_DON) ~ "No",
+      TRUE ~ NA_character_
+    ),
+    cod_cva_label = factor(cod_cva_label, levels = c("No", "Yes")),
+    
+    # --- HCV+ status (based on HCV_NAT — nucleic acid test result) ---
+    # Check the table(df_deceased_donor_sub$HCV_NAT) output above and adjust
+    # the value strings below to match what actually shows up (this covers
+    # the common OPTN codings, but confirm before trusting it).
+    hcv_label = case_when(
+      toupper(trimws(as.character(HCV_NAT))) %in% c("P", "POS", "POSITIVE", "Y") ~ "Yes",
+      toupper(trimws(as.character(HCV_NAT))) %in% c("N", "NEG", "NEGATIVE") ~ "No",
+      TRUE ~ NA_character_
+    ),
+    hcv_label = factor(hcv_label, levels = c("No", "Yes")),
+    
+    # --- Donation after circulatory death ---
+    dcd_label = case_when(
+      toupper(trimws(as.character(NON_HRT_DON))) == "Y" ~ "Yes",
+      toupper(trimws(as.character(NON_HRT_DON))) == "N" ~ "No",
+      TRUE ~ NA_character_
+    ),
+    dcd_label = factor(dcd_label, levels = c("No", "Yes"))
+  )
+
+# Sanity check group sizes before building the table
+summary(df_kdpi_donor_table$KDPI)  # should now range ~0-100, not 0-1
+df_kdpi_donor_table |> count(KDPI_cat)
+df_kdpi_donor_table |> count(Group, KDPI_cat)  # confirm both KALT and LTA are represented in each KDPI bucket
+
+#=================================================================================
+# Table 2 build
+#---------------------------------------------------------------------------------
+table2 <- df_kdpi_donor_table |>
+  select(
+    KDPI_cat, AGE_DECEASED_DON, HGT_CM_DECEASED, WGT_KG_DECEASED,
+    race_don_label, htn_don_label, diab_don_label, cod_cva_label,
+    CREAT_DON, hcv_label, dcd_label
+  ) |>
+  tbl_summary(
+    by = KDPI_cat,
+    statistic = list(
+      all_continuous()  ~ "{mean} ({sd})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits = all_continuous() ~ 1,
+    label = list(
+      AGE_DECEASED_DON ~ "Age, mean (SD), y",
+      HGT_CM_DECEASED  ~ "Height, mean (SD), cm",
+      WGT_KG_DECEASED  ~ "Weight, mean (SD), kg",
+      race_don_label   ~ "Race/ethnicity, n (%)",
+      htn_don_label    ~ "History of hypertension, n (%)",
+      diab_don_label   ~ "History of diabetes, n (%)",
+      cod_cva_label    ~ "Cause of death: cerebrovascular/stroke, n (%)",
+      CREAT_DON        ~ "Serum creatinine, mean (SD), mg/dL",
+      hcv_label        ~ "HCV+ status, n (%)",
+      dcd_label        ~ "Donation after circulatory death, n (%)"
+    ),
+    missing = "no"
+  ) |>
+  add_p(test = list(
+    all_continuous()  ~ "aov",       # 3-group comparison -> ANOVA (t.test only handles 2 groups)
+    all_categorical() ~ "chisq.test"
+  )) |>
+  modify_header(label ~ "**Characteristics**") |>
+  modify_caption("**Table 2. Donor Characteristics by KDPI Category**") |>
+  bold_labels()
+
+table2
+#=================================================================================
+# Table 2. Donor Characteristics by KDPI Category
+#---------------------------------------------------------------------------------
+# Requires: df_read_decease_donor (deceased donor file, loaded in full earlier)
+#           df_esrd_cohort / df_filterEC_kidpan_main (has KDPI + DONOR_ID)
+#
+# NOTE: Variable names below (HIST_HYPERTENS_DON, HIST_DIABETES_DON, CREAT_DON,
+# HCV_SEROSTATUS) are ASSUMED OPTN SAF coding. VERIFY against your data
+# dictionary before trusting this, same as the LDRI component assumptions above.
+#---------------------------------------------------------------------------------
+
+# ----------------- Columns needed from the deceased donor file -----------------
+DECEASED_DONOR_COLS <- c(
+  "DONOR_ID", "AGE_DON", "HGT_CM_DON_CALC", "WGT_KG_DON_CALC", "ETHCAT_DON",
+  "HIST_HYPERTENS_DON", "HIST_DIABETES_DON", "COD_CAD_DON",
+  "CREAT_DON", "HCV_NAT", "NON_HRT_DON"
+)
+
+# Confirm these actually exist in what you loaded — full deceased donor pull
+# earlier had no col filter, so check names first:
+setdiff(DECEASED_DONOR_COLS, names(df_read_decease_donor))
+# ^ if this returns anything, fix the name(s) above against your data dictionary
+
+df_deceased_donor_sub <- df_read_decease_donor |>
+  select(any_of(DECEASED_DONOR_COLS)) |>
+  rename(
+    AGE_DECEASED_DON   = AGE_DON,
+    HGT_CM_DECEASED    = HGT_CM_DON_CALC,
+    WGT_KG_DECEASED    = WGT_KG_DON_CALC
+  )
+
+# ------------------- Sanity check raw codes before mapping ---------------------
+table(df_deceased_donor_sub$ETHCAT_DON, useNA = "always")
+table(df_deceased_donor_sub$HIST_HYPERTENS_DON, useNA = "always")
+table(df_deceased_donor_sub$HIST_DIABETES_DON, useNA = "always")
+table(df_deceased_donor_sub$COD_CAD_DON, useNA = "always")
+table(df_deceased_donor_sub$HCV_NAT, useNA = "always")
+table(df_deceased_donor_sub$NON_HRT_DON, useNA = "always")
+
+# ------------------- Join donor demographics onto the KALT/LTA cohort ----------
+# Restricted to donors linked to df_esrd_cohort (i.e. only kidney donors for
+# patients already in the KALT/LTA analysis, not the full filtered kidney set).
+# Note: on df_esrd_cohort the kidney donor id is DONOR_ID_KIDNEY (the liver
+# donor id kept the plain DONOR_ID name from the liver-side join earlier).
+df_kdpi_donor_table <- df_esrd_cohort |>
+  select(PT_CODE, DONOR_ID_KIDNEY, KDPI, Group) |>
+  mutate(KDPI = as.numeric(KDPI) * 100) |>  # UNOS stores KDPI as 0.0-1.0; convert to 0-100 scale
+  left_join(df_deceased_donor_sub, by = c("DONOR_ID_KIDNEY" = "DONOR_ID")) |>
+  filter(!is.na(KDPI)) |>
+  mutate(
+    # --- KDPI category ---
+    KDPI_cat = case_when(
+      KDPI < 20  ~ "KDPI < 20",
+      KDPI >= 20 & KDPI <= 85 ~ "KDPI 20-85",
+      KDPI > 85  ~ "KDPI > 85"
+    ),
+    KDPI_cat = factor(KDPI_cat, levels = c("KDPI < 20", "KDPI 20-85", "KDPI > 85")),
+    
+    AGE_DECEASED_DON = as.numeric(AGE_DECEASED_DON),
+    HGT_CM_DECEASED  = as.numeric(HGT_CM_DECEASED),
+    WGT_KG_DECEASED  = as.numeric(WGT_KG_DECEASED),
+    CREAT_DON        = as.numeric(CREAT_DON),
+    
+    # --- Race/ethnicity (ASSUMED coding — verify) ---
+    race_don_label = case_when(
+      ETHCAT_DON == 1 ~ "White",
+      ETHCAT_DON == 2 ~ "Black/African American",
+      ETHCAT_DON == 4 ~ "Hispanic/Latino",
+      ETHCAT_DON == 5 ~ "Asian",
+      ETHCAT_DON %in% c(6, 7, 9) ~ "Other",
+      TRUE ~ NA_character_
+    ),
+    race_don_label = factor(race_don_label,
+                            levels = c("Black/African American", "Hispanic/Latino", "White", "Asian", "Other")),
+    
+    # --- History of hypertension ---
+    htn_don_label = case_when(
+      toupper(trimws(as.character(HIST_HYPERTENS_DON))) == "Y" ~ "Yes",
+      toupper(trimws(as.character(HIST_HYPERTENS_DON))) == "N" ~ "No",
+      TRUE ~ NA_character_
+    ),
+    htn_don_label = factor(htn_don_label, levels = c("No", "Yes")),
+    
+    # --- History of diabetes ---
+    # HIST_DIABETES_DON is numeric-coded (1=No, 2-5=Yes/type, 998=Unknown),
+    # confirmed via table(df_read_kidpan_table3$HIST_DIABETES_DON) while
+    # building Table 3 -- NOT a Y/N string like HIST_HYPERTENS_DON.
+    diab_don_label = case_when(
+      as.numeric(HIST_DIABETES_DON) == 1 ~ "No",
+      as.numeric(HIST_DIABETES_DON) %in% c(2, 3, 4, 5) ~ "Yes",
+      as.numeric(HIST_DIABETES_DON) == 998 ~ NA_character_,
+      TRUE ~ NA_character_
+    ),
+    diab_don_label = factor(diab_don_label, levels = c("No", "Yes")),
+    
+    # --- Cause of death: cerebrovascular/stroke ---
+    # ASSUMED: COD_CAD_DON == 2 is CVA/Stroke (same mapping used in LDRI section)
+    cod_cva_label = case_when(
+      COD_CAD_DON == 2 ~ "Yes",
+      !is.na(COD_CAD_DON) ~ "No",
+      TRUE ~ NA_character_
+    ),
+    cod_cva_label = factor(cod_cva_label, levels = c("No", "Yes")),
+    
+    # --- HCV+ status (based on HCV_NAT — nucleic acid test result) ---
+    # Check the table(df_deceased_donor_sub$HCV_NAT) output above and adjust
+    # the value strings below to match what actually shows up (this covers
+    # the common OPTN codings, but confirm before trusting it).
+    hcv_label = case_when(
+      toupper(trimws(as.character(HCV_NAT))) %in% c("P", "POS", "POSITIVE", "Y") ~ "Yes",
+      toupper(trimws(as.character(HCV_NAT))) %in% c("N", "NEG", "NEGATIVE") ~ "No",
+      TRUE ~ NA_character_
+    ),
+    hcv_label = factor(hcv_label, levels = c("No", "Yes")),
+    
+    # --- Donation after circulatory death ---
+    dcd_label = case_when(
+      toupper(trimws(as.character(NON_HRT_DON))) == "Y" ~ "Yes",
+      toupper(trimws(as.character(NON_HRT_DON))) == "N" ~ "No",
+      TRUE ~ NA_character_
+    ),
+    dcd_label = factor(dcd_label, levels = c("No", "Yes"))
+  )
+
+# Sanity check group sizes before building the table
+summary(df_kdpi_donor_table$KDPI)  # should now range ~0-100, not 0-1
+df_kdpi_donor_table |> count(KDPI_cat)
+df_kdpi_donor_table |> count(Group, KDPI_cat)  # confirm both KALT and LTA are represented in each KDPI bucket
+
+#=================================================================================
+# Table 2 build
+#---------------------------------------------------------------------------------
+table2 <- df_kdpi_donor_table |>
+  select(
+    KDPI_cat, AGE_DECEASED_DON, HGT_CM_DECEASED, WGT_KG_DECEASED,
+    race_don_label, htn_don_label, diab_don_label, cod_cva_label,
+    CREAT_DON, hcv_label, dcd_label
+  ) |>
+  tbl_summary(
+    by = KDPI_cat,
+    statistic = list(
+      all_continuous()  ~ "{mean} ({sd})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits = all_continuous() ~ 1,
+    label = list(
+      AGE_DECEASED_DON ~ "Age, mean (SD), y",
+      HGT_CM_DECEASED  ~ "Height, mean (SD), cm",
+      WGT_KG_DECEASED  ~ "Weight, mean (SD), kg",
+      race_don_label   ~ "Race/ethnicity, n (%)",
+      htn_don_label    ~ "History of hypertension, n (%)",
+      diab_don_label   ~ "History of diabetes, n (%)",
+      cod_cva_label    ~ "Cause of death: cerebrovascular/stroke, n (%)",
+      CREAT_DON        ~ "Serum creatinine, mean (SD), mg/dL",
+      hcv_label        ~ "HCV+ status, n (%)",
+      dcd_label        ~ "Donation after circulatory death, n (%)"
+    ),
+    missing = "no"
+  ) |>
+  add_p(test = list(
+    all_continuous()  ~ "aov",       # 3-group comparison -> ANOVA (t.test only handles 2 groups)
+    all_categorical() ~ "chisq.test"
+  )) |>
+  modify_header(label ~ "**Characteristics**") |>
+  modify_caption("**Table 2. Donor Characteristics by KDPI Category**") |>
+  bold_labels()
+
+table2
+
+#=================================================================================
+# Table 3. Characteristics of KALT Recipients (by kidney donor type) -- v2
+#---------------------------------------------------------------------------------
+# KEY FIX vs. v1: the deceased-donor columns (KDPI <20/20-85/>85) now reuse
+# df_esrd_cohort filtered to Group == "KALT", instead of a freshly rebuilt
+# liver-kidney merge. Your reference table's Ns for those three columns
+# (107/624/71) are IDENTICAL to the Table 2 donor-characteristics cohort --
+# that's the tell that this is the right population, and that the fresh
+# parallel re-extraction in v1 introduced a dedup mismatch (wrong KDPI value
+# picked for some patients), which is what skewed the KDPI tiers and pulled
+# average age down.
+#
+# Only the LD-KALT column is genuinely new data (living donors were excluded
+# from df_esrd_cohort by the original !is.na(KDPI) filter), so that one still
+# needs a fresh extraction.
+#---------------------------------------------------------------------------------
+
+# ----------------- Extra kidney columns needed for Table 3 ---------------------
+KID_COLS_TABLE3 <- c(
+  "PT_CODE", "TRR_ID_CODE", "DONOR_ID", "TX_DATE", "INIT_DATE", "INIT_AGE",
+  "KDPI", "DON_TY", "COLD_ISCH_KI", "WARM_ISCH_TM_DON", "HLAMIS",
+  "HIST_HYPERTENS_DON", "HIST_DIABETES_DON",
+  "TXHRT", "TXINT", "TXKID", "TXLNG", "TXPAN",
+  "ON_DIALYSIS", "DGN_TCR", "DGN2_TCR"
+)
+
+df_read_kidpan_table3 <- sas_to_array(
+  "~/Local Documents/AOT/UNOS Data/Kidney_ Pancreas_ Kidney-Pancreas/kidpan_data.sas7bdat",
+  verbose = TRUE, cols = KID_COLS_TABLE3
+)
+
+# Confirm coding before trusting anything downstream -- PASTE THESE BACK if
+# diab_don_label or warm_isch_min still come back all-NA after this rewrite:
+table(df_read_kidpan_table3$DON_TY, useNA = "always")
+table(df_read_kidpan_table3$HIST_HYPERTENS_DON, useNA = "always")
+table(df_read_kidpan_table3$HIST_DIABETES_DON, useNA = "always")
+summary(as.numeric(df_read_kidpan_table3$HLAMIS))
+summary(as.numeric(df_read_kidpan_table3$COLD_ISCH_KI))
+summary(as.numeric(df_read_kidpan_table3$WARM_ISCH_TM_DON))
+
+# ------------------- Filters (same window as main pipeline) --------------------
+df_read_kidpan_table3$INIT_AGE <- as.numeric(df_read_kidpan_table3$INIT_AGE)
+
+df_kidpan_table3_filtered <- df_read_kidpan_table3 |>
+  filter(INIT_AGE >= age_min & INIT_AGE <= age_max) |>
+  filter(INIT_DATE >= wl_start_date & INIT_DATE <= wl_end_date) |>
+  filter(if_all(all_of(SIM_TX_COLS2), ~ is.na(.) | trimws(.) == ""))
+
+df_kidpan_table3_dedup <- df_kidpan_table3_filtered |>
+  arrange(PT_CODE, desc(!is.na(TX_DATE)), TX_DATE, INIT_DATE) |>
+  group_by(PT_CODE) |>
+  slice(1) |>
+  ungroup() |>
+  rename(
+    TX_DATE_KIDNEY = TX_DATE, INIT_AGE_KIDNEY = INIT_AGE,
+    INIT_DATE_KIDNEY = INIT_DATE, TRR_ID_CODE_KIDNEY = TRR_ID_CODE,
+    DONOR_ID_KIDNEY = DONOR_ID, DGN_TCR_KIDNEY = DGN_TCR, DGN2_TCR_KIDNEY = DGN2_TCR,
+    TXHRT_KIDNEY = TXHRT, TXINT_KIDNEY = TXINT, TXKID_KIDNEY = TXKID,
+    TXLNG_KIDNEY = TXLNG, TXPAN_KIDNEY = TXPAN,
+    DON_TY_KIDNEY = DON_TY
+  )
+
+#=================================================================================
+# Population 1: Deceased-donor KDPI tiers -- reuse df_esrd_cohort, KALT only
+#=================================================================================
+df_kidney_extra_fields <- df_kidpan_table3_dedup |>
+  select(TRR_ID_CODE_KIDNEY, DON_TY_KIDNEY, HLAMIS, COLD_ISCH_KI,
+         WARM_ISCH_TM_DON, HIST_HYPERTENS_DON, HIST_DIABETES_DON)
+
+df_deceased_kalt <- df_esrd_cohort |>
+  filter(Group == "KALT") |>
+  left_join(df_kidney_extra_fields, by = "TRR_ID_CODE_KIDNEY") |>
+  mutate(
+    KDPI = as.numeric(KDPI) * 100,  # stored 0.0-1.0 -> 0-100
+    donor_type_cat = case_when(
+      KDPI < 20 ~ "KDPI <20",
+      KDPI >= 20 & KDPI <= 85 ~ "KDPI 20-85",
+      KDPI > 85 ~ "KDPI >85",
+      TRUE ~ NA_character_
+    ),
+    waiting_time_yrs = as.numeric(TX_DATE_KIDNEY - INIT_DATE_KIDNEY) / 365.25,
+    olt_to_kalt_yrs  = as.numeric(TX_DATE_KIDNEY - TX_DATE) / 365.25,
+    HLAMIS        = as.numeric(HLAMIS),
+    cold_isch_hr  = as.numeric(COLD_ISCH_KI),
+    # WARM_ISCH_TM_DON dropped -- confirmed 0% non-missing for this cohort
+    htn_don_label = case_when(
+      toupper(trimws(as.character(HIST_HYPERTENS_DON))) == "Y" ~ "Yes",
+      toupper(trimws(as.character(HIST_HYPERTENS_DON))) == "N" ~ "No",
+      TRUE ~ NA_character_
+    ),
+    htn_don_label = factor(htn_don_label, levels = c("No", "Yes")),
+    # HIST_DIABETES_DON is numeric-coded (1=No, 2-5=Yes/type, 998=Unknown) --
+    # same convention as the recipient DIAB field used elsewhere in this script,
+    # NOT a Y/N string like HIST_HYPERTENS_DON.
+    diab_don_label = case_when(
+      HIST_DIABETES_DON == 1 ~ "No",
+      HIST_DIABETES_DON %in% c(2, 3, 4, 5) ~ "Yes",
+      HIST_DIABETES_DON == 998 ~ NA_character_,
+      TRUE ~ NA_character_
+    ),
+    diab_don_label = factor(diab_don_label, levels = c("No", "Yes"))
+  )
+
+df_deceased_kalt |> count(donor_type_cat)  # should now be close to 107 / 624 / 71
+
+#=================================================================================
+# Population 2: LD-KALT -- fresh extraction (living donors excluded from esrd_cohort)
+#=================================================================================
+df_liver_kidney_table3 <- df_filterEC_liver_main_dedup |>
+  left_join(df_kidpan_table3_dedup, by = "PT_CODE") |>
+  mutate(
+    days_liver_to_kidney_tx = as.numeric(TX_DATE_KIDNEY - TX_DATE),
+    KALT_STATUS_CALC = case_when(
+      is.na(TX_DATE_KIDNEY) ~ 0L,
+      days_liver_to_kidney_tx >= 0 & days_liver_to_kidney_tx < 365 ~ 1L,
+      days_liver_to_kidney_tx >= 365 ~ 2L,
+      days_liver_to_kidney_tx < 0 ~ 3L,
+      TRUE ~ NA_integer_
+    )
+  )
+
+df_ld_kalt <- df_liver_kidney_table3 |>
+  filter(KALT_STATUS_CALC == 1,
+         toupper(trimws(as.character(DON_TY_KIDNEY))) == "L") |>
+  left_join(df_ldri_final |> select(PT_CODE, LDRI), by = "PT_CODE") |>
+  filter(!is.na(LDRI)) |>
+  mutate(
+    donor_type_cat = "LD-KALT",
+    AGE = as.numeric(AGE),               # age at OLT -- same convention as Table 1/2, NOT age at KALT
+    BMI_CALC = as.numeric(BMI_CALC),
+    sex_label = case_when(
+      toupper(trimws(as.character(GENDER))) == "M" ~ "Male",
+      toupper(trimws(as.character(GENDER))) == "F" ~ "Female",
+      TRUE ~ NA_character_
+    ),
+    sex_label = factor(sex_label, levels = c("Female", "Male")),
+    race_label = case_when(
+      ETHCAT == 1 ~ "White",
+      ETHCAT == 2 ~ "Black/African American",
+      ETHCAT == 4 ~ "Hispanic/Latino",
+      ETHCAT == 5 ~ "Asian",
+      ETHCAT %in% c(6, 7, 9) ~ "Other",
+      TRUE ~ NA_character_
+    ),
+    race_label = factor(race_label,
+                        levels = c("Black/African American", "Hispanic/Latino", "White", "Asian", "Other")),
+    dialysis_label = case_when(
+      toupper(trimws(as.character(ON_DIALYSIS))) == "Y" ~ "Yes",
+      toupper(trimws(as.character(ON_DIALYSIS))) == "N" ~ "No",
+      TRUE ~ NA_character_
+    ),
+    dialysis_label = factor(dialysis_label, levels = c("No", "Yes")),
+    waiting_time_yrs = as.numeric(TX_DATE_KIDNEY - INIT_DATE_KIDNEY) / 365.25,
+    olt_to_kalt_yrs  = days_liver_to_kidney_tx / 365.25,
+    HLAMIS        = as.numeric(HLAMIS),
+    cold_isch_hr  = as.numeric(COLD_ISCH_KI),
+    # WARM_ISCH_TM_DON dropped -- confirmed 0% non-missing for this cohort
+    htn_don_label = case_when(
+      toupper(trimws(as.character(HIST_HYPERTENS_DON))) == "Y" ~ "Yes",
+      toupper(trimws(as.character(HIST_HYPERTENS_DON))) == "N" ~ "No",
+      TRUE ~ NA_character_
+    ),
+    htn_don_label = factor(htn_don_label, levels = c("No", "Yes")),
+    diab_don_label = case_when(
+      HIST_DIABETES_DON == 1 ~ "No",
+      HIST_DIABETES_DON %in% c(2, 3, 4, 5) ~ "Yes",
+      HIST_DIABETES_DON == 998 ~ NA_character_,
+      TRUE ~ NA_character_
+    ),
+    diab_don_label = factor(diab_don_label, levels = c("No", "Yes")),
+    LDRI_cat = case_when(
+      LDRI <= 1.1 ~ "LDRI \u2264 1.1",
+      LDRI > 1.1 & LDRI <= 1.6 ~ "1.1 < LDRI \u2264 1.6",
+      LDRI > 1.6 ~ "LDRI > 1.6"
+    ),
+    LDRI_cat = factor(LDRI_cat,
+                      levels = c("LDRI \u2264 1.1", "1.1 < LDRI \u2264 1.6", "LDRI > 1.6")),
+    esrd_etiology = case_when(
+      DGN_TCR_KIDNEY %in% c(3025, 3036, 3052, 3061, 3065) ~ "Congenital",
+      DGN_TCR_KIDNEY %in% c(3011, 3012, 3038, 3039, 3069, 3070, 3071) ~ "Diabetes",
+      DGN_TCR_KIDNEY %in% c(3000, 3001, 3002, 3003, 3004, 3005, 3006, 3009, 3018,
+                            3033, 3035, 3041, 3042, 3043, 3054, 3055, 3067, 3068,
+                            3074) ~ "Glomerular disease",
+      DGN_TCR_KIDNEY %in% c(3034, 3040, 3051) ~ "Hypertensive nephrosclerosis",
+      DGN_TCR_KIDNEY %in% c(3020, 3021, 3022, 3023, 3058) ~ "Neoplasm",
+      DGN_TCR_KIDNEY %in% c(3008, 3028) ~ "Polycystic kidney disease",
+      DGN_TCR_KIDNEY %in% c(3050, 3056, 3059, 3060, 3066) ~ "Renovascular related disease",
+      DGN_TCR_KIDNEY %in% c(3007, 3010, 3024, 3026, 3027, 3029, 3030, 3031, 3032,
+                            3044, 3045, 3046, 3047, 3048, 3049, 3053, 3062, 3063,
+                            3064, 3072, 3073) ~ "Tubular and interstitial disease",
+      DGN_TCR_KIDNEY %in% c(999, 3013, 3014, 3015, 3016, 3017, 3037, 3057) ~ "Other",
+      TRUE ~ NA_character_
+    ),
+    esrd_etiology = factor(esrd_etiology, levels = c(
+      "Diabetes", "Glomerular disease", "Hypertensive nephrosclerosis",
+      "Polycystic kidney disease", "Renovascular related disease",
+      "Tubular and interstitial disease", "Other", "Congenital", "Neoplasm"
+    ))
+  )
+
+df_ld_kalt |> nrow()  # sanity check -- how many LD-KALT patients did we find?
+
+#=================================================================================
+# Combine both populations and build the table
+#=================================================================================
+common_cols <- c("donor_type_cat", "AGE", "sex_label", "BMI_CALC", "race_label",
+                 "htn_don_label", "diab_don_label", "dialysis_label",
+                 "waiting_time_yrs", "olt_to_kalt_yrs", "HLAMIS",
+                 "cold_isch_hr", "LDRI_cat", "esrd_etiology")
+
+df_kalt_only <- bind_rows(
+  df_deceased_kalt |> select(all_of(common_cols)),
+  df_ld_kalt        |> select(all_of(common_cols))
+) |>
+  mutate(donor_type_cat = factor(donor_type_cat,
+                                 levels = c("LD-KALT", "KDPI <20", "KDPI 20-85", "KDPI >85")))
+
+df_kalt_only |> count(donor_type_cat)  # final check -- compare to 313 / 107 / 624 / 71
+
+table3 <- df_kalt_only |>
+  tbl_summary(
+    by = donor_type_cat,
+    type = list(HLAMIS ~ "continuous"),  # force continuous -- low cardinality (0-6) trips gtsummary's default
+    statistic = list(
+      all_continuous()  ~ "{mean} ({sd})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits = all_continuous() ~ 1,
+    label = list(
+      AGE                ~ "Age, mean (SD), y",
+      sex_label          ~ "Sex, n (%)",
+      BMI_CALC           ~ "BMI, mean (SD), kg/m\u00b2",
+      race_label         ~ "Race/ethnicity, n (%)",
+      htn_don_label      ~ "History of hypertension, n (%)",
+      diab_don_label     ~ "History of diabetes, n (%)",
+      dialysis_label     ~ "Dialysis, n (%)",
+      waiting_time_yrs   ~ "Waiting time, mean (SD), y",
+      olt_to_kalt_yrs    ~ "Time between OLT and KALT, mean (SD), y",  # confirm vs. months -- see note above
+      HLAMIS             ~ "HLA mismatch, mean (SD)",
+      cold_isch_hr       ~ "Cold ischemia time, mean (SD), hr",
+      LDRI_cat           ~ "Liver donor risk index, n (%)",
+      esrd_etiology      ~ "Etiology of ESRD, n (%)"
+    ),
+    missing = "no"
+  ) |>
+  add_p(test = list(
+    all_continuous()  ~ "aov",
+    all_categorical() ~ "chisq.test"
+  )) |>
+  modify_header(label ~ "**Characteristics**") |>
+  modify_caption("**Table 3. Characteristics of KALT Recipients**") |>
+  bold_labels()
+
+table3
 #================================================================================
 # Debugging
 #-----------------------------------------------------------------
-
-
-
+mean(!is.na(df_kidpan_table3_dedup$WARM_ISCH_TM_DON))
+mean(!is.na(df_kidpan_table3_dedup$COLD_ISCH_KI))
