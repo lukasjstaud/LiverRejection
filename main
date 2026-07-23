@@ -1,6 +1,2952 @@
 # 
 # This script is designed to parse patients in the UNOS database into based on rejection status:
 # @ 12 months rejection vs no rejection
+#
+# PATCHED VERSION. Changes are marked with "# [FIX n]" comments corresponding to
+# the numbered review points. Date-filter logic left untouched by request.
+
+
+#===============================================================================
+# Load required libraries
+#---------------------------------
+if (!requireNamespace("ggplot2", quietly = TRUE)) {
+  install.packages("ggplot2")
+}
+library(ggplot2)
+
+if (!requireNamespace("haven", quietly = TRUE)) {
+  install.packages("haven")
+}
+library(haven)
+
+if (!requireNamespace("tidyr", quietly = TRUE)) {
+  install.packages("tidyr")
+}
+library(tidyr)
+
+if (!requireNamespace("dplyr", quietly = TRUE)) {
+  install.packages("dplyr")
+}
+library(dplyr)
+
+if (!requireNamespace("knitr", quietly = TRUE)) {
+  install.packages("knitr")
+}
+library(knitr)
+
+if (!requireNamespace("kableExtra", quietly = TRUE)) {
+  install.packages("kableExtra")
+}
+library(kableExtra)
+
+if (!requireNamespace("stringr", quietly = TRUE)) {
+  install.packages("stringr")
+}
+library(stringr)
+
+if (!requireNamespace("lubridate", quietly = TRUE)) {
+  install.packages("lubridate")
+}
+library(lubridate)
+
+if (!requireNamespace("gt", quietly = TRUE)) {
+  install.packages("gt")
+}
+library(gt)
+
+if (!requireNamespace("tibble", quietly = TRUE)) {
+  install.packages("tibble")
+}
+library(tibble)
+
+if (!requireNamespace("survminer", quietly = TRUE)) {
+  install.packages("survminer")
+}
+library(survminer)
+
+if (!requireNamespace("survival", quietly = TRUE)) {
+  install.packages("survival")
+}
+library(survival)
+
+if (!requireNamespace("scales", quietly = TRUE)) {
+  install.packages("scales")
+}
+library(scales)
+
+if (!requireNamespace("MatchIt", quietly = TRUE)) install.packages("MatchIt")
+library(MatchIt)
+
+if (!requireNamespace("cobalt", quietly = TRUE)) install.packages("cobalt")
+library(cobalt)
+
+#===============================================================================
+# Reading data (adjust path and file type as needed)
+#------------------------
+# Mac loading
+df_immuno_fol_read <- read.csv("~/Local Documents/AOT/Analysis/FilteredData/liver_immuno_followup.csv", stringsAsFactors = FALSE, na.strings = c("", " ", "NA", "."))
+df_liver_data <- read.csv("~/Local Documents/AOT/Analysis/FilteredData/liver_data.csv", stringsAsFactors = FALSE, na.strings = c("", " ", "NA", "."))
+df_immuno_induc <- read.csv("~/Local Documents/AOT/Analysis/FilteredData/liver-immuno-discharge_unfilter.csv", stringsAsFactors = FALSE, na.strings = c("", " ", "NA", "."))
+df_hla <- read.csv("~/Local Documents/AOT/Analysis/FilteredData/liver_addtl_hla.csv", stringsAsFactors = FALSE, na.strings = c("", " ", "NA", "."))
+df_pra <- read.csv("~/Local Documents/AOT/Analysis/FilteredData/liver_pra_crossmatch_data.csv", stringsAsFactors = FALSE, na.strings = c("", " ", "NA", "."))
+df_deceased_don <- read.csv("~/Local Documents/AOT/Analysis/FilteredData/deceased_donor_data.csv", stringsAsFactors = FALSE, na.strings = c("", " ", "NA", "."))
+df_liver_fol <- read.csv("~/Local Documents/AOT/Analysis/FilteredData/liver_followup_data.csv", stringsAsFactors = FALSE, na.strings = c("", " ", "NA", "."))
+# need to load living donor
+#---------------------------------
+# Window loading
+#df_immuno_fol_read <- read.csv("C:/Users/lukas/Documents/Med School/AOT/R/Output/Filtered Data by Date/liver-immuno-follow-up_date-filtered.csv", stringsAsFactors = FALSE)
+#df_liver_data <- read.csv("C:/Users/lukas/Documents/Med School/AOT/R/Output/Filtered Data by Date/liver-data_date-filtered.csv", stringsAsFactors = FALSE)
+#df_immuno_induc <- read.csv("C:/Users/lukas/Documents/Med School/AOT/R/Output/Filtered Data by Date/liver-immuno-discharge_unfilter.csv")
+
+#===============================================================================
+# [FIX 19] Drug column definitions MOVED UP so the 0/1 indicator columns can be
+# coerced to numeric immediately after reading. If any of these columns come in
+# as character (a stray "Y"/"N", a quoted "1", a blank-padded field), then
+# `rowSums(across(...) == 1)` silently evaluates to 0 for that whole column and
+# the drug looks like it was never prescribed. Coercing once, at the source,
+# removes that failure mode for every downstream section.
+#-------------------------------------------------------------------------------
+# GENERICMMF, GENERICTACROLIMUS, ASTAGRAFXL, NULOJIX are a maintenance column ONLY
+RX_COLS <- c("ALG", "CYCLOSPORIN", "OKT4", "CYTOXAN", "METHOTREXATE", "BREQUINARSODIUM", "MIZORIBINE",
+             "ATGAM", "NRATGNRATS", "OKT3", "XOMAZYMECD5", "DAB486IL2", "ANTILFA1", "ANTIICAM1",
+             "IL1RECEPTORANTAGONIST", "ANTIIL6", "ANTITNF", "SOLUBLEIL1RECEPTOR", "ALDESLEUKIN", "T10B9",
+             "SANDIMMUNE", "DEOXYSPERGUALIN", "NEORAL", "SANGCYA", "THYMOGLOBULIN", "ZENAPAX",
+             "SIMULECT", "GENGRAF", "ZORTRESS", "EON", "MYFORTIC", "GENERICCYCLOSPORIN", "STEROIDS", "PROGRAF",
+             "CAMPATH", "FTY720","RITUXAN", "GENERICMYFORTIC", "GENERICSIROLIMUS", "ENVARSUSXR", "RAPAMUNE",
+             "LEFLUNOMIDE", "IMURAN", "CELLCEPT") # important to note this does not capture the "other drug" column
+
+COL_TAIL <- "_ANTIREJ" # this needs to change based on if we are looking at induction, maintenance, ANTI-reject
+
+COLS_TO_CHECK <- paste0(RX_COLS, COL_TAIL)
+
+# [FIX 19] Coerce drug indicator columns to numeric. any_of() so a missing
+# column is skipped rather than erroring.
+coerce_rx_numeric <- function(df) {
+  df %>% mutate(across(any_of(COLS_TO_CHECK), ~ suppressWarnings(as.numeric(.x))))
+}
+
+df_immuno_fol_read <- coerce_rx_numeric(df_immuno_fol_read)
+df_immuno_induc    <- coerce_rx_numeric(df_immuno_induc)
+
+# [FIX 19] Report any drug column that failed to coerce anywhere (all-NA after
+# coercion when it had content before) -- a fast way to catch an encoding change.
+rx_all_na <- names(which(sapply(
+  intersect(COLS_TO_CHECK, names(df_immuno_fol_read)),
+  function(cn) all(is.na(df_immuno_fol_read[[cn]]))
+)))
+if (length(rx_all_na)) {
+  message("Drug columns entirely NA after numeric coercion (check source encoding): ",
+          paste(rx_all_na, collapse = ", "))
+}
+
+# [FIX 19] Numeric coercion for the continuous recipient variables used in
+# medians, matching, and Cox/logistic models. Same rationale.
+df_liver_data <- df_liver_data %>%
+  mutate(across(any_of(c("AGE", "MELD_PELD_LAB_SCORE", "COLD_ISCH", "PTIME")),
+                ~ suppressWarnings(as.numeric(.x))))
+
+#-----------------------------------------------
+# ===============================================================================
+# Filters of index data
+#------------------------------------------------------------------------
+# ---------------------------------------------------------------
+# Filter1 - Age filter
+
+col_age_range  <- "AGE"     # <- change to your column name
+age_min <- 18            # <- change to the value you want 
+age_max <- 80         # <- change to the value you want
+
+df_liver_data$AGE <- as.numeric(df_liver_data$AGE)
+
+df_liver_data_filtered <- df_liver_data %>%
+  filter(.data[[col_age_range]] >= age_min & .data[[col_age_range]] <= age_max)  # filters the age
+
+# ---------------------------------------------------------------
+#  Filter2 - Data Dates: Filter out Patients w. TX before 03APR2015 and after 03APR2025
+# 
+FILTER_DATE_COL_FOL <- "PX_STAT_DATE_FOL" # column for follow up data
+FILTER_DATE_COL_TX <- "TX_DATE"
+
+tx_start_date <- "2015-04-03"
+tx_end_date <- "2025-04-03"
+
+df_liver_data_filtered <- df_liver_data_filtered %>%
+  filter(.data[[FILTER_DATE_COL_TX]] >= tx_start_date & .data[[FILTER_DATE_COL_TX]] <= tx_end_date)
+
+#--------------------------------------------------------------
+# Filter* - Filtering of dfs base on the above criteria
+
+tx_ids_to_keep <- df_liver_data_filtered$TRR_ID_CODE
+dnr_ids_to_keep <- df_liver_data_filtered$DONOR_ID
+
+df_immuno_induc <- df_immuno_induc %>% 
+  filter(TRR_ID_CODE %in% tx_ids_to_keep)
+
+df_liver_fol_fil <- df_liver_fol %>% 
+  filter(TRR_ID_CODE %in% tx_ids_to_keep)
+
+df_immuno_fol <- df_immuno_fol_read %>% 
+  filter(TRR_ID_CODE %in% tx_ids_to_keep)
+
+df_deceased_don_fil <- df_deceased_don%>% 
+  filter(DONOR_ID %in% dnr_ids_to_keep)
+
+df_hla_fil <- df_hla %>% 
+  filter(TRR_ID_CODE %in% tx_ids_to_keep)
+
+df_pra_fil <- df_pra %>% 
+  filter(TRR_ID_CODE %in% tx_ids_to_keep)
+
+# still need to load living donor data
+
+# ______________________________________________________________________________
+# Merging look up table with liver_date to compare No Rejection, 6 month, 12 month 
+
+# [FIX 18] TX_DATE was listed twice in this select(); duplicate removed.
+df_immuno_fol <- df_immuno_fol %>%
+  left_join(df_liver_data_filtered %>% 
+              select(TRR_ID_CODE, TX_DATE, DISCHARGE_DATE, TRTREJ6M, TRTREJ1Y), by = "TRR_ID_CODE") %>%
+  filter(!is.na(TX_DATE)) # very important filter!!, removes any immuno_fol row
+# that had tx prior to the date ranges specified by uploaded data_liver file
+
+# ------------------------------------------------
+# Filtering out follow up dates +1 year
+
+df_immuno_fol <- df_immuno_fol %>% # telling R to treat columns as a date and sort
+  mutate(
+    PX_STAT_DATE_FOL = as.Date(PX_STAT_DATE_FOL),
+    TX_DATE = as.Date(TX_DATE)
+  ) %>% # sets csv values in these columns as date data types
+  mutate(FOL_DATE_DAYS_DELTA = time_length(interval(TX_DATE, PX_STAT_DATE_FOL), "days")) %>% # new column with post op days
+  filter(FOL_DATE_DAYS_DELTA >= 0 & FOL_DATE_DAYS_DELTA < 365.24219) %>% # filters for follow ups + 1 year
+  arrange(PX_STAT_DATE_FOL) # orders based on follow up date
+
+#--------------------------------------------------------------------------------------------------
+# Creating running counts of follow up treatments for anti-rejection therapy and checking for combo therapy
+
+df_immuno_fol <- df_immuno_fol %>%
+  # running count
+  mutate(REJECT_RUNNING_COUNT = 0L) %>%
+  group_by(TRR_ID_CODE) %>%
+  mutate(
+    REJECT_RUNNING_COUNT = cumsum(if_any(all_of(COLS_TO_CHECK), ~ !is.na(.) & . == 1))
+  ) %>%
+  ungroup() %>%
+  # combo therapy rx'ed?
+  mutate(NUM_ANTI_REJ_RXED = 0L) |>
+  mutate(NUM_ANTI_REJ_RXED = rowSums(across(all_of(COLS_TO_CHECK)) == 1, na.rm = TRUE))
+
+
+# store data so that I dont have to keep calculating it
+df_immuno_fol_calc <- df_immuno_fol
+
+#-----------------------------------------------------------------------------------------------------
+# Actually counting number of instances within set time
+
+# extracting data from df_immuno_fol
+freq_drug_fol_antirej_indiv <- data.frame(
+  drug_name      = str_remove(COLS_TO_CHECK, COL_TAIL),
+  drug_count  = sapply(df_immuno_fol[COLS_TO_CHECK], function(x) sum(x == 1, na.rm = TRUE)),
+  rej6m_count = sapply(COLS_TO_CHECK, function(col) {
+    sum(df_immuno_fol[[col]] == 1 & df_immuno_fol$FOL_DATE_DAYS_DELTA <= 182.62110, na.rm = TRUE)
+  }),
+  rej1y_count = sapply(COLS_TO_CHECK, function(col) {
+    sum(df_immuno_fol[[col]] == 1 & df_immuno_fol$FOL_DATE_DAYS_DELTA <= 365.24219, na.rm = TRUE)
+  })
+)
+
+#_________________________________________________________________________________
+# Setting count for Anti-Rej Therapy during inpatient s/p tx
+# * will need to combine in patient and follow up data
+
+df_immuno_induc <- df_immuno_induc |> 
+  semi_join(df_liver_data_filtered, by = "TRR_ID_CODE") |> 
+  mutate(NUM_ANTI_REJ_RXED = 0L) |> 
+  mutate(NUM_ANTI_REJ_RXED = rowSums(across(all_of(COLS_TO_CHECK)) == 1, na.rm = TRUE)) |> 
+  left_join(df_liver_data_filtered %>% 
+              select(TRR_ID_CODE, TX_DATE, DISCHARGE_DATE, DEATH_DATE), by = "TRR_ID_CODE") |> 
+  arrange(TX_DATE) |> 
+  mutate(DAYS_HOSP_SP_TX = 0L) |> 
+  mutate(
+    DISCHARGE_DATE = as.Date(DISCHARGE_DATE),
+    TX_DATE = as.Date(TX_DATE)
+  ) %>%
+  mutate(DAYS_HOSP_SP_TX = time_length(interval(TX_DATE, DISCHARGE_DATE), "days"))
+
+#_______________________________________________________________________________
+# Parsing Tables
+
+#-------------------------------------------------------------------------------
+# Parsing by Anti-rejection and No rejection through 1 year
+
+# Creating an array of patients with anti-rejection during inpatient sp tx
+# [FIX 17] all_of() around COLS_TO_CHECK (bare external vector in select() is
+#          deprecated tidyselect).
+# [FIX 5]  distinct() here so a duplicated discharge record can't later cause
+#          the patient to be DELETED outright by the n() > 1 filter.
+pat_rej_array_dis <- df_immuno_induc %>% 
+  filter(NUM_ANTI_REJ_RXED >= 1) %>% 
+  mutate(DISCHARGE_DATE = as.Date(DISCHARGE_DATE)) %>% 
+  select(TRR_ID_CODE, TX_DATE, DISCHARGE_DATE, NUM_ANTI_REJ_RXED, all_of(COLS_TO_CHECK)) %>%
+  distinct(TRR_ID_CODE, .keep_all = TRUE)
+
+#Pulling patient IDs treated inpatient post tx to then add to follow up
+inpatient_reject_ID_vect <- pat_rej_array_dis |> 
+  pull(TRR_ID_CODE)
+
+# Isolating Patients with first instance of rejection in 1 year
+# [FIX 17] all_of()
+pat_rej_array_fol <- df_immuno_fol_calc %>%
+  mutate(
+    REJECT_RUNNING_COUNT = if_else(
+      TRR_ID_CODE %in% inpatient_reject_ID_vect,
+      REJECT_RUNNING_COUNT + 1,
+      REJECT_RUNNING_COUNT
+    )
+  ) |> 
+  filter(REJECT_RUNNING_COUNT == 1, NUM_ANTI_REJ_RXED >= 1) %>%
+  group_by(TRR_ID_CODE) %>%
+  slice_min(order_by = PX_STAT_DATE_FOL, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(
+    TRR_ID_CODE, TRR_FOL_ID_CODE, TX_DATE, DISCHARGE_DATE, PX_STAT_DATE_FOL,
+    FOL_DATE_DAYS_DELTA, REJECT_RUNNING_COUNT, NUM_ANTI_REJ_RXED, 
+    all_of(COLS_TO_CHECK)
+  ) %>%
+  mutate(
+    DISCHARGE_DATE = as.Date(DISCHARGE_DATE)
+  )
+
+# Combining Discharge and follow up rejections 
+# [FIX 5] source coerced to integer so slice_min() below orders it numerically
+#         (1 = discharge event, 2 = follow-up event).
+pat_rej_array <- bind_rows(pat_rej_array_dis, pat_rej_array_fol, .id = "source") %>%
+  mutate(source = as.integer(source))
+
+# [FIX 4] Rejector IDs defined ONCE, from the combined rejection array, and used
+# to define the control cohort by exclusion. Previously pat_ctrl_array used a
+# row-wise REJECT_RUNNING_COUNT == 0 filter, which retained rows from patients
+# who were rejection-free early but treated later in year 1 -- so ctrl_id_vect
+# (pulled from that array) was contaminated with year-1 rejectors even though
+# pat_ctrl_demo_table separately cleaned itself up. ctrl_id_vect feeds the
+# year-2 landmark analyses, so the contamination propagated there.
+rejector_ids <- unique(pat_rej_array$TRR_ID_CODE)
+
+# Isolating patients w/o rejection at follow ups at 1 year
+# [FIX 4] exclusion added; [FIX 17] all_of()
+pat_ctrl_array <- df_immuno_fol_calc %>% 
+  filter(!TRR_ID_CODE %in% rejector_ids) %>%
+  filter(REJECT_RUNNING_COUNT == 0) %>%   # now redundant, kept as belt-and-braces
+  select(
+    TRR_ID_CODE, TRR_FOL_ID_CODE, TX_DATE, DISCHARGE_DATE, PX_STAT_DATE_FOL, 
+    FOL_DATE_DAYS_DELTA, REJECT_RUNNING_COUNT, NUM_ANTI_REJ_RXED, all_of(COLS_TO_CHECK)
+  ) %>% 
+  mutate(FOLLOW_UP_NUM = 1L) |>
+  group_by(TRR_ID_CODE) %>%
+  slice_max(order_by = PX_STAT_DATE_FOL, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+# NOTE (unchanged behaviour, flagged for awareness): patients with NO follow-up
+# rows at all never enter df_immuno_fol and are therefore neither cases nor
+# controls. If that group is large, "no rejection" is partly "no data".
+message("Patients in cohort with no year-1 follow-up rows: ",
+        length(setdiff(tx_ids_to_keep,
+                       union(rejector_ids, pat_ctrl_array$TRR_ID_CODE))))
+
+# ==============================================================================
+# Creating my groups
+#-------------------------------------------------------------------------------
+# Filtering for monotherapy
+monotherapy_reject <- pat_rej_array |> 
+  filter(NUM_ANTI_REJ_RXED < 2)
+
+# -----------------------------------------------------------------------------
+# Collecting TRR_CODE of patients that used Rituxan ONLY in anti-rejection therapy
+
+rituxan_id_all_vect <- monotherapy_reject %>%
+  filter(RITUXAN_ANTIREJ == 1) %>%
+  pull(TRR_ID_CODE)
+
+#--------------------------------------------------------------------------------
+# Collecting TRR_CODE of patients that used Steroids ONLY in anti-rejection therapy
+
+steroid_id_all_vect <- monotherapy_reject %>%
+  filter(STEROIDS_ANTIREJ == 1) %>%
+  pull(TRR_ID_CODE)
+
+#--------------------------------------------------------------------------------
+# Collecting TRR_CODE of patients that used Thymoglobulin ONLY in anti-rejection therapy
+
+thymo_id_all_vect <- monotherapy_reject %>%
+  filter(THYMOGLOBULIN_ANTIREJ == 1) %>%
+  pull(TRR_ID_CODE)
+
+#--------------------------------------------------------------------------------
+# Collecting TRR_CODE of patients that used SIMULECT ONLY in anti-rejection therapy
+
+simulect_id_all_vect <- monotherapy_reject %>%
+  filter(SIMULECT_ANTIREJ == 1) %>%
+  pull(TRR_ID_CODE)
+
+#------------------------------------------------------------------------------
+# Collecting TRR_CODE of patients that used STEROID + Combo Therapy in anti-rejection therapy
+
+dual_therapy_id_vect <- pat_rej_array %>%
+  filter(STEROIDS_ANTIREJ == 1) %>%
+  filter(SIMULECT_ANTIREJ == 1 | THYMOGLOBULIN_ANTIREJ == 1 | RITUXAN_ANTIREJ == 1) |> 
+  pull(TRR_ID_CODE)
+
+#------------------------------------------------------------------------------
+# Collecting TRR_CODE of patients that used Rituxan ANY in anti-rejection therapy
+
+rituxan_any_id_vect <- pat_rej_array %>%
+  filter(RITUXAN_ANTIREJ == 1) %>%
+  pull(TRR_ID_CODE)
+
+#------------------------------------------------------------------------------
+# Creating the combined arm for comparison
+arm2_ID_vect <- unique(c(simulect_id_all_vect, thymo_id_all_vect, rituxan_id_all_vect))
+
+#--------------------------------------------------------------------------------
+# Collecting TRR_CODE of control patients that were NEVER treated for anti-rejection therapy
+# [FIX 4] now drawn from the cleaned control array
+ctrl_id_vect <- pat_ctrl_array %>%
+  pull(TRR_ID_CODE)
+
+# [FIX 4] sanity checks -- both should now be character(0) / integer(0)
+stopifnot(length(intersect(arm2_ID_vect, ctrl_id_vect)) == 0)
+stopifnot(length(intersect(steroid_id_all_vect, ctrl_id_vect)) == 0)
+
+# =============================================================================
+# HLA MISMATCH CALCULATION (A, B, DR loci) — 0 to 6 scale
+#------------------------------------------------------------------------------
+
+# --- Step 1: Use retyped donor HLA if available, else original typing ---
+df_hla_fil <- df_hla_fil %>%
+  mutate(
+    DA1_final  = coalesce(RT_DA1, DA1),
+    DA2_final  = coalesce(RT_DA2, DA2),
+    DB1_final  = coalesce(RT_DB1, DB1),
+    DB2_final  = coalesce(RT_DB2, DB2),
+    DDR1_final = coalesce(RT_DDR1, DDR1),
+    DDR2_final = coalesce(RT_DDR2, DDR2)
+  )
+
+# --- Step 2: Function to calculate mismatch at a single locus ---
+locus_mismatch <- function(r1, r2, d1, d2) {
+  # Returns NA if any of the 4 alleles are missing
+  if (any(is.na(c(r1, r2, d1, d2)))) return(NA_integer_)
+  rec_alleles <- c(r1, r2)
+  don_alleles <- c(d1, d2)
+  sum(!don_alleles %in% rec_alleles)
+}
+
+# --- Step 3: Apply row-wise to compute mismatch per locus + total ---
+df_hla_calc <- df_hla_fil %>%
+  rowwise() %>%
+  mutate(
+    MM_A     = locus_mismatch(RA1, RA2, DA1_final, DA2_final),
+    MM_B     = locus_mismatch(RB1, RB2, DB1_final, DB2_final),
+    MM_DR    = locus_mismatch(RDR1, RDR2, DDR1_final, DDR2_final),
+    MM_TOTAL = if_else(
+      any(is.na(c(MM_A, MM_B, MM_DR))),
+      NA_integer_,
+      MM_A + MM_B + MM_DR
+    )
+  ) %>%
+  ungroup() %>% 
+  select(TRR_ID_CODE, MM_A, MM_B, MM_DR, MM_TOTAL) |> 
+  distinct(TRR_ID_CODE, .keep_all = TRUE)
+
+#===============================================================================
+# Processing PRA Data
+#------------------------------------------------------------------------------- 
+# CANNOT DO, physcians/centers stopped reporting PRA around mid-March 2015 :(
+
+#===============================================================================
+# Processing Deceased Donor Data
+#------------------------------------------------------------------------------
+# [FIX 7] A single donor can map to more than one recipient (split liver), and
+# df_deceased_don itself contained duplicate DONOR_IDs (see the debug line that
+# used to sit at the bottom of the script). Either produces duplicated rows here,
+# which then multiply pat_rej_demo_table / pat_ctrl_demo_table on the next join
+# and silently inflate every count in Table 1. distinct() on the recipient key
+# after the join, mirroring what df_hla_calc already does.
+
+df_deceased_don_fil2 <- df_deceased_don_fil %>% 
+  left_join(df_liver_data_filtered |> 
+              select(DONOR_ID, TRR_ID_CODE), by = "DONOR_ID") |> 
+  select(TRR_ID_CODE, AGE_DON, LI_MACHINE_PERFUSION, LI_MACHINE_PERFUSION_TY, LI_FIBROSIS, NON_HRT_DON) |> 
+  filter(!is.na(TRR_ID_CODE)) |> 
+  distinct(TRR_ID_CODE, .keep_all = TRUE)
+
+# =============================================================================
+# Graphing
+#---------------------------------------------------------------------------
+# Prepping Table for graphing
+
+freq_long <- freq_drug_fol_antirej_indiv %>%
+  pivot_longer(
+    cols = c(rej6m_count, rej1y_count),
+    names_to = "rej_period",
+    values_to = "rej_count"
+  ) %>%
+  mutate(
+    rej_period = recode(rej_period,
+                        "rej6m_count" = "6-Month",
+                        "rej1y_count" = "1-Year")
+  )
+
+#===============================================================================
+# Tables
+#------------------------------------------------------------------------
+# Collecting Demographic Data on the Reject vs Control Patients
+#-------------------------------
+# Rejection Demographic Table Building
+# [FIX 5] The old `filter(!(source == 1 & n() > 1))` DELETED a patient entirely
+# whenever they had two source==1 rows (both rows satisfy the condition), rather
+# than deduplicating them. Replaced with slice_min(source), which keeps exactly
+# one row per patient and prefers the earlier (discharge) event -- the correct
+# choice for a first-rejection cohort.
+pat_rej_demo_table <- pat_rej_array %>% 
+  left_join(df_liver_data_filtered %>% 
+              select(TRR_ID_CODE, AGE, GENDER, ETHCAT, MELD_PELD_LAB_SCORE, TXKID, TXHRT, TXLNG, TXPAN, 
+                     PREV_TX, PREV_TX_ANY_N, DON_TY, COLD_ISCH, DIAB), by = "TRR_ID_CODE") |> 
+  group_by(TRR_ID_CODE) %>%
+  slice_min(order_by = source, n = 1, with_ties = FALSE) %>%
+  ungroup() %>% 
+  mutate(REJ_STAT = 1L) |> # for the following merge this will let me know what is a rejection pt
+  left_join(df_deceased_don_fil2, by = "TRR_ID_CODE") |> # adding deceased donor table
+  left_join(df_hla_calc, by = "TRR_ID_CODE") # adding HLA data
+
+# Control Demographic Table Building
+pat_ctrl_demo_table <- pat_ctrl_array %>% 
+  left_join(df_liver_data_filtered %>% 
+              select(TRR_ID_CODE, AGE, GENDER, ETHCAT, MELD_PELD_LAB_SCORE, TXKID, TXHRT, TXLNG, TXPAN, 
+                     PREV_TX, PREV_TX_ANY_N, DON_TY, COLD_ISCH, DIAB), by = "TRR_ID_CODE") |> 
+  mutate(DISCHARGE_DATE = as.Date(DISCHARGE_DATE)) %>% 
+  mutate(REJ_STAT = 0L) %>% # for the following merge this will let me know what is a nonrejection pt
+  filter(!TRR_ID_CODE %in% pat_rej_demo_table$TRR_ID_CODE) |>  # now redundant post-[FIX 4], kept defensively
+  left_join(df_deceased_don_fil2, by = "TRR_ID_CODE") |> # adding deceased donor table
+  left_join(df_hla_calc, by = "TRR_ID_CODE")
+
+# [FIX 18] full_join() with no `by =` was joining on every shared column; the two
+# tables also carry different columns (source vs FOLLOW_UP_NUM). bind_rows() is
+# what was actually meant -- stack the two cohorts.
+pat_all_demo_table <- bind_rows(pat_rej_demo_table, pat_ctrl_demo_table)
+
+# Rituxan Demographic Table Building
+pat_ritux_demo_table <- pat_rej_demo_table %>% 
+  filter(TRR_ID_CODE %in% rituxan_any_id_vect)
+
+# Steroid Demographic Table Building
+pat_steroid_demo_table <- pat_rej_demo_table |> 
+  filter(TRR_ID_CODE %in% steroid_id_all_vect)
+
+# Combined Arm Demographic Table Building
+pat_combined_demo_table <- pat_rej_demo_table |> 
+  filter(TRR_ID_CODE %in% arm2_ID_vect)
+
+
+#-----------
+# Doing some double checking on demographic TRR_ID_CODES
+# [FIX 5/7] all three of these should now come back empty
+
+pat_rej_demo_table %>% count(TRR_ID_CODE) %>% filter(n > 1)
+pat_ctrl_demo_table %>% count(TRR_ID_CODE) %>% filter(n > 1)
+
+overlap_ids <- intersect(pat_rej_demo_table$TRR_ID_CODE, pat_ctrl_demo_table$TRR_ID_CODE)
+length(overlap_ids)
+
+df_liver_data_filtered %>% count(TRR_ID_CODE) %>% filter(n>1)
+
+#---------------------------------------------------
+# calculating demographic table values
+# [FIX 13] A "Perfusion Type, n(%)" header row is inserted before Normothermic /
+# Hypothermic. Previously the perfusion-type p-value was written onto the
+# "Normothermic" row, where a reader would misread it as a p-value for
+# normothermic specifically rather than for the type distribution as a whole.
+# All four parallel vectors (labels, refs, means, stds, p-values) grow by one.
+
+demo_label1 = c(
+  "n",
+  "Recipient Age (y), median(IQR)",
+  "Male Gender, n(%)",
+  "Race, n(%)",
+  "White", "Black", "Hispanic", "Asian", "Other/Multiracial",
+  "Diabetes, n(%)",
+  "MELD, median(IQR)",
+  "Organ Transplanted, n(%)",
+  "Liver", "Liver and Kidney", "Liver and Heart", "Liver and Lung", "Liver and Pancreas",
+  "Living Donor, n(%)",
+  "Cold Ischemic Time (hr), median(IQR)",
+  "Previous Liver Transplants, n(%)",
+  "Previous Any Transplants, n(%)",
+  "0", "1", "2", "3",
+  "HLA Mismatch Level, n(%)",
+  "0", "1", "2", "3", "4", "5", "6",
+  "Liver Perfusion, n(%)",
+  "Perfusion Type, n(%)",                      # [FIX 13] new header row
+  "Normothermic", "Hypothermic"
+)
+
+ref_value1 = c(
+  "",
+  "AGE",
+  "GENDER",
+  "",
+  "ETHCAT", "ETHCAT", "ETHCAT", "ETHCAT", "ETHCAT",
+  "DIAB",
+  "MELD_PELD_LAB_SCORE",
+  "",
+  "",
+  "TXKID", "TXHRT", "TXLNG", "TXPAN",
+  "DON_TY",
+  "COLD_ISCH",
+  "PREV_TX",
+  "",
+  "PREV_TX_ANY_N", "PREV_TX_ANY_N", "PREV_TX_ANY_N", "PREV_TX_ANY_N",
+  "",
+  "MM_TOTAL", "MM_TOTAL", "MM_TOTAL", "MM_TOTAL", "MM_TOTAL", "MM_TOTAL", "MM_TOTAL",
+  "LI_MACHINE_PERFUSION",
+  "",                                          # [FIX 13] Perfusion Type header
+  "LI_MACHINE_PERFUSION_TY", "LI_MACHINE_PERFUSION_TY"
+)
+
+# [FIX 1] Header rows were being detected via `is.na(ref_value1) & is.na(std_rej)`,
+# but ref_value1 holds "" for headers, not NA -- and is.na("") is FALSE. So
+# is_header was NEVER TRUE: every header row fell through to the count branch
+# and rendered as "NA (NA%)", and the bold tab_style() never fired on anything.
+# Headers are now declared explicitly by label.
+header_rows <- demo_label1 %in% c(
+  "Race, n(%)",
+  "Organ Transplanted, n(%)",
+  "Previous Any Transplants, n(%)",
+  "HLA Mismatch Level, n(%)",
+  "Perfusion Type, n(%)"
+)
+
+stopifnot(length(demo_label1) == length(ref_value1),
+          length(demo_label1) == length(header_rows))
+
+
+#===============================================================================
+# Shared helpers
+#-------------------------------------------------------------------------------
+
+# [FIX 12] Chi-square vs Fisher decided on EXPECTED cell counts, not observed.
+# This version was already defined further down the script and used by the
+# year-2 sections; it is moved up here so calc_pvalues() (which used the weaker
+# observed-count rule, `any(tab < 5)`) can use the same logic.
+safe_chisq_or_fisher <- function(tab) {
+  if (any(dim(tab) < 2) || sum(tab) == 0) return(NULL)
+  expected <- outer(rowSums(tab), colSums(tab)) / sum(tab)
+  if (any(expected < 5)) {
+    fisher.test(tab, simulate.p.value = (ncol(tab) > 2 || nrow(tab) > 2))
+  } else {
+    chisq.test(tab)
+  }
+}
+
+# [FIX 6] Organ-transplanted grouping defined ONCE and shared between
+# calc_demo_stats() and calc_pvalues(). Previously calc_demo_stats computed
+#   txliv <- organ_denom - sum(txkid, txhrt, txlng, txpan)
+# which double-counts multi-organ recipients (a liver-kidney-pancreas patient is
+# in both txkid and txpan), under-counting txliv and letting it go negative --
+# while calc_pvalues used a mutually exclusive case_when(). The table and the
+# p-value were describing two different variables. Both now use this hierarchy.
+#
+# NOTE: UNOS CSVs frequently carry "" rather than NA for these fields, so
+# has_data is effectively always TRUE and the denominator becomes the full
+# cohort. That is a defensible denominator, but if you want true missingness
+# excluded, run na_if(x, "") on the organ columns before calling this.
+organ_group <- function(df) {
+  has_data <- !is.na(df$TXKID) | !is.na(df$TXHRT) | !is.na(df$TXLNG) | !is.na(df$TXPAN)
+  grp <- case_when(
+    df$TXKID %in% c("L","R","E") ~ "Kidney",
+    df$TXHRT == "Y"              ~ "Heart",
+    df$TXLNG %in% c("L","R","E") ~ "Lung",
+    df$TXPAN %in% c("L","R","E") ~ "Pancreas",
+    TRUE ~ "Liver only"
+  )
+  if_else(has_data, grp, NA_character_)
+}
+
+# Race bucketing, also shared between stats and p-values
+race_group <- function(df) {
+  case_when(
+    df$ETHCAT == "1" ~ "White",
+    df$ETHCAT == "2" ~ "Black",
+    df$ETHCAT == "4" ~ "Hispanic",
+    df$ETHCAT == "5" ~ "Asian",
+    !is.na(df$ETHCAT) ~ "Other",
+    TRUE ~ NA_character_
+  )
+}
+
+#=================================================================
+# Demographic Table Functions
+# ------------------------------------------------------------------------
+# Function 1: raw counts and medians
+# ------------------------------------------------------------------------
+calc_demo_stats <- function(df) {
+  n_total <- nrow(df)
+  
+  race_wt    <- sum(df$ETHCAT == "1", na.rm = TRUE)
+  race_bl    <- sum(df$ETHCAT == "2", na.rm = TRUE)
+  race_his   <- sum(df$ETHCAT == "4", na.rm = TRUE)
+  race_asia  <- sum(df$ETHCAT == "5", na.rm = TRUE)
+  race_denom <- sum(!is.na(df$ETHCAT))
+  race_other <- race_denom - sum(race_wt, race_bl, race_his, race_asia)
+  
+  # Diabetes: 1 = negative, 2-5 = positive, 998 = unknown, true NA = missing
+  # (unknown and missing both excluded from denom)
+  diab_pos <- sum(as.numeric(df$DIAB) %in% 2:5, na.rm = TRUE)
+  diab_neg <- sum(as.numeric(df$DIAB) == 1, na.rm = TRUE)
+  diab_denom <- diab_pos + diab_neg
+  
+  # [FIX 6] mutually exclusive organ categories, matching organ_group()
+  og <- organ_group(df)
+  txkid       <- sum(og == "Kidney",     na.rm = TRUE)
+  txhrt       <- sum(og == "Heart",      na.rm = TRUE)
+  txlng       <- sum(og == "Lung",       na.rm = TRUE)
+  txpan       <- sum(og == "Pancreas",   na.rm = TRUE)
+  txliv       <- sum(og == "Liver only", na.rm = TRUE)
+  organ_denom <- sum(!is.na(og))
+  
+  list(
+    n            = n_total,
+    
+    age_med      = median(df$AGE, na.rm = TRUE),
+    age_q1       = quantile(df$AGE, 0.25, na.rm = TRUE),
+    age_q3       = quantile(df$AGE, 0.75, na.rm = TRUE),
+    
+    gen_count    = sum(df$GENDER == "M", na.rm = TRUE),
+    gen_denom    = sum(!is.na(df$GENDER)),
+    
+    race_wt      = race_wt,
+    race_bl      = race_bl,
+    race_his     = race_his,
+    race_asia    = race_asia,
+    race_other   = race_other,
+    race_denom   = race_denom,
+    
+    diab_pos     = diab_pos,
+    diab_denom   = diab_denom,
+    
+    meld_med     = median(df$MELD_PELD_LAB_SCORE, na.rm = TRUE),
+    meld_q1      = quantile(df$MELD_PELD_LAB_SCORE, 0.25, na.rm = TRUE),
+    meld_q3      = quantile(df$MELD_PELD_LAB_SCORE, 0.75, na.rm = TRUE),
+    
+    txliv        = txliv,
+    txkid        = txkid,
+    txhrt        = txhrt,
+    txlng        = txlng,
+    txpan        = txpan,
+    organ_denom  = organ_denom,
+    
+    liv_don      = sum(df$DON_TY == "L", na.rm = TRUE),
+    liv_don_denom= sum(!is.na(df$DON_TY)),
+    
+    cold_isch_med= median(df$COLD_ISCH, na.rm = TRUE),
+    cold_isch_q1 = quantile(df$COLD_ISCH, 0.25, na.rm = TRUE),
+    cold_isch_q3 = quantile(df$COLD_ISCH, 0.75, na.rm = TRUE),
+    
+    prev_liver   = sum(df$PREV_TX == "Y", na.rm = TRUE),
+    prev_liver_denom = sum(!is.na(df$PREV_TX)),
+    
+    prev_tx_0    = sum(is.na(df$PREV_TX_ANY_N)),   # NA here IS meaningful (= 0 prior tx), kept as-is
+    prev_tx_1    = sum(df$PREV_TX_ANY_N == "1", na.rm = TRUE),
+    prev_tx_2    = sum(df$PREV_TX_ANY_N == "2", na.rm = TRUE),
+    prev_tx_3    = sum(df$PREV_TX_ANY_N == "3", na.rm = TRUE),
+    
+    hla_0        = sum(df$MM_TOTAL == 0, na.rm = TRUE),
+    hla_1        = sum(df$MM_TOTAL == 1, na.rm = TRUE),
+    hla_2        = sum(df$MM_TOTAL == 2, na.rm = TRUE),
+    hla_3        = sum(df$MM_TOTAL == 3, na.rm = TRUE),
+    hla_4        = sum(df$MM_TOTAL == 4, na.rm = TRUE),
+    hla_5        = sum(df$MM_TOTAL == 5, na.rm = TRUE),
+    hla_6        = sum(df$MM_TOTAL == 6, na.rm = TRUE),
+    hla_denom    = sum(!is.na(df$MM_TOTAL)),
+    
+    perf_n       = sum(df$LI_MACHINE_PERFUSION == "Y", na.rm = TRUE),
+    perf_denom   = sum(!is.na(df$LI_MACHINE_PERFUSION)),
+    perf_typed_n = sum(!is.na(df$LI_MACHINE_PERFUSION_TY)),
+    perf_normo   = sum(df$LI_MACHINE_PERFUSION_TY == "1", na.rm = TRUE),
+    perf_hypo    = sum(df$LI_MACHINE_PERFUSION_TY == "2", na.rm = TRUE)
+  )
+}
+
+# ------------------------------------------------------------------------
+# Function 2: IQR strings + percentages, built FROM the stats list above
+# ------------------------------------------------------------------------
+calc_demo_std <- function(s) {
+  # generic safe percent: returns NA instead of NaN/Inf if denom is 0
+  pct <- function(count, denom) {
+    if (is.na(denom) || denom == 0) return(NA_real_)
+    100 * count / denom
+  }
+  
+  list(
+    age_qstring   = paste0(" (", s$age_q1, "\u2013", s$age_q3, ")"),
+    
+    gen_perc      = pct(s$gen_count, s$gen_denom),
+    
+    race_wt_perc    = pct(s$race_wt, s$race_denom),
+    race_bl_perc    = pct(s$race_bl, s$race_denom),
+    race_his_perc   = pct(s$race_his, s$race_denom),
+    race_asia_perc  = pct(s$race_asia, s$race_denom),
+    race_other_perc = pct(s$race_other, s$race_denom),
+    
+    diab_perc = pct(s$diab_pos, s$diab_denom),
+    
+    meld_qstring  = paste0(" (", s$meld_q1, "\u2013", s$meld_q3, ")"),
+    
+    txliv_perc    = pct(s$txliv, s$organ_denom),
+    txkid_perc    = pct(s$txkid, s$organ_denom),
+    txhrt_perc    = pct(s$txhrt, s$organ_denom),
+    txlng_perc    = pct(s$txlng, s$organ_denom),
+    txpan_perc    = pct(s$txpan, s$organ_denom),
+    
+    liv_don_perc  = pct(s$liv_don, s$liv_don_denom),
+    
+    isch_qstring  = paste0(" (", s$cold_isch_q1, "\u2013", s$cold_isch_q3, ")"),
+    
+    prev_liv_perc  = pct(s$prev_liver, s$prev_liver_denom),
+    prev_tx_0_perc = pct(s$prev_tx_0, s$n),   # NA in PREV_TX_ANY_N counts as "0 prior", so denom stays n
+    prev_tx_1_perc = pct(s$prev_tx_1, s$n),
+    prev_tx_2_perc = pct(s$prev_tx_2, s$n),
+    prev_tx_3_perc = pct(s$prev_tx_3, s$n),
+    
+    hla_0_perc = pct(s$hla_0, s$hla_denom),
+    hla_1_perc = pct(s$hla_1, s$hla_denom),
+    hla_2_perc = pct(s$hla_2, s$hla_denom),
+    hla_3_perc = pct(s$hla_3, s$hla_denom),
+    hla_4_perc = pct(s$hla_4, s$hla_denom),
+    hla_5_perc = pct(s$hla_5, s$hla_denom),
+    hla_6_perc = pct(s$hla_6, s$hla_denom),
+    
+    perf_n_perc     = pct(s$perf_n, s$perf_denom),
+    perf_normo_perc = pct(s$perf_normo, s$perf_typed_n),
+    perf_hypo_perc  = pct(s$perf_hypo, s$perf_typed_n)
+  )
+}
+
+# ------------------------------------------------------------------------
+# Assemble the mean_* and std_* vectors in demo_label1 order
+# [FIX 13] an NA slot added for the new "Perfusion Type, n(%)" header row
+# ------------------------------------------------------------------------
+build_mean_vector <- function(s) {
+  out <- c(
+    s$n,
+    s$age_med,
+    s$gen_count,
+    NA,
+    s$race_wt, s$race_bl, s$race_his, s$race_asia, s$race_other,
+    s$diab_pos,
+    s$meld_med,
+    NA,
+    s$txliv, s$txkid, s$txhrt, s$txlng, s$txpan,
+    s$liv_don,
+    s$cold_isch_med,
+    s$prev_liver,
+    NA,
+    s$prev_tx_0, s$prev_tx_1, s$prev_tx_2, s$prev_tx_3,
+    NA,                                  # HLA header
+    s$hla_0, s$hla_1, s$hla_2, s$hla_3, s$hla_4, s$hla_5, s$hla_6,
+    s$perf_n,                            # Liver Perfusion, n(%)
+    NA,                                  # [FIX 13] Perfusion Type header
+    s$perf_normo, s$perf_hypo
+  )
+  stopifnot(length(out) == length(demo_label1))
+  as.numeric(out)
+}
+
+# [FIX 15] returns a plain character vector, NOT a one-column data.frame.
+# Wrapping this in data.frame() and then dropping it into tibble() created a
+# packed df-column, which is why str_detect() / as.numeric() on std_rej were so
+# fragile downstream.
+build_std_vector <- function(s, std) {
+  out <- c(
+    NA,
+    std$age_qstring,
+    std$gen_perc,
+    NA,
+    std$race_wt_perc, std$race_bl_perc, std$race_his_perc, std$race_asia_perc, std$race_other_perc,
+    std$diab_perc,
+    std$meld_qstring,
+    NA,
+    std$txliv_perc, std$txkid_perc, std$txhrt_perc, std$txlng_perc, std$txpan_perc,
+    std$liv_don_perc,
+    std$isch_qstring,
+    std$prev_liv_perc,
+    NA,
+    std$prev_tx_0_perc, std$prev_tx_1_perc, std$prev_tx_2_perc, std$prev_tx_3_perc,
+    NA,                                  # HLA header
+    std$hla_0_perc, std$hla_1_perc, std$hla_2_perc, std$hla_3_perc,
+    std$hla_4_perc, std$hla_5_perc, std$hla_6_perc,
+    std$perf_n_perc,                     # Liver Perfusion, n(%)
+    NA,                                  # [FIX 13] Perfusion Type header
+    std$perf_normo_perc, std$perf_hypo_perc
+  )
+  stopifnot(length(out) == length(demo_label1))
+  as.character(out)
+}
+
+# ------------------------------------------------------------------------
+# Statistical Testing Function
+# ------------------------------------------------------------------------
+# Continuous vars (median/IQR rows) -> Wilcoxon rank-sum test
+# Binary categorical vars -> chi-square, falling back to Fisher's exact
+#   [FIX 12] the fallback is now triggered by EXPECTED cell counts < 5 via
+#   safe_chisq_or_fisher(), not by observed counts. The observed-count rule
+#   over-triggered Fisher on large but lopsided tables and under-triggered it
+#   on small balanced ones.
+# Multi-level categorical vars -> ONE test across the full contingency table,
+#   reported once on the group header row.
+
+calc_pvalues <- function(df_rej, df_ctrl) {
+  
+  test_cont <- function(var) {
+    x <- df_rej[[var]]; y <- df_ctrl[[var]]
+    if (sum(!is.na(x)) < 2 || sum(!is.na(y)) < 2) return(NA_real_)
+    tryCatch(wilcox.test(x, y)$p.value, error = function(e) NA_real_)
+  }
+  
+  test_binary <- function(var, target_val) {
+    a <- sum(df_rej[[var]]  == target_val, na.rm = TRUE)
+    b <- sum(!is.na(df_rej[[var]]))  - a
+    c <- sum(df_ctrl[[var]] == target_val, na.rm = TRUE)
+    d <- sum(!is.na(df_ctrl[[var]])) - c
+    tab <- matrix(c(a, b, c, d), nrow = 2)
+    if (sum(tab) == 0) return(NA_real_)
+    tryCatch({
+      res <- safe_chisq_or_fisher(tab)   # [FIX 12]
+      if (is.null(res)) NA_real_ else res$p.value
+    }, error = function(e) NA_real_)
+  }
+  
+  test_multilevel <- function(x, y) {
+    # levels derived from whatever is observed in EITHER group, so an arm with
+    # zero patients in a category doesn't misalign columns or error out
+    lv <- sort(unique(c(as.character(x), as.character(y))))
+    if (length(lv) < 2) return(NA_real_)
+    x <- factor(as.character(x), levels = lv)
+    y <- factor(as.character(y), levels = lv)
+    tab <- rbind(table(x), table(y))
+    if (any(rowSums(tab) == 0) || any(colSums(tab) == 0)) return(NA_real_)
+    tryCatch({
+      res <- safe_chisq_or_fisher(tab)   # [FIX 12]
+      if (is.null(res)) NA_real_ else res$p.value
+    }, error = function(e) NA_real_)
+  }
+  
+  test_diab <- function(df_rej, df_ctrl) {
+    pos_rej <- sum(as.numeric(df_rej$DIAB) %in% 2:5, na.rm = TRUE)
+    neg_rej <- sum(as.numeric(df_rej$DIAB) == 1, na.rm = TRUE)
+    
+    pos_ctrl <- sum(as.numeric(df_ctrl$DIAB) %in% 2:5, na.rm = TRUE)
+    neg_ctrl <- sum(as.numeric(df_ctrl$DIAB) == 1, na.rm = TRUE)
+    
+    tab <- matrix(c(pos_rej, neg_rej, pos_ctrl, neg_ctrl), nrow = 2)
+    if (sum(tab) == 0) return(NA_real_)
+    tryCatch({
+      res <- safe_chisq_or_fisher(tab)   # [FIX 12]
+      if (is.null(res)) NA_real_ else res$p.value
+    }, error = function(e) NA_real_)
+  }
+  
+  p_age    <- test_cont("AGE")
+  p_gender <- test_binary("GENDER", "M")
+  p_race   <- test_multilevel(race_group(df_rej), race_group(df_ctrl))
+  p_diab   <- test_diab(df_rej, df_ctrl)
+  p_meld   <- test_cont("MELD_PELD_LAB_SCORE")
+  p_organ  <- test_multilevel(organ_group(df_rej), organ_group(df_ctrl))   # [FIX 6] shared helper
+  p_livdon <- test_binary("DON_TY", "L")
+  p_isch   <- test_cont("COLD_ISCH")
+  p_prev_liv <- test_binary("PREV_TX", "Y")
+  p_prev_any <- test_multilevel(
+    factor(replace(df_rej$PREV_TX_ANY_N, is.na(df_rej$PREV_TX_ANY_N), "0")),
+    factor(replace(df_ctrl$PREV_TX_ANY_N, is.na(df_ctrl$PREV_TX_ANY_N), "0"))
+  )
+  p_hla    <- test_multilevel(
+    factor(df_rej$MM_TOTAL,  levels = 0:6),
+    factor(df_ctrl$MM_TOTAL, levels = 0:6)
+  )
+  p_perf_used <- test_binary("LI_MACHINE_PERFUSION", "Y")
+  p_perf_ty   <- test_multilevel(
+    factor(df_rej$LI_MACHINE_PERFUSION_TY,  levels = c("1","2")),
+    factor(df_ctrl$LI_MACHINE_PERFUSION_TY, levels = c("1","2"))
+  )
+  
+  # Build vector aligned to demo_label1 order.
+  # [FIX 13] p_perf_ty now sits on the "Perfusion Type, n(%)" header row rather
+  # than on "Normothermic".
+  out <- c(
+    NA,          # n
+    p_age,
+    p_gender,
+    p_race,
+    NA, NA, NA, NA, NA,
+    p_diab,
+    p_meld,
+    p_organ,
+    NA, NA, NA, NA, NA,
+    p_livdon,
+    p_isch,
+    p_prev_liv,
+    p_prev_any,
+    NA, NA, NA, NA,
+    p_hla,
+    NA, NA, NA, NA, NA, NA, NA,
+    p_perf_used,
+    p_perf_ty,          # Perfusion Type header
+    NA, NA              # Normothermic, Hypothermic
+  )
+  stopifnot(length(out) == length(demo_label1))
+  as.numeric(out)
+}
+
+# ------------------------------------------------------------------------
+# [FIX 14] Shared count formatter.
+# format(x, big.mark = ",") inside mutate() sees the whole column and right-pads
+# every element to the width of the widest one, so a count of 22 rendered as
+# "   22 (4.1%)". trim = TRUE suppresses the padding.
+# ------------------------------------------------------------------------
+fmt_count <- function(x) {
+  format(round(x), big.mark = ",", scientific = FALSE, trim = TRUE)
+}
+
+# [FIX 1] Median-row detection. The old regex "^\\(" never matched because the
+# IQR strings are built with a LEADING SPACE -- paste0(" (", q1, ...). It was
+# harmless only because the median\\(IQR\\) label check caught all three rows
+# anyway. Fixed rather than deleted so it works if a median row is ever added
+# without "median(IQR)" in its label.
+is_median_row <- function(label, std) {
+  str_detect(label, "median\\(IQR\\)") | (!is.na(std) & str_detect(std, "^\\s*\\("))
+}
+
+# ------------------------------------------------------------------------
+# Running Demographic Functions
+# ------------------------------------------------------------------------
+rej_stats  <- calc_demo_stats(pat_rej_demo_table)
+ctrl_stats <- calc_demo_stats(pat_ctrl_demo_table)
+ritux_stats <- calc_demo_stats(pat_ritux_demo_table)
+
+rej_std  <- calc_demo_std(rej_stats)
+ctrl_std <- calc_demo_std(ctrl_stats)
+ritux_std <- calc_demo_std(ritux_stats)
+
+num_rej  <- rej_stats$n
+num_ctrl <- ctrl_stats$n
+num_ritux <- ritux_stats$n
+
+mean_rej  <- build_mean_vector(rej_stats)
+mean_ctrl <- build_mean_vector(ctrl_stats)
+mean_ritux <- build_mean_vector(ritux_stats)
+
+# [FIX 15] plain vectors, no data.frame() wrapper
+std_rej   <- build_std_vector(rej_stats, rej_std)
+std_ctrl  <- build_std_vector(ctrl_stats, ctrl_std)
+std_ritux <- build_std_vector(ritux_stats, ritux_std)
+
+# ------------------------------------------------------------------------
+# Tibble Demographic Data 
+
+tbl_data <- tibble(
+  demo_label1,
+  ref_value1,
+  is_header_flag = header_rows,     # [FIX 1]
+  mean_rej,
+  std_rej,
+  mean_ctrl,
+  std_ctrl,
+  mean_ritux,
+  std_ritux
+)
+
+#---------------------------------------------------------------------------------
+# Follow Up Anti rejection tables
+
+followup_12m_anti_rej_table <- data.frame(
+  AntiRejectionTherapy = str_remove(COLS_TO_CHECK,COL_TAIL),
+  Frequency = sapply(df_immuno_fol[COLS_TO_CHECK], function(x) sum(x == 1, na.rm = TRUE))
+)
+
+followup_12m_anti_rej_table %>%
+  arrange(desc(Frequency)) %>%
+  kable(caption = "Frequency of Anti-Rejection Therapies Used At Follow up < 1 year s/p Liver Transplant") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+#-------------------------------------------------------------------------------------
+# Inpatient hospital course sp liver transplant
+
+post_tx_anti_rej_table <- data.frame(
+  AntiRejectionTherapy = str_remove(COLS_TO_CHECK,COL_TAIL),
+  Frequency = sapply(df_immuno_induc[COLS_TO_CHECK], function(x) sum(x == 1, na.rm = TRUE))
+)
+
+post_tx_anti_rej_table %>%
+  arrange(desc(Frequency)) %>%
+  kable(caption = "Frequency of Anti-Rejection Therapies Used While Admitted s/p Liver Transplant") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+#===============================================================================
+# Demographic Table 1
+#-------------------------------------------------------------------------------
+format_table1 <- function() {
+  tbl_data %>%
+    filter(demo_label1 != "n") %>%
+    mutate(
+      is_header = is_header_flag,                              # [FIX 1]
+      is_median = is_median_row(demo_label1, std_rej),         # [FIX 1]
+      mean_rej_fmt   = if_else(is_median, NA_character_, fmt_count(mean_rej)),    # [FIX 14]
+      mean_ritux_fmt = if_else(is_median, NA_character_, fmt_count(mean_ritux)),
+      mean_ctrl_fmt  = if_else(is_median, NA_character_, fmt_count(mean_ctrl)),
+      Rejection = case_when(
+        is_header ~ NA_character_,
+        is_median ~ paste0(fmt_count(mean_rej), " ", std_rej),
+        TRUE ~ paste0(mean_rej_fmt, " (", sprintf("%.1f", as.numeric(std_rej)), "%)")
+      ),
+      Rituxan = case_when(
+        is_header ~ NA_character_,
+        is_median ~ paste0(fmt_count(mean_ritux), " ", std_ritux),
+        TRUE ~ paste0(mean_ritux_fmt, " (", sprintf("%.1f", as.numeric(std_ritux)), "%)")
+      ),
+      Control = case_when(
+        is_header ~ NA_character_,
+        is_median ~ paste0(fmt_count(mean_ctrl), " ", std_ctrl),
+        TRUE ~ paste0(mean_ctrl_fmt, " (", sprintf("%.1f", as.numeric(std_ctrl)), "%)")
+      ),
+      Variable = if_else(is_header, demo_label1, paste0("    ", demo_label1))
+    ) %>%
+    select(Variable, Rejection, Rituxan, Control, is_header)
+}
+
+demo_tbl1 <- format_table1()
+
+demo_tbl1 %>%
+  select(-is_header) %>%
+  gt() %>%
+  cols_label(
+    Variable = "Characteristic",
+    Rejection = paste0("Rejection (n = ", num_rej, ")"),
+    Rituxan = paste0("Rituxan (n = ", num_ritux, ")"),
+    Control = paste0("Control (n = ", num_ctrl, ")")
+  ) %>%
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(rows = demo_tbl1$is_header)
+  ) %>%
+  tab_style(
+    style = cell_text(align = "left"),
+    locations = cells_column_labels(columns = Variable)
+  ) %>%
+  cols_align(align = "center", columns = c(Rejection, Rituxan, Control)) %>%
+  tab_options(
+    table.font.size = 13,
+    data_row.padding = px(4),
+    column_labels.font.weight = "bold"
+  ) %>%
+  tab_source_note("Values are n (%) or median (IQR) as indicated.")
+
+# ==============================================================================
+# Propensity Score Matching: Combined vs Steroid, Combined vs Control
+# ------------------------------------------------------------------------------
+
+prep_match_df <- function(df) {
+  df %>%
+    mutate(
+      DIAB_BIN = case_when(
+        as.numeric(DIAB) %in% 2:5 ~ 1,
+        as.numeric(DIAB) == 1     ~ 0,
+        TRUE                      ~ NA_real_
+      ),
+      GENDER = factor(GENDER),
+      ETHCAT = factor(ETHCAT),
+      DON_TY = factor(DON_TY)
+    )
+}
+
+match_covariates <- c("AGE", "GENDER", "ETHCAT", "MELD_PELD_LAB_SCORE", 
+                      "DIAB_BIN", "COLD_ISCH", "MM_TOTAL")
+
+match_formula <- as.formula(paste("treat ~", paste(match_covariates, collapse = " + ")))
+
+# [FIX 9] drop_na() on the matching covariates can quietly gut the cohort --
+# MM_TOTAL is NA whenever ANY of the six alleles is missing, which in UNOS is
+# common, and cold ischemic time is patchy too. This reports complete-case
+# attrition per arm AND per covariate so you can see exactly which variable is
+# doing the damage before trusting the matched Ns.
+report_complete_case_loss <- function(df, label) {
+  n_before <- nrow(df)
+  n_after  <- nrow(tidyr::drop_na(df, all_of(match_covariates)))
+  message("\n[", label, "] complete-case attrition on matching covariates:")
+  message("  rows before drop_na: ", n_before,
+          " | after: ", n_after,
+          " | lost: ", n_before - n_after,
+          " (", sprintf("%.1f", 100 * (n_before - n_after) / max(n_before, 1)), "%)")
+  
+  per_arm <- df %>%
+    group_by(treat) %>%
+    summarise(before = n(),
+              after = sum(complete.cases(across(all_of(match_covariates)))),
+              .groups = "drop")
+  print(per_arm)
+  
+  miss_by_var <- sapply(match_covariates, function(v) sum(is.na(df[[v]])))
+  message("  missing count by covariate:")
+  print(miss_by_var[order(-miss_by_var)])
+  invisible(NULL)
+}
+
+# ------------------------------------------------------------------------------
+# Comparison 1: Combined vs Steroid
+# ------------------------------------------------------------------------------
+match_df_combined_steroid_raw <- bind_rows(
+  prep_match_df(pat_combined_demo_table) %>% mutate(treat = 1),
+  prep_match_df(pat_steroid_demo_table)  %>% mutate(treat = 0)
+) %>%
+  select(TRR_ID_CODE, treat, all_of(match_covariates))
+
+report_complete_case_loss(match_df_combined_steroid_raw, "Combined vs Steroid")   # [FIX 9]
+
+match_df_combined_steroid <- match_df_combined_steroid_raw %>% drop_na()
+
+set.seed(1234)  # reproducibility of the matching algorithm
+
+# [FIX 10] caliper added. 1:1 nearest-neighbour with no caliper will force a
+# match for every treated unit no matter how far away the nearest control is,
+# which with small treated arms produces pairs that are not comparable at all.
+# 0.2 SD of the propensity logit is the conventional cutoff (Austin 2011);
+# std.caliper = TRUE makes it SD-scaled rather than absolute.
+m_combined_steroid <- matchit(
+  match_formula,
+  data         = match_df_combined_steroid,
+  method       = "nearest",
+  distance     = "logit",
+  ratio        = 1,
+  caliper      = 0.2,
+  std.caliper  = TRUE
+)
+
+summary(m_combined_steroid)  # check balance (Std. Mean Diff should shrink toward 0)
+
+# [FIX 10] with a caliper, some treated units will now go UNMATCHED. Report how
+# many, since a large drop changes who the estimand applies to.
+message("[Combined vs Steroid] treated units unmatched by caliper: ",
+        sum(m_combined_steroid$treat == 1 & is.na(m_combined_steroid$subclass)))
+
+matched_combined_steroid <- match.data(m_combined_steroid)
+
+combined_ids_1 <- matched_combined_steroid %>% filter(treat == 1) %>% pull(TRR_ID_CODE)
+steroid_ids    <- matched_combined_steroid %>% filter(treat == 0) %>% pull(TRR_ID_CODE)
+
+pat_combined_demo_table_m_steroid <- pat_combined_demo_table %>% filter(TRR_ID_CODE %in% combined_ids_1)
+pat_steroid_demo_table_m          <- pat_steroid_demo_table  %>% filter(TRR_ID_CODE %in% steroid_ids)
+
+# ------------------------------------------------------------------------------
+# Comparison 2: Combined vs Control (No Rejection)
+# ------------------------------------------------------------------------------
+match_df_combined_ctrl_raw <- bind_rows(
+  prep_match_df(pat_combined_demo_table) %>% mutate(treat = 1),
+  prep_match_df(pat_ctrl_demo_table)     %>% mutate(treat = 0)
+) %>%
+  select(TRR_ID_CODE, treat, all_of(match_covariates))
+
+report_complete_case_loss(match_df_combined_ctrl_raw, "Combined vs Control")   # [FIX 9]
+
+match_df_combined_ctrl <- match_df_combined_ctrl_raw %>% drop_na()
+
+set.seed(1234)
+
+m_combined_ctrl <- matchit(
+  match_formula,
+  data         = match_df_combined_ctrl,
+  method       = "nearest",
+  distance     = "logit",
+  ratio        = 1,
+  caliper      = 0.2,      # [FIX 10]
+  std.caliper  = TRUE
+)
+
+summary(m_combined_ctrl)
+
+message("[Combined vs Control] treated units unmatched by caliper: ",
+        sum(m_combined_ctrl$treat == 1 & is.na(m_combined_ctrl$subclass)))
+
+matched_combined_ctrl <- match.data(m_combined_ctrl)
+
+combined_ids_2 <- matched_combined_ctrl %>% filter(treat == 1) %>% pull(TRR_ID_CODE)
+ctrl_ids       <- matched_combined_ctrl %>% filter(treat == 0) %>% pull(TRR_ID_CODE)
+
+pat_combined_demo_table_m_ctrl <- pat_combined_demo_table %>% filter(TRR_ID_CODE %in% combined_ids_2)
+pat_ctrl_demo_table_m          <- pat_ctrl_demo_table     %>% filter(TRR_ID_CODE %in% ctrl_ids)
+
+# ==============================================================================
+# Love Plots: Covariate Balance Before/After Matching
+# ------------------------------------------------------------------------------
+love.plot(
+  m_combined_steroid,
+  binary   = "std",
+  stats    = "mean.diffs",
+  abs      = TRUE,
+  var.order = "unadjusted",
+  thresholds = c(m = 0.1),
+  title    = "Covariate Balance: Combined vs Steroid",
+  sample.names = c("Unmatched", "Matched")
+)
+
+love.plot(
+  m_combined_ctrl,
+  binary   = "std",
+  stats    = "mean.diffs",
+  abs      = TRUE,
+  var.order = "unadjusted",
+  thresholds = c(m = 0.1),
+  title    = "Covariate Balance: Combined vs Control",
+  sample.names = c("Unmatched", "Matched")
+)
+
+#===============================================================================
+# UNMATCHED Demographic Tables (no propensity score matching)
+#   Table 4: Combined vs Steroid
+#   Table 5: Combined vs No Rejection (Control)
+#-------------------------------------------------------------------------------
+
+#===============================================================================
+# Table 4: Combined vs Steroid (Unmatched)
+#-------------------------------------------------------------------------------
+
+rej_stats  <- calc_demo_stats(pat_combined_demo_table)
+ctrl_stats <- calc_demo_stats(pat_steroid_demo_table)
+
+rej_std  <- calc_demo_std(rej_stats)
+ctrl_std <- calc_demo_std(ctrl_stats)
+
+num_rej  <- rej_stats$n
+num_ctrl <- ctrl_stats$n
+
+mean_rej  <- build_mean_vector(rej_stats)
+mean_ctrl <- build_mean_vector(ctrl_stats)
+
+std_rej  <- build_std_vector(rej_stats, rej_std)     # [FIX 15]
+std_ctrl <- build_std_vector(ctrl_stats, ctrl_std)
+
+pval_combined_steroid_unmatched <- calc_pvalues(pat_combined_demo_table, pat_steroid_demo_table)
+
+tbl_data <- tibble(
+  demo_label1,
+  ref_value1,
+  is_header_flag = header_rows,     # [FIX 1]
+  mean_rej,
+  std_rej,
+  mean_ctrl,
+  std_ctrl,
+  pval_rej_ctrl = pval_combined_steroid_unmatched
+)
+
+format_table4 <- function() {
+  tbl_data %>%
+    filter(demo_label1 != "n") %>%
+    mutate(
+      is_header = is_header_flag,                         # [FIX 1]
+      is_median = is_median_row(demo_label1, std_rej),
+      mean_rej_fmt  = if_else(is_median, NA_character_, fmt_count(mean_rej)),   # [FIX 14]
+      mean_ctrl_fmt = if_else(is_median, NA_character_, fmt_count(mean_ctrl)),
+      Combined = case_when(
+        is_header ~ NA_character_,
+        is_median ~ paste0(fmt_count(mean_rej), " ", std_rej),
+        TRUE ~ paste0(mean_rej_fmt, " (", sprintf("%.1f", as.numeric(std_rej)), "%)")
+      ),
+      Steroid = case_when(
+        is_header ~ NA_character_,
+        is_median ~ paste0(fmt_count(mean_ctrl), " ", std_ctrl),
+        TRUE ~ paste0(mean_ctrl_fmt, " (", sprintf("%.1f", as.numeric(std_ctrl)), "%)")
+      ),
+      `P value` = case_when(
+        is.na(pval_rej_ctrl) ~ NA_character_,
+        pval_rej_ctrl < 0.001 ~ "<0.001",
+        TRUE ~ sprintf("%.3f", pval_rej_ctrl)
+      ),
+      Variable = if_else(is_header, demo_label1, paste0("    ", demo_label1))
+    ) %>%
+    select(Variable, Combined, Steroid, `P value`, is_header)
+}
+
+demo_tbl4 <- format_table4()
+
+demo_tbl4 %>%
+  select(-is_header) %>%
+  gt() %>%
+  cols_label(
+    Variable = "Characteristic",
+    Combined = paste0("Combined (n = ", num_rej, ")"),
+    Steroid = paste0("Steroid (n = ", num_ctrl, ")"),
+    `P value` = "P value"
+  ) %>%
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(rows = demo_tbl4$is_header)
+  ) %>%
+  tab_style(
+    style = cell_text(align = "left"),
+    locations = cells_column_labels(columns = Variable)
+  ) %>%
+  cols_align(align = "center", columns = c(Combined, Steroid, `P value`)) %>%
+  tab_options(
+    table.font.size = 13,
+    data_row.padding = px(4),
+    column_labels.font.weight = "bold"
+  ) %>%
+  tab_header(title = "Table 4. Combined vs Steroid (Unmatched)") %>%
+  tab_source_note("Values are n (%) or median (IQR) as indicated. P-values from Wilcoxon rank-sum (continuous), chi-square, or Fisher's exact tests (categorical, selected on expected cell counts) as appropriate. No propensity score matching applied.")
+
+#===============================================================================
+# Table 5: Combined vs No Rejection (Unmatched)
+#-------------------------------------------------------------------------------
+
+rej_stats  <- calc_demo_stats(pat_combined_demo_table)
+ctrl_stats <- calc_demo_stats(pat_ctrl_demo_table)
+
+rej_std  <- calc_demo_std(rej_stats)
+ctrl_std <- calc_demo_std(ctrl_stats)
+
+num_rej  <- rej_stats$n
+num_ctrl <- ctrl_stats$n
+
+mean_rej  <- build_mean_vector(rej_stats)
+mean_ctrl <- build_mean_vector(ctrl_stats)
+
+std_rej  <- build_std_vector(rej_stats, rej_std)     # [FIX 15]
+std_ctrl <- build_std_vector(ctrl_stats, ctrl_std)
+
+pval_combined_norej_unmatched <- calc_pvalues(pat_combined_demo_table, pat_ctrl_demo_table)
+
+tbl_data <- tibble(
+  demo_label1,
+  ref_value1,
+  is_header_flag = header_rows,     # [FIX 1]
+  mean_rej,
+  std_rej,
+  mean_ctrl,
+  std_ctrl,
+  pval_combined_norej = pval_combined_norej_unmatched
+)
+
+format_table5 <- function() {
+  tbl_data %>%
+    filter(demo_label1 != "n") %>%
+    mutate(
+      is_header = is_header_flag,
+      is_median = is_median_row(demo_label1, std_rej),
+      mean_rej_fmt  = if_else(is_median, NA_character_, fmt_count(mean_rej)),
+      mean_ctrl_fmt = if_else(is_median, NA_character_, fmt_count(mean_ctrl)),
+      `Combined Therapy` = case_when(
+        is_header ~ NA_character_,
+        is_median ~ paste0(fmt_count(mean_rej), " ", std_rej),
+        TRUE ~ paste0(mean_rej_fmt, " (", sprintf("%.1f", as.numeric(std_rej)), "%)")
+      ),
+      `No Rejection` = case_when(
+        is_header ~ NA_character_,
+        is_median ~ paste0(fmt_count(mean_ctrl), " ", std_ctrl),
+        TRUE ~ paste0(mean_ctrl_fmt, " (", sprintf("%.1f", as.numeric(std_ctrl)), "%)")
+      ),
+      `P value` = case_when(
+        is.na(pval_combined_norej) ~ NA_character_,
+        pval_combined_norej < 0.001 ~ "<0.001",
+        TRUE ~ sprintf("%.3f", pval_combined_norej)
+      ),
+      Variable = if_else(is_header, demo_label1, paste0("    ", demo_label1))
+    ) %>%
+    select(Variable, `Combined Therapy`, `No Rejection`, `P value`, is_header)
+}
+
+demo_tbl5 <- format_table5()
+
+demo_tbl5 %>%
+  select(-is_header) %>%
+  gt() %>%
+  cols_label(
+    Variable = "Characteristic",
+    `Combined Therapy` = paste0("Combined Therapy (n = ", num_rej, ")"),
+    `No Rejection` = paste0("No Rejection (n = ", num_ctrl, ")"),
+    `P value` = "P value"
+  ) %>%
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(rows = demo_tbl5$is_header)
+  ) %>%
+  tab_style(
+    style = cell_text(align = "left"),
+    locations = cells_column_labels(columns = Variable)
+  ) %>%
+  cols_align(align = "center", columns = c(`Combined Therapy`, `No Rejection`, `P value`)) %>%
+  tab_options(
+    table.font.size = 13,
+    data_row.padding = px(4),
+    column_labels.font.weight = "bold"
+  ) %>%
+  tab_header(title = "Table 5. Combined Therapy vs No Rejection (Unmatched)") %>%
+  tab_source_note("Values are n (%) or median (IQR) as indicated. P-values from Wilcoxon rank-sum (continuous), chi-square, or Fisher's exact tests (categorical, selected on expected cell counts) as appropriate. No propensity score matching applied.")
+
+#===============================================================================
+# Table 2 - Steroid vs Combined Therapy (PROPENSITY MATCHED)
+# ------------------------------------------------------------------------
+rej_stats  <- calc_demo_stats(pat_combined_demo_table_m_steroid)
+ctrl_stats <- calc_demo_stats(pat_steroid_demo_table_m)
+
+rej_std  <- calc_demo_std(rej_stats)
+ctrl_std <- calc_demo_std(ctrl_stats)
+
+num_rej  <- rej_stats$n
+num_ctrl <- ctrl_stats$n
+
+mean_rej  <- build_mean_vector(rej_stats)
+mean_ctrl <- build_mean_vector(ctrl_stats)
+
+std_rej  <- build_std_vector(rej_stats, rej_std)     # [FIX 15]
+std_ctrl <- build_std_vector(ctrl_stats, ctrl_std)
+
+pval_rej_ctrl <- calc_pvalues(pat_combined_demo_table_m_steroid, pat_steroid_demo_table_m)
+
+tbl_data <- tibble(
+  demo_label1,
+  ref_value1,
+  is_header_flag = header_rows,     # [FIX 1]
+  mean_rej,
+  std_rej,
+  mean_ctrl,
+  std_ctrl,
+  pval_rej_ctrl
+)
+
+format_table2 <- function() {
+  tbl_data %>%
+    filter(demo_label1 != "n") %>%
+    mutate(
+      is_header = is_header_flag,
+      is_median = is_median_row(demo_label1, std_rej),
+      mean_rej_fmt  = if_else(is_median, NA_character_, fmt_count(mean_rej)),
+      mean_ctrl_fmt = if_else(is_median, NA_character_, fmt_count(mean_ctrl)),
+      Combined = case_when(
+        is_header ~ NA_character_,
+        is_median ~ paste0(fmt_count(mean_rej), " ", std_rej),
+        TRUE ~ paste0(mean_rej_fmt, " (", sprintf("%.1f", as.numeric(std_rej)), "%)")
+      ),
+      Steroid = case_when(
+        is_header ~ NA_character_,
+        is_median ~ paste0(fmt_count(mean_ctrl), " ", std_ctrl),
+        TRUE ~ paste0(mean_ctrl_fmt, " (", sprintf("%.1f", as.numeric(std_ctrl)), "%)")
+      ),
+      `P value` = case_when(
+        is.na(pval_rej_ctrl) ~ NA_character_,
+        pval_rej_ctrl < 0.001 ~ "<0.001",
+        TRUE ~ sprintf("%.3f", pval_rej_ctrl)
+      ),
+      Variable = if_else(is_header, demo_label1, paste0("    ", demo_label1))
+    ) %>%
+    select(Variable, Combined, Steroid, `P value`, is_header)
+}
+
+demo_tbl2 <- format_table2()
+
+demo_tbl2 %>%
+  select(-is_header) %>%
+  gt() %>%
+  cols_label(
+    Variable = "Characteristic",
+    Combined = paste0("Combined (n = ", num_rej, ")"),
+    Steroid = paste0("Steroid (n = ", num_ctrl, ")"),
+    `P value` = "P value"
+  ) %>%
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(rows = demo_tbl2$is_header)
+  ) %>%
+  tab_style(
+    style = cell_text(align = "left"),
+    locations = cells_column_labels(columns = Variable)
+  ) %>%
+  cols_align(align = "center", columns = c(Combined, Steroid, `P value`)) %>%
+  tab_options(
+    table.font.size = 13,
+    data_row.padding = px(4),
+    column_labels.font.weight = "bold"
+  ) %>%
+  tab_header(title = "Table 2. Combined vs Steroid (Propensity Matched)") %>%
+  tab_source_note("Values are n (%) or median (IQR) as indicated. P-values from Wilcoxon rank-sum (continuous), chi-square, or Fisher's exact tests (categorical, selected on expected cell counts) as appropriate.")
+
+#===============================================================================
+# Table 3 - Combined Therapy vs No Rejection (PROPENSITY MATCHED)
+# ------------------------------------------------------------------------
+rej_stats  <- calc_demo_stats(pat_combined_demo_table_m_ctrl)
+ctrl_stats <- calc_demo_stats(pat_ctrl_demo_table_m)
+
+rej_std  <- calc_demo_std(rej_stats)
+ctrl_std <- calc_demo_std(ctrl_stats)
+
+num_rej  <- rej_stats$n
+num_ctrl <- ctrl_stats$n
+
+mean_rej  <- build_mean_vector(rej_stats)
+mean_ctrl <- build_mean_vector(ctrl_stats)
+
+std_rej  <- build_std_vector(rej_stats, rej_std)     # [FIX 15]
+std_ctrl <- build_std_vector(ctrl_stats, ctrl_std)
+
+pval_combined_norej <- calc_pvalues(pat_combined_demo_table_m_ctrl, pat_ctrl_demo_table_m)
+
+tbl_data <- tibble(
+  demo_label1,
+  ref_value1,
+  is_header_flag = header_rows,     # [FIX 1]
+  mean_rej,
+  std_rej,
+  mean_ctrl,
+  std_ctrl,
+  pval_combined_norej
+)
+
+format_table3 <- function() {
+  tbl_data %>%
+    filter(demo_label1 != "n") %>%
+    mutate(
+      is_header = is_header_flag,
+      is_median = is_median_row(demo_label1, std_rej),
+      mean_rej_fmt  = if_else(is_median, NA_character_, fmt_count(mean_rej)),
+      mean_ctrl_fmt = if_else(is_median, NA_character_, fmt_count(mean_ctrl)),
+      `Combined Therapy` = case_when(
+        is_header ~ NA_character_,
+        is_median ~ paste0(fmt_count(mean_rej), " ", std_rej),
+        TRUE ~ paste0(mean_rej_fmt, " (", sprintf("%.1f", as.numeric(std_rej)), "%)")
+      ),
+      `No Rejection` = case_when(
+        is_header ~ NA_character_,
+        is_median ~ paste0(fmt_count(mean_ctrl), " ", std_ctrl),
+        TRUE ~ paste0(mean_ctrl_fmt, " (", sprintf("%.1f", as.numeric(std_ctrl)), "%)")
+      ),
+      `P value` = case_when(
+        is.na(pval_combined_norej) ~ NA_character_,
+        pval_combined_norej < 0.001 ~ "<0.001",
+        TRUE ~ sprintf("%.3f", pval_combined_norej)
+      ),
+      Variable = if_else(is_header, demo_label1, paste0("    ", demo_label1))
+    ) %>%
+    select(Variable, `Combined Therapy`, `No Rejection`, `P value`, is_header)
+}
+
+demo_tbl3 <- format_table3()
+
+demo_tbl3 %>%
+  select(-is_header) %>%
+  gt() %>%
+  cols_label(
+    Variable = "Characteristic",
+    `Combined Therapy` = paste0("Combined Therapy (n = ", num_rej, ")"),
+    `No Rejection` = paste0("No Rejection (n = ", num_ctrl, ")"),
+    `P value` = "P value"
+  ) %>%
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(rows = demo_tbl3$is_header)
+  ) %>%
+  tab_style(
+    style = cell_text(align = "left"),
+    locations = cells_column_labels(columns = Variable)
+  ) %>%
+  cols_align(align = "center", columns = c(`Combined Therapy`, `No Rejection`, `P value`)) %>%
+  tab_options(
+    table.font.size = 13,
+    data_row.padding = px(4),
+    column_labels.font.weight = "bold"
+  ) %>%
+  tab_header(title = "Table 3. Combined Therapy vs No Rejection (Propensity Matched)") %>%
+  tab_source_note("Values are n (%) or median (IQR) as indicated. P-values from Wilcoxon rank-sum (continuous), chi-square, or Fisher's exact tests (categorical, selected on expected cell counts) as appropriate.")
+
+#==============================================================================
+# Survival Analysis  --  LANDMARK DESIGN
+#-------------------------------------------------------------------------------
+# [FIX 8] IMMORTAL TIME BIAS.
+#
+# The previous version of this section defined group membership from
+# anti-rejection treatment received during YEAR 1, but started the survival
+# clock at TRANSPLANT (day 0). That is immortal time bias, and it is not a
+# small effect:
+#
+#   * A patient who died on day 40 could not possibly have received a month-6
+#     rejection treatment. They are therefore forced into the Control arm by
+#     construction -- not because they avoided rejection, but because they died
+#     before they could be observed having one.
+#   * Every patient in the Steroids / Combined / Dual arms is GUARANTEED to have
+#     survived at least until their treatment date. That guaranteed survival is
+#     "immortal time," and the naive KM curve credits it to the treatment.
+#   * The result is that treated arms look structurally protected early on, and
+#     the Control arm absorbs all the early deaths. The bias runs in the
+#     direction of making anti-rejection treatment look beneficial.
+#
+# The year-2 sections already handled this correctly with landmark_ids_yr1.
+# This section applies the same logic to the primary survival analysis, plus a
+# time-varying-exposure Cox model as a sensitivity analysis that uses the full
+# follow-up without discarding anyone.
+#
+# DESIGN:
+#   1. Fix a landmark day L (default 365.25, matching the year-2 sections).
+#   2. Exposure is whatever anti-rejection treatment was given in [0, L).
+#   3. Only patients still under observation AT L enter the analysis.
+#   4. The survival clock is reset to start at L.
+#   Nobody in any arm can have died before L, so no arm carries immortal time.
+#
+# CONSEQUENCE FOR INTERPRETATION -- READ THIS:
+#   Time on the x-axis is now DAYS SINCE THE LANDMARK, not days since
+#   transplant. With L = 365.25, the "1-year" curve covers post-transplant
+#   years 1-2 and the "2-year" curve covers years 1-3. These are conditional
+#   survival estimates (survival given you reached 1 year), which is the correct
+#   quantity for a year-1 exposure, but it is NOT the same estimand as the old
+#   plots. Label it as such in any manuscript.
+#
+#   Everyone who died in year 1 is excluded. That is the price of the landmark
+#   design and the reason the time-varying model below is included alongside it.
+#-------------------------------------------------------------------------------
+
+# [FIX 16] fix_origin() previously added a bare scale_x_continuous(), which
+# REPLACES the scale survminer built from break.time.by -- so the 90-day /
+# 180-day tick marks were silently discarded and ggplot emitted a "Scale for x
+# is already present" message on every plot. The replacement scale now carries
+# the breaks explicitly.
+fix_origin <- function(p, break_by = NULL, max_time = NULL) {
+  x_scale <- if (!is.null(break_by) && !is.null(max_time)) {
+    ggplot2::scale_x_continuous(
+      expand = ggplot2::expansion(mult = c(0, 0.02)),
+      breaks = seq(0, max_time, by = break_by)
+    )
+  } else {
+    ggplot2::scale_x_continuous(expand = ggplot2::expansion(mult = c(0, 0.02)))
+  }
+  
+  p$plot <- suppressMessages(
+    p$plot +
+      x_scale +
+      ggplot2::scale_y_continuous(expand = ggplot2::expansion(mult = c(0, 0.02)),
+                                  limits = c(0, 1))
+  )
+  # keep the risk table on the same x scale so the columns stay aligned
+  if (!is.null(p$table)) {
+    p$table <- suppressMessages(p$table + x_scale)
+  }
+  p
+}
+
+#-------------------------------------------------------------------------------
+# Step 0: analysis parameters
+#-------------------------------------------------------------------------------
+# LANDMARK_DAY is the single knob that controls this whole section. Setting it
+# to 365.25 keeps the exposure definition identical to the rest of the script.
+# Setting it lower (e.g. 90) retains far more patients and more post-landmark
+# follow-up, at the cost of only counting rejections treated in the first 90
+# days -- rejections after that are then treated as non-exposure (a
+# treat-as-of-landmark / intention-to-treat-at-landmark analysis). Running both
+# and comparing is a reasonable sensitivity analysis.
+LANDMARK_DAY <- 365.25
+
+# Horizons are measured FROM THE LANDMARK, not from transplant.
+LM_HORIZON_SHORT <- 365.25   # 1 year of post-landmark follow-up
+LM_HORIZON_LONG  <- 730.5    # 2 years of post-landmark follow-up
+
+# Day (post-transplant) assigned to anti-rejection therapy given during the
+# index admission. The UNOS discharge file records THAT it was given, not WHEN,
+# so day 0 is used: it assigns these patients no immortal time at all. Setting
+# this to a positive value would credit them unexposed person-time they may not
+# have had. Sensitivity: try DAYS_HOSP_SP_TX / 2.
+INPATIENT_RX_DAY <- 0
+
+#-------------------------------------------------------------------------------
+# Step 1: day of FIRST anti-rejection treatment, per patient
+#-------------------------------------------------------------------------------
+# This is the variable the old code never had, and without it a landmark or
+# time-varying design is impossible -- which is why the bias went unnoticed.
+#
+# Sources and their timing caveats:
+#   source == 1 (index admission) -> INPATIENT_RX_DAY, see above.
+#   source == 2 (outpatient)      -> FOL_DATE_DAYS_DELTA, the date of the
+#      follow-up VISIT at which the drug was recorded. The actual treatment
+#      happened at some point in the interval since the previous visit, so this
+#      is an upper bound on the true treatment day. Using it grants slightly
+#      MORE unexposed person-time than reality, which is conservative here.
+pat_rej_first <- pat_rej_array %>%
+  group_by(TRR_ID_CODE) %>%
+  slice_min(order_by = source, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(
+    REJ_TX_DAY = if_else(source == 1L,
+                         as.numeric(INPATIENT_RX_DAY),
+                         as.numeric(FOL_DATE_DAYS_DELTA))
+  )
+
+# Sanity: every rejector must have a usable treatment day
+message("Rejectors with unusable REJ_TX_DAY (should be 0): ",
+        sum(is.na(pat_rej_first$REJ_TX_DAY)))
+summary(pat_rej_first$REJ_TX_DAY)
+
+#-------------------------------------------------------------------------------
+# Step 2: arm assignment AS OF a given landmark
+#-------------------------------------------------------------------------------
+# Arms are mutually exclusive and are derived from the patient's FIRST
+# anti-rejection event only. Note this differs subtly from the original
+# steroid_id_all_vect / arm2_ID_vect, which were built from pat_rej_array
+# WITHOUT deduplication -- a patient with both an inpatient and an outpatient
+# record could be classified from whichever row happened to match. First-event
+# classification is the one that is coherent with a time-to-event design.
+assign_arm_at_landmark <- function(landmark_day) {
+  
+  treated_before <- pat_rej_first %>%
+    filter(!is.na(REJ_TX_DAY), REJ_TX_DAY < landmark_day)
+  
+  mono <- treated_before %>% filter(NUM_ANTI_REJ_RXED < 2)
+  
+  steroid_lm  <- mono %>%
+    filter(STEROIDS_ANTIREJ == 1) %>% pull(TRR_ID_CODE)
+  
+  combined_lm <- mono %>%
+    filter(SIMULECT_ANTIREJ == 1 | THYMOGLOBULIN_ANTIREJ == 1 | RITUXAN_ANTIREJ == 1) %>%
+    pull(TRR_ID_CODE)
+  
+  dual_lm <- treated_before %>%
+    filter(STEROIDS_ANTIREJ == 1,
+           SIMULECT_ANTIREJ == 1 | THYMOGLOBULIN_ANTIREJ == 1 | RITUXAN_ANTIREJ == 1) %>%
+    pull(TRR_ID_CODE)
+  
+  # Controls: assessed at least once (so "no rejection" means observed, not
+  # missing) and no anti-rejection therapy recorded before the landmark.
+  assessed_ids   <- unique(df_immuno_fol_calc$TRR_ID_CODE)
+  control_lm     <- setdiff(assessed_ids, treated_before$TRR_ID_CODE)
+  
+  tibble(TRR_ID_CODE = unique(c(treated_before$TRR_ID_CODE, control_lm))) %>%
+    mutate(ARM = case_when(
+      TRR_ID_CODE %in% dual_lm     ~ "Dual Therapy",
+      TRR_ID_CODE %in% steroid_lm  ~ "Steroids",
+      TRR_ID_CODE %in% combined_lm ~ "Combined",
+      TRR_ID_CODE %in% control_lm  ~ "Control",
+      TRUE                         ~ "Other Rejection"
+    ))
+}
+
+arm_at_landmark <- assign_arm_at_landmark(LANDMARK_DAY)
+table(arm_at_landmark$ARM, useNA = "ifany")
+
+# --- Reconciliation against the original ID vectors -------------------------
+# At LANDMARK_DAY = 365.25 these should agree almost exactly. Any difference is
+# the deduplication effect described above, NOT the landmark itself. Reported
+# rather than asserted, so a real discrepancy is visible instead of fatal.
+reconcile_arm <- function(arm_name, old_vect) {
+  new_vect <- arm_at_landmark %>% filter(ARM == arm_name) %>% pull(TRR_ID_CODE)
+  message(sprintf("  %-14s new n=%4d | old n=%4d | new-only=%3d | old-only=%3d",
+                  arm_name, length(new_vect), length(old_vect),
+                  length(setdiff(new_vect, old_vect)),
+                  length(setdiff(old_vect, new_vect))))
+}
+message("Arm reconciliation (first-event classification vs original vectors):")
+reconcile_arm("Steroids",     steroid_id_all_vect)
+reconcile_arm("Combined",     arm2_ID_vect)
+reconcile_arm("Dual Therapy", dual_therapy_id_vect)
+reconcile_arm("Control",      ctrl_id_vect)
+
+#-------------------------------------------------------------------------------
+# Step 3: base survival frame
+#-------------------------------------------------------------------------------
+df_survival <- df_liver_data_filtered |> 
+  select(TRR_ID_CODE, TX_DATE, COMPOSITE_DEATH_DATE, RETXDATE, PTIME, PX_STAT, PX_STAT_DATE) |> 
+  mutate(PTIME = suppressWarnings(as.numeric(PTIME))) |>          # [FIX 19]
+  distinct(TRR_ID_CODE, .keep_all = TRUE) |>                      # [FIX 7]
+  mutate(event = ifelse(PX_STAT == "D", 1, 0))   # confirm "D" is your death code
+
+# Baseline covariates, assembled once, for matching inside the landmark cohort
+baseline_covs <- df_liver_data_filtered %>%
+  select(TRR_ID_CODE, AGE, GENDER, ETHCAT, MELD_PELD_LAB_SCORE, COLD_ISCH, DIAB) %>%
+  distinct(TRR_ID_CODE, .keep_all = TRUE) %>%                     # [FIX 7]
+  left_join(df_hla_calc %>% select(TRR_ID_CODE, MM_TOTAL), by = "TRR_ID_CODE") %>%
+  mutate(
+    DIAB_BIN = case_when(
+      as.numeric(DIAB) %in% 2:5 ~ 1,
+      as.numeric(DIAB) == 1     ~ 0,
+      TRUE                      ~ NA_real_
+    ),
+    GENDER = factor(GENDER),
+    ETHCAT = factor(ETHCAT)
+  )
+
+#-------------------------------------------------------------------------------
+# Step 4: build the landmark survival dataset
+#-------------------------------------------------------------------------------
+# This is where the bias is actually removed. Three things happen together and
+# all three are necessary:
+#   (a) arms are assigned from exposure BEFORE the landmark,
+#   (b) patients not still under observation AT the landmark are DROPPED,
+#   (c) the clock is reset so t = 0 is the landmark, not transplant.
+# Doing (a) without (b) and (c) is exactly the original bug.
+build_landmark_surv <- function(landmark_day, horizon_days) {
+  arms <- assign_arm_at_landmark(landmark_day)
+  
+  out <- df_survival %>%
+    inner_join(arms, by = "TRR_ID_CODE") %>%
+    filter(!is.na(PTIME), PTIME >= landmark_day) %>%     # (b) landmark restriction
+    mutate(
+      time_raw = PTIME - landmark_day,                   # (c) clock reset
+      event_lm = if_else(time_raw <= horizon_days, event, 0),
+      time_lm  = pmin(time_raw, horizon_days),
+      ARM = factor(ARM, levels = c("Control", "Steroids", "Combined",
+                                   "Dual Therapy", "Other Rejection"))
+    )
+  
+  n_zero <- sum(out$time_lm == 0)
+  if (n_zero > 0) {
+    message("  note: ", n_zero, " patient(s) have exactly 0 days of post-landmark follow-up")
+  }
+  out
+}
+
+df_lm_short <- build_landmark_surv(LANDMARK_DAY, LM_HORIZON_SHORT)
+df_lm_long  <- build_landmark_surv(LANDMARK_DAY, LM_HORIZON_LONG)
+
+# --- How much cohort did the landmark cost, and from which arm? -------------
+# Worth looking at properly. If the Control arm loses a far larger share than
+# the treated arms, that IS the immortal time bias, quantified -- those are the
+# early deaths the old analysis was silently assigning to Control.
+landmark_attrition <- assign_arm_at_landmark(LANDMARK_DAY) %>%
+  left_join(df_survival %>% select(TRR_ID_CODE, PTIME), by = "TRR_ID_CODE") %>%
+  group_by(ARM) %>%
+  summarise(
+    n_before_landmark = n(),
+    n_at_landmark     = sum(!is.na(PTIME) & PTIME >= LANDMARK_DAY),
+    n_lost            = n_before_landmark - n_at_landmark,
+    pct_lost          = 100 * n_lost / n_before_landmark,
+    .groups = "drop"
+  )
+
+landmark_attrition %>%
+  gt() %>%
+  fmt_number(columns = pct_lost, decimals = 1) %>%
+  cols_label(
+    ARM               = "Arm",
+    n_before_landmark = "N assigned to arm",
+    n_at_landmark     = paste0("N still observed at day ", round(LANDMARK_DAY)),
+    n_lost            = "N excluded by landmark",
+    pct_lost          = "% excluded"
+  ) %>%
+  tab_header(title = "Landmark Attrition by Arm") %>%
+  tab_options(table.font.size = 13, data_row.padding = px(4),
+              column_labels.font.weight = "bold") %>%
+  tab_source_note("Patients excluded because they were no longer under observation at the landmark. A markedly higher exclusion rate in the Control arm is the immortal time bias made explicit: under the previous transplant-anchored design those deaths were counted against Control while every treated patient was guaranteed to have survived to their treatment date.")
+
+#-------------------------------------------------------------------------------
+# Step 5: KM plotting helper
+#-------------------------------------------------------------------------------
+# NOTE: the log-rank p-value is computed here and passed to ggsurvplot as a
+# pre-formatted STRING rather than via pval = TRUE. survminer re-evaluates the
+# model formula in the calling frame when asked to compute the p-value itself,
+# which breaks when the data lives in a function-local variable. Computing it
+# directly sidesteps that entirely.
+plot_landmark_km <- function(df, arms_keep, horizon, break_by, title) {
+  d <- df %>% filter(ARM %in% arms_keep) %>% mutate(ARM = droplevels(ARM))
+  
+  if (nlevels(d$ARM) < 2) {
+    message("skipping plot -- fewer than 2 non-empty arms: ", title)
+    return(invisible(NULL))
+  }
+  
+  fit <- survfit(Surv(time_lm, event_lm) ~ ARM, data = d)
+  
+  sd_test  <- survdiff(Surv(time_lm, event_lm) ~ ARM, data = d)
+  pv       <- 1 - pchisq(sd_test$chisq, length(sd_test$n) - 1)
+  pval_lbl <- if (pv < 0.001) "log-rank p < 0.001" else sprintf("log-rank p = %.3f", pv)
+  
+  p <- ggsurvplot(
+    fit,
+    data          = d,
+    pval          = pval_lbl,
+    conf.int      = TRUE,
+    risk.table    = TRUE,
+    break.time.by = break_by,
+    legend.title  = "Group",
+    legend.labs   = levels(d$ARM),
+    xlab          = paste0("Days since landmark (day ", round(LANDMARK_DAY), " post-transplant)"),
+    ylab          = "Survival Probability",
+    title         = title
+  )
+  fix_origin(p, break_by = break_by, max_time = horizon)
+}
+
+#-------------------------------------------------------------------------------
+# Step 6: descriptive KM curves on the UNMATCHED landmark cohort
+#-------------------------------------------------------------------------------
+print(plot_landmark_km(
+  df_lm_short, c("Steroids", "Combined", "Control"), LM_HORIZON_SHORT, 90,
+  "Conditional Survival, Years 1-2 Post-Transplant (Landmark, Unmatched)"
+))
+
+print(plot_landmark_km(
+  df_lm_long, c("Steroids", "Combined", "Control"), LM_HORIZON_LONG, 180,
+  "Conditional Survival, Years 1-3 Post-Transplant (Landmark, Unmatched)"
+))
+
+print(plot_landmark_km(
+  df_lm_long, c("Steroids", "Dual Therapy"), LM_HORIZON_LONG, 180,
+  "Steroids vs Dual Therapy (Landmark, Unmatched)"
+))
+
+print(plot_landmark_km(
+  df_lm_long, c("Dual Therapy", "Combined"), LM_HORIZON_LONG, 180,
+  "Dual Therapy vs Combined (Landmark, Unmatched)"
+))
+
+# Survival probability at each horizon
+fit_lm_3arm_short <- survfit(Surv(time_lm, event_lm) ~ ARM,
+                             data = df_lm_short %>%
+                               filter(ARM %in% c("Steroids","Combined","Control")) %>%
+                               mutate(ARM = droplevels(ARM)))
+summary(fit_lm_3arm_short, times = LM_HORIZON_SHORT)
+
+fit_lm_3arm_long <- survfit(Surv(time_lm, event_lm) ~ ARM,
+                            data = df_lm_long %>%
+                              filter(ARM %in% c("Steroids","Combined","Control")) %>%
+                              mutate(ARM = droplevels(ARM)))
+summary(fit_lm_3arm_long, times = LM_HORIZON_LONG)
+
+#-------------------------------------------------------------------------------
+# Step 7: propensity matching WITHIN the landmark cohort
+#-------------------------------------------------------------------------------
+# Matching is redone here rather than reusing m_combined_steroid / m_combined_ctrl
+# from the demographic section. Those were fit on the full year-1 cohort; if the
+# landmark restriction were applied afterwards it would break matched pairs
+# non-randomly (the patient who died at month 6 is dropped, their match is not),
+# reintroducing the imbalance the matching existed to remove. Matching within
+# the eligible cohort keeps pairs intact.
+#
+# Tables 2 and 3 earlier in the script therefore describe the YEAR-1 matched
+# cohorts, while this section reports its own Ns and its own balance. Do not
+# quote one table's N alongside the other's hazard ratio.
+match_within_landmark <- function(df_lm, treat_arm, ctrl_arm, label, seed = 1234) {
+  
+  d <- df_lm %>%
+    filter(ARM %in% c(treat_arm, ctrl_arm)) %>%
+    mutate(treat = as.integer(ARM == treat_arm)) %>%
+    left_join(baseline_covs, by = "TRR_ID_CODE")
+  
+  md <- d %>% select(TRR_ID_CODE, treat, all_of(match_covariates))
+  report_complete_case_loss(md, label)                    # [FIX 9]
+  
+  md <- md %>%
+    drop_na() %>%
+    mutate(across(where(is.factor), droplevels))
+  
+  if (length(unique(md$treat)) < 2 || min(table(md$treat)) < 5) {
+    message("skipping match -- too few complete cases in one arm: ", label)
+    return(NULL)
+  }
+  
+  set.seed(seed)
+  m <- matchit(
+    match_formula,
+    data        = md,
+    method      = "nearest",
+    distance    = "logit",
+    ratio       = 1,
+    caliper     = 0.2,                                    # [FIX 10]
+    std.caliper = TRUE
+  )
+  
+  message("[", label, "] treated units unmatched by caliper: ",
+          sum(m$treat == 1 & is.na(m$subclass)))
+  
+  matched_ids <- match.data(m)$TRR_ID_CODE
+  
+  list(
+    matchit = m,
+    data    = d %>%
+      filter(TRR_ID_CODE %in% matched_ids) %>%
+      mutate(ARM = droplevels(ARM))
+  )
+}
+
+lm_match_steroid_combined <- match_within_landmark(
+  df_lm_long, treat_arm = "Combined", ctrl_arm = "Steroids",
+  label = "Landmark: Combined vs Steroid"
+)
+
+lm_match_combined_control <- match_within_landmark(
+  df_lm_long, treat_arm = "Combined", ctrl_arm = "Control",
+  label = "Landmark: Combined vs Control"
+)
+
+# --- Balance ---
+if (!is.null(lm_match_steroid_combined)) {
+  summary(lm_match_steroid_combined$matchit)
+  print(love.plot(lm_match_steroid_combined$matchit,
+                  binary = "std", stats = "mean.diffs", abs = TRUE,
+                  var.order = "unadjusted", thresholds = c(m = 0.1),
+                  title = "Landmark Cohort Balance: Combined vs Steroid",
+                  sample.names = c("Unmatched", "Matched")))
+}
+
+if (!is.null(lm_match_combined_control)) {
+  summary(lm_match_combined_control$matchit)
+  print(love.plot(lm_match_combined_control$matchit,
+                  binary = "std", stats = "mean.diffs", abs = TRUE,
+                  var.order = "unadjusted", thresholds = c(m = 0.1),
+                  title = "Landmark Cohort Balance: Combined vs Control",
+                  sample.names = c("Unmatched", "Matched")))
+}
+
+# --- Matched KM curves ---
+if (!is.null(lm_match_steroid_combined)) {
+  print(plot_landmark_km(
+    lm_match_steroid_combined$data, c("Steroids", "Combined"),
+    LM_HORIZON_LONG, 180,
+    "Combined vs Steroids (Landmark, Propensity Matched)"
+  ))
+}
+
+if (!is.null(lm_match_combined_control)) {
+  print(plot_landmark_km(
+    lm_match_combined_control$data, c("Control", "Combined"),
+    LM_HORIZON_LONG, 180,
+    "Combined vs Control (Landmark, Propensity Matched)"
+  ))
+}
+
+#===============================================================================
+# Hazard Ratios: Landmark Cox Models
+#-------------------------------------------------------------------------------
+
+# [FIX 3] The reference arm is now an explicit ARGUMENT rather than an emergent
+# property of factor level ordering, and the realised direction is echoed back
+# in the output. The old code read conf.int[1, ] and assumed it matched the
+# label, which is how "Combined vs Control" ended up reporting Control vs
+# Combined.
+run_coxph_lm <- function(data, ref_arm, label) {
+  d <- data %>% mutate(ARM = relevel(droplevels(ARM), ref = ref_arm))
+  
+  fit <- coxph(Surv(time_lm, event_lm) ~ ARM, data = d)
+  s   <- summary(fit)
+  
+  zph  <- tryCatch(cox.zph(fit), error = function(e) NULL)
+  ph_p <- if (!is.null(zph)) zph$table[1, "p"] else NA_real_
+  
+  tibble(
+    Comparison = label,
+    Direction  = paste0(rownames(s$conf.int)[1], "  (ref = ", ref_arm, ")"),
+    n          = fit$n,
+    events     = fit$nevent,
+    HR         = s$conf.int[1, "exp(coef)"],
+    CI_lower   = s$conf.int[1, "lower .95"],
+    CI_upper   = s$conf.int[1, "upper .95"],
+    p_value    = s$coefficients[1, "Pr(>|z|)"],
+    ph_test_p  = ph_p
+  )
+}
+
+hr_results_lm <- bind_rows(
+  if (!is.null(lm_match_steroid_combined))
+    run_coxph_lm(lm_match_steroid_combined$data, ref_arm = "Steroids",
+                 label = "Combined vs Steroids"),
+  if (!is.null(lm_match_combined_control))
+    run_coxph_lm(lm_match_combined_control$data, ref_arm = "Control",
+                 label = "Combined vs Control"),
+  run_coxph_lm(df_lm_long %>% filter(ARM %in% c("Steroids", "Dual Therapy")),
+               ref_arm = "Steroids", label = "Dual Therapy vs Steroids (unmatched)")
+)
+
+hr_results_lm
+
+# --- Overall 3-arm model on the unmatched landmark cohort ---
+df_lm_3arm <- df_lm_long %>%
+  filter(ARM %in% c("Steroids", "Combined", "Control")) %>%
+  mutate(ARM = relevel(droplevels(ARM), ref = "Control"))
+
+fit_lm_3arm <- coxph(Surv(time_lm, event_lm) ~ ARM, data = df_lm_3arm)
+summary(fit_lm_3arm)
+cox.zph(fit_lm_3arm)
+
+# ------------------------------------------------------------------------
+# Formatted HR Table
+# ------------------------------------------------------------------------
+hr_table_lm <- hr_results_lm %>%
+  mutate(
+    `HR (95% CI)` = sprintf("%.2f (%.2f\u2013%.2f)", HR, CI_lower, CI_upper),
+    `P value` = case_when(
+      p_value < 0.001 ~ "<0.001",
+      TRUE ~ sprintf("%.3f", p_value)
+    ),
+    `PH test P` = case_when(
+      is.na(ph_test_p) ~ NA_character_,
+      ph_test_p < 0.001 ~ "<0.001",
+      TRUE ~ sprintf("%.3f", ph_test_p)
+    )
+  ) %>%
+  select(Comparison, Direction, n, events, `HR (95% CI)`, `P value`, `PH test P`)
+
+hr_table_lm %>%
+  gt() %>%
+  cols_label(
+    Comparison    = "Comparison",
+    Direction     = "Model direction",
+    n             = "N",
+    events        = "Deaths",
+    `HR (95% CI)` = "Hazard Ratio (95% CI)",
+    `P value`     = "P value",
+    `PH test P`   = "PH Assumption P"
+  ) %>%
+  tab_header(
+    title    = "Hazard Ratios for Mortality (Landmark Cox Models)",
+    subtitle = paste0("Landmark at day ", round(LANDMARK_DAY),
+                      "; follow-up from landmark to day ", round(LM_HORIZON_LONG))
+  ) %>%
+  tab_options(table.font.size = 13, data_row.padding = px(4),
+              column_labels.font.weight = "bold") %>%
+  tab_source_note("LANDMARK DESIGN: exposure defined over the first year post-transplant; only patients still under observation at the landmark are included; the survival clock starts AT the landmark. This removes the immortal time bias present in transplant-anchored analyses of a year-1 exposure. Hazard ratios are therefore for CONDITIONAL survival (given survival to 1 year), not overall post-transplant survival. Matched comparisons use 1:1 nearest-neighbour propensity matching performed WITHIN the landmark cohort (caliper 0.2 SD of the propensity logit; age, gender, ethnicity, MELD, diabetes, cold ischemic time, HLA mismatch). PH Assumption P from cox.zph().")
+
+# --- Forest plots ---
+ggforest(fit_lm_3arm, data = df_lm_3arm)
+
+if (!is.null(lm_match_combined_control)) {
+  d_fp <- lm_match_combined_control$data %>%
+    mutate(ARM = relevel(droplevels(ARM), ref = "Control"))
+  ggforest(coxph(Surv(time_lm, event_lm) ~ ARM, data = d_fp), data = d_fp)
+}
+
+#===============================================================================
+# Covariate-Adjusted Landmark Hazard Ratios
+#-------------------------------------------------------------------------------
+adj_formula_suffix <- " + AGE + GENDER + MELD_PELD_LAB_SCORE + COLD_ISCH + DIAB_BIN"
+
+run_coxph_lm_adj <- function(data, ref_arm, label) {
+  d <- data %>% mutate(ARM = relevel(droplevels(ARM), ref = ref_arm))
+  
+  # matched frames already carry baseline covariates; unmatched ones may not
+  if (!"DIAB_BIN" %in% names(d)) {
+    d <- d %>% left_join(baseline_covs, by = "TRR_ID_CODE")
+  }
+  
+  fit <- coxph(as.formula(paste0("Surv(time_lm, event_lm) ~ ARM", adj_formula_suffix)),
+               data = d)
+  s <- summary(fit)
+  
+  tibble(
+    Comparison = label,
+    Direction  = paste0(rownames(s$conf.int)[1], "  (ref = ", ref_arm, ")"),
+    n          = fit$n,
+    events     = fit$nevent,
+    HR         = s$conf.int[1, "exp(coef)"],
+    CI_lower   = s$conf.int[1, "lower .95"],
+    CI_upper   = s$conf.int[1, "upper .95"],
+    p_value    = s$coefficients[1, "Pr(>|z|)"]
+  )
+}
+
+hr_adj_results_lm <- bind_rows(
+  if (!is.null(lm_match_steroid_combined))
+    run_coxph_lm_adj(lm_match_steroid_combined$data, "Steroids",
+                     "Combined vs Steroids (adjusted)"),
+  if (!is.null(lm_match_combined_control))
+    run_coxph_lm_adj(lm_match_combined_control$data, "Control",
+                     "Combined vs Control (adjusted)")
+)
+
+hr_adj_results_lm
+
+hr_adj_table_lm <- hr_adj_results_lm %>%
+  mutate(
+    `HR (95% CI)` = sprintf("%.2f (%.2f\u2013%.2f)", HR, CI_lower, CI_upper),
+    `P value` = case_when(
+      p_value < 0.001 ~ "<0.001",
+      TRUE ~ sprintf("%.3f", p_value)
+    )
+  ) %>%
+  select(Comparison, Direction, n, events, `HR (95% CI)`, `P value`)
+
+hr_adj_table_lm %>%
+  gt() %>%
+  cols_label(
+    Comparison    = "Comparison",
+    Direction     = "Model direction",
+    n             = "N",
+    events        = "Deaths",
+    `HR (95% CI)` = "Adjusted Hazard Ratio (95% CI)",
+    `P value`     = "P value"
+  ) %>%
+  tab_header(title = "Covariate-Adjusted Landmark Hazard Ratios") %>%
+  tab_options(table.font.size = 13, data_row.padding = px(4),
+              column_labels.font.weight = "bold") %>%
+  tab_source_note("Same landmark propensity-matched cohorts as the unadjusted table, with the Cox model additionally adjusted for recipient age, gender, MELD score, cold ischemic time, and diabetes status. Because several of these covariates were also used in the matching, this is adjustment layered on top of matching -- residual imbalance after matching (per the Love plots) is the reason for including it.")
+
+#===============================================================================
+# SENSITIVITY ANALYSIS: Time-Varying Exposure Cox Model
+#-------------------------------------------------------------------------------
+# [FIX 8, second approach] The landmark design removes immortal time bias by
+# DISCARDING everyone who died before the landmark. That is safe but wasteful,
+# and it changes the estimand to conditional survival.
+#
+# The time-varying (Mantel-Byar) approach removes the same bias without
+# discarding anyone. Every patient begins follow-up at transplant in the
+# untreated state and CONTRIBUTES PERSON-TIME TO THE UNTREATED ARM until the day
+# they are first treated, at which point they switch arms. A patient who died on
+# day 40 having never been treated therefore contributes 40 days of untreated
+# person-time and one untreated death -- rather than being misfiled as a Control
+# who survived a full year, which is what the original code did.
+#
+# Data is in counting-process (start, stop] format, so each patient may occupy
+# more than one row. No cluster/robust variance is needed: the segments from a
+# single patient are non-overlapping in time and the partial likelihood handles
+# them correctly.
+#-------------------------------------------------------------------------------
+
+arm_all_time <- assign_arm_at_landmark(Inf)   # exposure over all available follow-up
+
+tv_base <- df_survival %>%
+  filter(!is.na(PTIME), PTIME > 0) %>%
+  select(TRR_ID_CODE, PTIME, event) %>%
+  left_join(pat_rej_first %>% select(TRR_ID_CODE, REJ_TX_DAY), by = "TRR_ID_CODE") %>%
+  left_join(arm_all_time, by = "TRR_ID_CODE") %>%
+  filter(!is.na(ARM))
+
+# Segment 1: untreated person-time, from day 0 until first treatment (or until
+# the end of follow-up for patients never treated).
+tv_seg_untreated <- tv_base %>%
+  mutate(
+    tstart = 0,
+    tstop = case_when(
+      is.na(REJ_TX_DAY)      ~ PTIME,        # never treated
+      REJ_TX_DAY <= 0        ~ NA_real_,     # treated at baseline: no untreated time
+      REJ_TX_DAY >= PTIME    ~ PTIME,        # treatment recorded at/after last follow-up
+      TRUE                   ~ REJ_TX_DAY
+    ),
+    ev = case_when(
+      is.na(REJ_TX_DAY)      ~ as.numeric(event),
+      REJ_TX_DAY <= 0        ~ NA_real_,
+      REJ_TX_DAY >= PTIME    ~ as.numeric(event),
+      TRUE                   ~ 0             # censored at the moment of switching
+    ),
+    RX_STATE = "None"
+  ) %>%
+  filter(!is.na(tstop), tstop > tstart)
+
+# Segment 2: treated person-time, from first treatment to end of follow-up.
+tv_seg_treated <- tv_base %>%
+  filter(!is.na(REJ_TX_DAY), REJ_TX_DAY < PTIME) %>%
+  mutate(
+    tstart   = pmax(REJ_TX_DAY, 0),
+    tstop    = PTIME,
+    ev       = as.numeric(event),
+    RX_STATE = as.character(ARM)
+  ) %>%
+  filter(tstop > tstart)
+
+tv_data <- bind_rows(tv_seg_untreated, tv_seg_treated) %>%
+  select(TRR_ID_CODE, tstart, tstop, ev, RX_STATE) %>%
+  mutate(RX_STATE = factor(RX_STATE,
+                           levels = c("None", "Steroids", "Combined",
+                                      "Dual Therapy", "Other Rejection"))) %>%
+  arrange(TRR_ID_CODE, tstart)
+
+# Sanity checks that this is well-formed counting-process data
+stopifnot(all(tv_data$tstop > tv_data$tstart))
+message("Time-varying dataset: ", nrow(tv_data), " rows for ",
+        n_distinct(tv_data$TRR_ID_CODE), " patients; ",
+        sum(tv_data$ev), " deaths")
+table(tv_data$RX_STATE, tv_data$ev)
+
+# Administrative censoring at a chosen horizon, measured from TRANSPLANT
+truncate_tv <- function(tv, horizon) {
+  tv %>%
+    filter(tstart < horizon) %>%
+    mutate(
+      ev    = if_else(tstop > horizon, 0, ev),
+      tstop = pmin(tstop, horizon)
+    ) %>%
+    filter(tstop > tstart)
+}
+
+tv_2yr <- truncate_tv(tv_data, 730.5)
+
+fit_tv_2yr <- coxph(Surv(tstart, tstop, ev) ~ RX_STATE, data = tv_2yr)
+summary(fit_tv_2yr)
+cox.zph(fit_tv_2yr)
+
+tv_hr_table <- summary(fit_tv_2yr)$conf.int %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("term") %>%
+  transmute(
+    Comparison = paste0(str_remove(term, "^RX_STATE"), " vs untreated person-time"),
+    `HR (95% CI)` = sprintf("%.2f (%.2f\u2013%.2f)",
+                            `exp(coef)`, `lower .95`, `upper .95`),
+    `P value` = {
+      p <- summary(fit_tv_2yr)$coefficients[, "Pr(>|z|)"]
+      if_else(p < 0.001, "<0.001", sprintf("%.3f", p))
+    }
+  )
+
+tv_hr_table %>%
+  gt() %>%
+  tab_header(
+    title    = "Time-Varying Exposure Cox Model, 2-Year Mortality",
+    subtitle = "Sensitivity analysis -- no patients excluded"
+  ) %>%
+  tab_options(table.font.size = 13, data_row.padding = px(4),
+              column_labels.font.weight = "bold") %>%
+  tab_source_note("Anti-rejection therapy modelled as a time-dependent covariate: every patient contributes untreated person-time from transplant until their first anti-rejection treatment, then treated person-time thereafter. Unlike the landmark analysis this discards no patients, and unlike the original transplant-anchored analysis it assigns no immortal time to the treated arms. Follow-up administratively censored at 2 years post-transplant. Treatment timing for therapy given during the index admission is approximated (see INPATIENT_RX_DAY).")
+
+#-------------------------------------------------------------------------------
+# OPTIONAL: quantify the bias by reproducing the original naive analysis
+#-------------------------------------------------------------------------------
+# Set to TRUE to fit the ORIGINAL, BIASED model alongside the corrected ones.
+# The point is not to report it but to show how far the estimate moves once the
+# immortal time is removed -- useful for a supplement or a reviewer response.
+# Do not use this HR for anything else.
+SHOW_NAIVE_COMPARISON <- FALSE
+
+if (SHOW_NAIVE_COMPARISON) {
+  df_naive <- df_survival %>%
+    inner_join(arm_all_time, by = "TRR_ID_CODE") %>%
+    filter(!is.na(PTIME)) %>%
+    mutate(
+      event_2yr = if_else(PTIME <= 730.5, event, 0),
+      time_2yr  = pmin(PTIME, 730.5),
+      ARM = relevel(factor(ARM), ref = "Control")
+    ) %>%
+    filter(ARM %in% c("Control", "Steroids", "Combined")) %>%
+    mutate(ARM = droplevels(ARM))
+  
+  fit_naive <- coxph(Surv(time_2yr, event_2yr) ~ ARM, data = df_naive)
+  
+  message("\n--- BIASED (transplant-anchored) vs CORRECTED (landmark) ---")
+  message("Biased HRs (immortal time present, DO NOT REPORT):")
+  print(round(summary(fit_naive)$conf.int[, c(1, 3, 4)], 3))
+  message("Landmark HRs (corrected):")
+  print(round(summary(fit_lm_3arm)$conf.int[, c(1, 3, 4)], 3))
+  message("Time-varying HRs (corrected, no exclusions):")
+  print(round(summary(fit_tv_2yr)$conf.int[, c(1, 3, 4)], 3))
+}
+
+#===============================================================================
+# Building a Graph of Meds rx'd with Steroids in Antirejection Therapy
+#-------------------------------------------------------------------------------
+dual_therapy_array <- pat_rej_array |> 
+  filter(TRR_ID_CODE %in% dual_therapy_id_vect)
+
+med_cols <- c("THYMOGLOBULIN_ANTIREJ", "RITUXAN_ANTIREJ", "ATGAM_ANTIREJ", "SIMULECT_ANTIREJ")
+
+dual_therapy_array |>
+  summarise(across(all_of(med_cols), ~ sum(.x > 0, na.rm = TRUE)))
+
+pivot_table <- dual_therapy_array %>%
+  summarise(across(all_of(med_cols), ~ sum(.x > 0, na.rm = TRUE))) %>%
+  pivot_longer(everything(), names_to = "Medication", values_to = "Frequency") %>%
+  arrange(desc(Frequency))
+
+pivot_table <- pivot_table %>%
+  mutate(Percent = Frequency / sum(Frequency))
+
+ggplot(pivot_table, aes(x = reorder(Medication, Frequency), y = Frequency)) +
+  geom_col(fill = "steelblue") +
+  geom_text(
+    aes(label = paste0(Frequency, " (", percent(Percent, accuracy = 0.1), ")")),
+    hjust = -0.1,
+    size = 3.5
+  ) +
+  coord_flip() +
+  labs(
+    title = "Frequency of Combination Anti-Rejection Rx with Steroids",
+    x = "Secondary Medication",
+    y = "Frequency"
+  ) +
+  theme_minimal() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15)))
+
+#===============================================================================
+# Year-2 Anti-Rejection Treatment, Stratified by First-Year Treatment Group
+#-------------------------------------------------------------------------------
+# [FIX 4] ctrl_id_vect is now the cleaned control cohort, so the Control arm in
+# this landmark analysis no longer contains patients who were treated for
+# rejection later in year 1.
+
+# --- Step 1: Landmark cohort -- patients known to still be followed at day 365 ---
+landmark_ids_yr1 <- df_liver_data_filtered %>%
+  filter(PTIME >= 365.25) %>%
+  pull(TRR_ID_CODE)
+
+# --- Step 2: Build the YEAR-2-ONLY follow-up window (not cumulative from TX) ---
+# [FIX 18] duplicate TX_DATE removed from select()
+df_immuno_fol_yr2 <- df_immuno_fol_read %>%
+  filter(TRR_ID_CODE %in% tx_ids_to_keep) %>%
+  filter(TRR_ID_CODE %in% landmark_ids_yr1) %>%   # restrict to patients at risk through yr2
+  left_join(df_liver_data_filtered %>%
+              select(TRR_ID_CODE, TX_DATE, DISCHARGE_DATE), by = "TRR_ID_CODE") %>%
+  filter(!is.na(TX_DATE)) %>%
+  mutate(
+    PX_STAT_DATE_FOL = as.Date(PX_STAT_DATE_FOL),
+    TX_DATE = as.Date(TX_DATE)
+  ) %>%
+  mutate(FOL_DATE_DAYS_DELTA = time_length(interval(TX_DATE, PX_STAT_DATE_FOL), "days")) %>%
+  filter(FOL_DATE_DAYS_DELTA > 365.25 & FOL_DATE_DAYS_DELTA <= 730.5) %>%   # YEAR 2 ONLY
+  arrange(PX_STAT_DATE_FOL) %>%
+  mutate(NUM_ANTI_REJ_RXED_ROW = rowSums(across(all_of(COLS_TO_CHECK)) == 1, na.rm = TRUE))
+
+# --- Step 3: Per-patient summary of year-2 anti-rejection treatment ---
+df_yr2_patient_summary <- df_immuno_fol_yr2 %>%
+  group_by(TRR_ID_CODE) %>%
+  summarise(
+    across(all_of(COLS_TO_CHECK), ~ as.integer(any(.x == 1, na.rm = TRUE))),
+    NUM_FOLLOWUPS_YR2 = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    NUM_DRUGS_YR2    = rowSums(across(all_of(COLS_TO_CHECK))),
+    ANY_ANTI_REJ_YR2 = as.integer(NUM_DRUGS_YR2 >= 1)
+  )
+
+# --- Step 4: Attach first-year group label to the FULL landmark cohort ---
+all_ids_by_group <- bind_rows(
+  tibble(TRR_ID_CODE = arm2_ID_vect,         FIRST_YEAR_GROUP = "Combined"),
+  tibble(TRR_ID_CODE = steroid_id_all_vect,  FIRST_YEAR_GROUP = "Steroid"),
+  tibble(TRR_ID_CODE = ctrl_id_vect,         FIRST_YEAR_GROUP = "Control")
+) %>%
+  distinct(TRR_ID_CODE, .keep_all = TRUE) %>%     # [FIX 4] guard against an ID landing in two arms
+  filter(TRR_ID_CODE %in% landmark_ids_yr1) %>%
+  mutate(FIRST_YEAR_GROUP = factor(FIRST_YEAR_GROUP, levels = c("Steroid", "Combined", "Control")))
+
+df_yr2_by_group <- all_ids_by_group %>%
+  left_join(df_yr2_patient_summary, by = "TRR_ID_CODE") %>%
+  mutate(
+    HAS_YR2_FOLLOWUP = !is.na(NUM_FOLLOWUPS_YR2),
+    ANY_ANTI_REJ_YR2 = coalesce(ANY_ANTI_REJ_YR2, 0L),
+    across(all_of(COLS_TO_CHECK), ~ coalesce(.x, 0L))
+  )
+
+# NOTE: patients with HAS_YR2_FOLLOWUP == FALSE have no recorded follow-up visit
+# in the year-2 window at all -- they are coded ANY_ANTI_REJ_YR2 = 0, which
+# assumes "no visit" means "no rejection," not "unknown."
+
+# ------------------------------------------------------------------------
+# Step 5: Group-level summary
+# ------------------------------------------------------------------------
+year2_group_summary <- df_yr2_by_group %>%
+  group_by(FIRST_YEAR_GROUP) %>%
+  summarise(
+    N                    = n(),
+    N_with_yr2_followup  = sum(HAS_YR2_FOLLOWUP),
+    N_rejected_yr2       = sum(ANY_ANTI_REJ_YR2),
+    Pct_rejected_yr2     = 100 * N_rejected_yr2 / N,
+    .groups = "drop"
+  )
+
+year2_group_summary %>%
+  gt() %>%
+  fmt_number(columns = Pct_rejected_yr2, decimals = 1) %>%
+  cols_label(
+    FIRST_YEAR_GROUP    = "First-Year Group",
+    N                   = "N (landmark cohort)",
+    N_with_yr2_followup = "N with Yr2 Follow-up",
+    N_rejected_yr2      = "N Treated for Rejection in Yr2",
+    Pct_rejected_yr2     = "% Treated in Yr2"
+  ) %>%
+  tab_header(title = "Anti-Rejection Treatment During Year 2, by First-Year Treatment Group") %>%
+  tab_options(
+    table.font.size = 13,
+    data_row.padding = px(4),
+    column_labels.font.weight = "bold"
+  ) %>%
+  tab_source_note("Landmark cohort restricted to patients with PTIME >= 365.25 days (still followed at 1 year). Year 2 defined as day 365.25-730.5 post-transplant.")
+
+tab_yr2 <- table(df_yr2_by_group$FIRST_YEAR_GROUP, df_yr2_by_group$ANY_ANTI_REJ_YR2)
+tab_yr2
+safe_chisq_or_fisher(tab_yr2)
+
+# ------------------------------------------------------------------------
+# Step 6: Which drugs were used in year 2, by first-year group
+# ------------------------------------------------------------------------
+drug_freq_by_group_yr2 <- df_yr2_by_group %>%
+  select(FIRST_YEAR_GROUP, all_of(COLS_TO_CHECK)) %>%
+  group_by(FIRST_YEAR_GROUP) %>%
+  summarise(
+    N = n(),
+    across(all_of(COLS_TO_CHECK), sum),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(-c(FIRST_YEAR_GROUP, N), names_to = "Drug", values_to = "Frequency") %>%
+  mutate(
+    Drug = str_remove(Drug, COL_TAIL),
+    Freq_Per_Patient = Frequency / N
+  ) %>%
+  arrange(FIRST_YEAR_GROUP, desc(Freq_Per_Patient))
+
+drug_freq_by_group_yr2 %>%
+  filter(Frequency > 0) %>%
+  select(FIRST_YEAR_GROUP, Drug, N, Frequency, Freq_Per_Patient) %>%
+  arrange(FIRST_YEAR_GROUP, desc(Freq_Per_Patient)) %>%
+  kable(
+    caption = "Year-2 Anti-Rejection Drug Use per Patient, by First-Year Treatment Group",
+    col.names = c("First-Year Group", "Drug", "Group N", "Patients Treated", "Rate per Patient"),
+    digits = 3
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+# Bar chart. NOTE: the hard limits = c(0, 0.03) silently drops any bar above 3%.
+# Left as-is but flagged -- switch to coord_cartesian(ylim = ...) if you want to
+# zoom without discarding data.
+drug_freq_by_group_yr2 %>%
+  filter(Frequency > 0) %>%
+  ggplot(aes(x = reorder(Drug, -Freq_Per_Patient), y = Freq_Per_Patient, fill = FIRST_YEAR_GROUP)) +
+  geom_col(position = "dodge") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  coord_cartesian(ylim = c(0, 0.03)) +
+  labs(
+    title = "Year-2 Anti-Rejection Drug Use per Patient, by First-Year Treatment Group",
+    x = "Drug",
+    y = "Fraction of Group Treated in Year 2",
+    fill = "First-Year Group"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# ------------------------------------------------------------------------
+# Step 7: Patient-level detail table
+# ------------------------------------------------------------------------
+df_yr2_by_group %>%
+  select(TRR_ID_CODE, FIRST_YEAR_GROUP, HAS_YR2_FOLLOWUP, ANY_ANTI_REJ_YR2, NUM_DRUGS_YR2, all_of(COLS_TO_CHECK)) %>%
+  arrange(FIRST_YEAR_GROUP, desc(ANY_ANTI_REJ_YR2)) %>%
+  head(20)
+
+
+#===============================================================================
+# Statistical Analysis: Year-2 Anti-Rejection Treatment by First-Year Group
+#-------------------------------------------------------------------------------
+
+covariates_yr2 <- df_liver_data_filtered %>%
+  select(TRR_ID_CODE, AGE, GENDER, MELD_PELD_LAB_SCORE, COLD_ISCH, DIAB) %>%
+  mutate(
+    DIAB_BIN = case_when(
+      as.numeric(DIAB) %in% 2:5 ~ 1,
+      as.numeric(DIAB) == 1     ~ 0,
+      TRUE                      ~ NA_real_
+    ),
+    GENDER = factor(GENDER)
+  ) %>%
+  distinct(TRR_ID_CODE, .keep_all = TRUE) %>%              # [FIX 7]
+  left_join(df_hla_calc %>% select(TRR_ID_CODE, MM_TOTAL), by = "TRR_ID_CODE")
+
+df_yr2_model <- df_yr2_by_group %>%
+  left_join(covariates_yr2, by = "TRR_ID_CODE") %>%
+  mutate(FIRST_YEAR_GROUP = relevel(FIRST_YEAR_GROUP, ref = "Control"))  # Control as reference
+
+stopifnot(nrow(df_yr2_model) == nrow(df_yr2_by_group))     # [FIX 7]
+
+tidy_glm_or <- function(fit) {
+  co  <- summary(fit)$coefficients
+  ci  <- suppressMessages(confint.default(fit))  # Wald CIs
+  
+  tibble(
+    term     = rownames(co),
+    OR       = exp(co[, "Estimate"]),
+    CI_lower = exp(ci[, 1]),
+    CI_upper = exp(ci[, 2]),
+    p_value  = co[, "Pr(>|z|)"]
+  ) %>%
+    filter(term != "(Intercept)")
+}
+
+fit_unadj <- glm(ANY_ANTI_REJ_YR2 ~ FIRST_YEAR_GROUP, data = df_yr2_model, family = binomial)
+summary(fit_unadj)
+
+fit_null <- glm(ANY_ANTI_REJ_YR2 ~ 1, data = df_yr2_model, family = binomial)
+anova(fit_null, fit_unadj, test = "LRT")
+
+or_unadj <- tidy_glm_or(fit_unadj) %>%
+  mutate(Model = "Unadjusted")
+
+fit_adj <- glm(
+  ANY_ANTI_REJ_YR2 ~ FIRST_YEAR_GROUP + AGE + GENDER + MELD_PELD_LAB_SCORE + COLD_ISCH + DIAB_BIN + MM_TOTAL,
+  data = df_yr2_model,
+  family = binomial
+)
+summary(fit_adj)
+
+or_adj <- tidy_glm_or(fit_adj) %>%
+  filter(str_detect(term, "^FIRST_YEAR_GROUP")) %>%
+  mutate(Model = "Adjusted")
+
+df_yr2_model_steroid_ref <- df_yr2_model %>%
+  mutate(FIRST_YEAR_GROUP = relevel(FIRST_YEAR_GROUP, ref = "Steroid"))
+
+fit_unadj_steroid_ref <- glm(ANY_ANTI_REJ_YR2 ~ FIRST_YEAR_GROUP, data = df_yr2_model_steroid_ref, family = binomial)
+fit_adj_steroid_ref <- glm(
+  ANY_ANTI_REJ_YR2 ~ FIRST_YEAR_GROUP + AGE + GENDER + MELD_PELD_LAB_SCORE + COLD_ISCH + DIAB_BIN + MM_TOTAL,
+  data = df_yr2_model_steroid_ref,
+  family = binomial
+)
+
+or_unadj_combined_vs_steroid <- tidy_glm_or(fit_unadj_steroid_ref) %>%
+  filter(term == "FIRST_YEAR_GROUPCombined") %>%
+  mutate(term = "FIRST_YEAR_GROUPCombined (ref = Steroid)", Model = "Unadjusted")
+
+or_adj_combined_vs_steroid <- tidy_glm_or(fit_adj_steroid_ref) %>%
+  filter(term == "FIRST_YEAR_GROUPCombined") %>%
+  mutate(term = "FIRST_YEAR_GROUPCombined (ref = Steroid)", Model = "Adjusted")
+
+or_results_yr2 <- bind_rows(or_unadj, or_adj, or_unadj_combined_vs_steroid, or_adj_combined_vs_steroid) %>%
+  mutate(
+    Comparison = case_when(
+      term == "FIRST_YEAR_GROUPSteroid"                    ~ "Steroid vs Control",
+      term == "FIRST_YEAR_GROUPCombined"                    ~ "Combined vs Control",
+      term == "FIRST_YEAR_GROUPCombined (ref = Steroid)"    ~ "Combined vs Steroid",
+      TRUE ~ term
+    )
+  ) %>%
+  select(Comparison, Model, OR, CI_lower, CI_upper, p_value)
+
+or_results_yr2
+
+or_table_yr2 <- or_results_yr2 %>%
+  mutate(
+    `OR (95% CI)` = sprintf("%.2f (%.2f\u2013%.2f)", OR, CI_lower, CI_upper),
+    `P value` = case_when(
+      p_value < 0.001 ~ "<0.001",
+      TRUE ~ sprintf("%.3f", p_value)
+    )
+  ) %>%
+  select(Comparison, Model, `OR (95% CI)`, `P value`) %>%
+  arrange(Comparison, Model)
+
+or_table_yr2 %>%
+  gt(groupname_col = "Comparison") %>%
+  cols_label(
+    Model         = "Model",
+    `OR (95% CI)`= "Odds Ratio (95% CI)",
+    `P value`    = "P value"
+  ) %>%
+  tab_header(title = "Odds of Anti-Rejection Treatment in Year 2, by First-Year Treatment Group") %>%
+  tab_options(
+    table.font.size = 13,
+    data_row.padding = px(4),
+    column_labels.font.weight = "bold",
+    row_group.font.weight = "bold"
+  ) %>%
+  tab_source_note("OR > 1 indicates higher odds of being treated for rejection in year 2 relative to the comparison group. Adjusted model controls for recipient age, gender, MELD score, cold ischemic time, diabetes status, and HLA mismatch level (MM_TOTAL). Landmark cohort restricted to patients followed through 1 year (PTIME >= 365.25).")
+
+# ------------------------------------------------------------------------
+# Model diagnostics
+# ------------------------------------------------------------------------
+summary(fit_adj)$coefficients
+fit_adj$converged
+
+fit_adj_no_group <- glm(
+  ANY_ANTI_REJ_YR2 ~ AGE + GENDER + MELD_PELD_LAB_SCORE + COLD_ISCH + DIAB_BIN + MM_TOTAL,
+  data = df_yr2_model,
+  family = binomial
+)
+anova(fit_adj_no_group, fit_adj, test = "LRT")
+
+#===============================================================================
+# Year-2 Graft Failure, Stratified by First-Year Treatment Group
+#-------------------------------------------------------------------------------
+
+df_graft_time <- df_liver_data_filtered %>%
+  select(TRR_ID_CODE, TX_DATE, GRF_FAIL_DATE, PX_STAT_DATE) %>%
+  mutate(
+    TX_DATE       = as.Date(TX_DATE),
+    GRF_FAIL_DATE = as.Date(GRF_FAIL_DATE),
+    PX_STAT_DATE  = as.Date(PX_STAT_DATE),
+    GRF_FAIL_EVENT = as.integer(!is.na(GRF_FAIL_DATE)),
+    GRF_TIME_DAYS  = if_else(
+      GRF_FAIL_EVENT == 1,
+      as.numeric(GRF_FAIL_DATE - TX_DATE),
+      as.numeric(PX_STAT_DATE  - TX_DATE)   # censored at last known status date
+    )
+  )
+
+summary(df_graft_time$GRF_TIME_DAYS)
+sum(is.na(df_graft_time$GRF_TIME_DAYS))
+table(df_graft_time$GRF_FAIL_EVENT, useNA = "ifany")
+
+landmark_ids_grf_yr1 <- df_graft_time %>%
+  filter(GRF_TIME_DAYS >= 365.25) %>%
+  pull(TRR_ID_CODE)
+
+df_graft_yr2 <- df_graft_time %>%
+  filter(TRR_ID_CODE %in% landmark_ids_grf_yr1) %>%
+  mutate(
+    ANY_GRF_FAIL_YR2 = if_else(
+      GRF_FAIL_EVENT == 1 & GRF_TIME_DAYS <= 730.5,
+      1L, 0L
+    )
+  )
+
+all_ids_by_group_grf <- bind_rows(
+  tibble(TRR_ID_CODE = arm2_ID_vect,        FIRST_YEAR_GROUP = "Combined"),
+  tibble(TRR_ID_CODE = steroid_id_all_vect, FIRST_YEAR_GROUP = "Steroid"),
+  tibble(TRR_ID_CODE = ctrl_id_vect,        FIRST_YEAR_GROUP = "Control")
+) %>%
+  distinct(TRR_ID_CODE, .keep_all = TRUE) %>%     # [FIX 4]
+  filter(TRR_ID_CODE %in% landmark_ids_grf_yr1) %>%
+  mutate(FIRST_YEAR_GROUP = factor(FIRST_YEAR_GROUP, levels = c("Steroid", "Combined", "Control")))
+
+df_graft_yr2_by_group <- all_ids_by_group_grf %>%
+  left_join(df_graft_yr2 %>%
+              select(TRR_ID_CODE, ANY_GRF_FAIL_YR2, GRF_TIME_DAYS) %>%
+              distinct(TRR_ID_CODE, .keep_all = TRUE),        # [FIX 7]
+            by = "TRR_ID_CODE")
+
+year2_grf_group_summary <- df_graft_yr2_by_group %>%
+  group_by(FIRST_YEAR_GROUP) %>%
+  summarise(
+    N                = n(),
+    N_grf_fail_yr2   = sum(ANY_GRF_FAIL_YR2, na.rm = TRUE),
+    Pct_grf_fail_yr2 = 100 * N_grf_fail_yr2 / N,
+    .groups = "drop"
+  )
+
+year2_grf_group_summary %>%
+  gt() %>%
+  fmt_number(columns = Pct_grf_fail_yr2, decimals = 1) %>%
+  cols_label(
+    FIRST_YEAR_GROUP  = "First-Year Group",
+    N                 = "N (landmark cohort)",
+    N_grf_fail_yr2    = "N Graft Failures in Yr2",
+    Pct_grf_fail_yr2   = "% Graft Failure in Yr2"
+  ) %>%
+  tab_header(title = "Graft Failure During Year 2, by First-Year Treatment Group") %>%
+  tab_options(
+    table.font.size = 13,
+    data_row.padding = px(4),
+    column_labels.font.weight = "bold"
+  ) %>%
+  tab_source_note("Landmark cohort restricted to patients whose graft was known functioning through day 365 (GRF_TIME_DAYS >= 365.25). Year 2 defined as day 365.25-730.5 post-transplant.")
+
+tab_grf_yr2 <- table(df_graft_yr2_by_group$FIRST_YEAR_GROUP, df_graft_yr2_by_group$ANY_GRF_FAIL_YR2)
+tab_grf_yr2
+safe_chisq_or_fisher(tab_grf_yr2)
+
+
+#===============================================================================
+# Statistical Analysis: Year-2 Graft Failure by First-Year Group
+#-------------------------------------------------------------------------------
+
+covariates_grf_yr2 <- df_liver_data_filtered %>%
+  select(TRR_ID_CODE, AGE, GENDER, MELD_PELD_LAB_SCORE, COLD_ISCH, DIAB) %>%
+  mutate(
+    DIAB_BIN = case_when(
+      as.numeric(DIAB) %in% 2:5 ~ 1,
+      as.numeric(DIAB) == 1     ~ 0,
+      TRUE                      ~ NA_real_
+    ),
+    GENDER = factor(GENDER)
+  ) %>%
+  distinct(TRR_ID_CODE, .keep_all = TRUE) %>%              # [FIX 7]
+  left_join(df_hla_calc %>% select(TRR_ID_CODE, MM_TOTAL), by = "TRR_ID_CODE")
+
+df_grf_yr2_model <- df_graft_yr2_by_group %>%
+  left_join(covariates_grf_yr2, by = "TRR_ID_CODE") %>%
+  mutate(FIRST_YEAR_GROUP = relevel(FIRST_YEAR_GROUP, ref = "Control"))
+
+stopifnot(nrow(df_graft_yr2_by_group) == nrow(df_grf_yr2_model))   # [FIX 7]
+
+fit_grf_unadj <- glm(ANY_GRF_FAIL_YR2 ~ FIRST_YEAR_GROUP, data = df_grf_yr2_model, family = binomial)
+summary(fit_grf_unadj)
+
+fit_grf_null <- glm(ANY_GRF_FAIL_YR2 ~ 1, data = df_grf_yr2_model, family = binomial)
+anova(fit_grf_null, fit_grf_unadj, test = "LRT")
+
+or_grf_unadj <- tidy_glm_or(fit_grf_unadj) %>% mutate(Model = "Unadjusted")
+
+fit_grf_adj <- glm(
+  ANY_GRF_FAIL_YR2 ~ FIRST_YEAR_GROUP + AGE + GENDER + MELD_PELD_LAB_SCORE + COLD_ISCH + DIAB_BIN + MM_TOTAL,
+  data = df_grf_yr2_model,
+  family = binomial
+)
+summary(fit_grf_adj)
+
+or_grf_adj <- tidy_glm_or(fit_grf_adj) %>%
+  filter(str_detect(term, "^FIRST_YEAR_GROUP")) %>%
+  mutate(Model = "Adjusted")
+
+df_grf_yr2_model_steroid_ref <- df_grf_yr2_model %>%
+  mutate(FIRST_YEAR_GROUP = relevel(FIRST_YEAR_GROUP, ref = "Steroid"))
+
+fit_grf_unadj_steroid_ref <- glm(ANY_GRF_FAIL_YR2 ~ FIRST_YEAR_GROUP, data = df_grf_yr2_model_steroid_ref, family = binomial)
+fit_grf_adj_steroid_ref <- glm(
+  ANY_GRF_FAIL_YR2 ~ FIRST_YEAR_GROUP + AGE + GENDER + MELD_PELD_LAB_SCORE + COLD_ISCH + DIAB_BIN + MM_TOTAL,
+  data = df_grf_yr2_model_steroid_ref,
+  family = binomial
+)
+
+or_grf_unadj_combined_vs_steroid <- tidy_glm_or(fit_grf_unadj_steroid_ref) %>%
+  filter(term == "FIRST_YEAR_GROUPCombined") %>%
+  mutate(term = "FIRST_YEAR_GROUPCombined (ref = Steroid)", Model = "Unadjusted")
+
+or_grf_adj_combined_vs_steroid <- tidy_glm_or(fit_grf_adj_steroid_ref) %>%
+  filter(term == "FIRST_YEAR_GROUPCombined") %>%
+  mutate(term = "FIRST_YEAR_GROUPCombined (ref = Steroid)", Model = "Adjusted")
+
+or_grf_results_yr2 <- bind_rows(
+  or_grf_unadj, or_grf_adj,
+  or_grf_unadj_combined_vs_steroid, or_grf_adj_combined_vs_steroid
+) %>%
+  mutate(
+    Comparison = case_when(
+      term == "FIRST_YEAR_GROUPSteroid"                 ~ "Steroid vs Control",
+      term == "FIRST_YEAR_GROUPCombined"                 ~ "Combined vs Control",
+      term == "FIRST_YEAR_GROUPCombined (ref = Steroid)" ~ "Combined vs Steroid",
+      TRUE ~ term
+    )
+  ) %>%
+  select(Comparison, Model, OR, CI_lower, CI_upper, p_value)
+
+or_grf_results_yr2
+
+or_grf_table_yr2 <- or_grf_results_yr2 %>%
+  mutate(
+    `OR (95% CI)` = sprintf("%.2f (%.2f\u2013%.2f)", OR, CI_lower, CI_upper),
+    `P value` = case_when(
+      p_value < 0.001 ~ "<0.001",
+      TRUE ~ sprintf("%.3f", p_value)
+    )
+  ) %>%
+  select(Comparison, Model, `OR (95% CI)`, `P value`) %>%
+  arrange(Comparison, Model)
+
+or_grf_table_yr2 %>%
+  gt(groupname_col = "Comparison") %>%
+  cols_label(
+    Model         = "Model",
+    `OR (95% CI)`= "Odds Ratio (95% CI)",
+    `P value`    = "P value"
+  ) %>%
+  tab_header(title = "Odds of Graft Failure in Year 2, by First-Year Treatment Group") %>%
+  tab_options(
+    table.font.size = 13,
+    data_row.padding = px(4),
+    column_labels.font.weight = "bold",
+    row_group.font.weight = "bold"
+  ) %>%
+  tab_source_note("OR > 1 indicates higher odds of graft failure in year 2 relative to the comparison group. Adjusted model controls for recipient age, gender, MELD score, cold ischemic time, diabetes status, and HLA mismatch level (MM_TOTAL). Landmark cohort restricted to patients with a functioning graft through 1 year (GRF_TIME_DAYS >= 365.25).")
+
+# ------------------------------------------------------------------------
+# Model diagnostics
+# ------------------------------------------------------------------------
+summary(fit_grf_adj)$coefficients   # check for very large |estimate|/SE (separation)
+
+fit_grf_adj_no_group <- glm(
+  ANY_GRF_FAIL_YR2 ~ AGE + GENDER + MELD_PELD_LAB_SCORE + COLD_ISCH + DIAB_BIN + MM_TOTAL,
+  data = df_grf_yr2_model,
+  family = binomial
+)
+anova(fit_grf_adj_no_group, fit_grf_adj, test = "LRT")
+
+# ===========================================================================
+# Debugging
+# [FIX 7] this check is what surfaced the duplicate-donor problem -- kept
+df_deceased_don_fil %>% count(DONOR_ID) %>% filter(n > 1)# 
+# This script is designed to parse patients in the UNOS database into based on rejection status:
+# @ 12 months rejection vs no rejection
 
 
 #===============================================================================
