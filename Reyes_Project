@@ -76,6 +76,9 @@ library(MatchIt)
 if (!requireNamespace("cobalt", quietly = TRUE)) install.packages("cobalt")
 library(cobalt)
 
+if (!requireNamespace("gtsummary", quietly = TRUE)) install.packages("gtsummary")
+library(gtsummary)
+
 #===============================================================================
 # Reading data (adjust path and file type as needed)
 #---------------------------------------------------------
@@ -109,8 +112,21 @@ sas_to_array <- function(file_path, verbose = FALSE, cols = NULL) {
 
 # ----------------- Setting Columns I want from each files ------------------
 
-#kidpan
-KID_COLS = c("PT_CODE", "TRR_ID_CODE", "TX_DATE", "KDPI", "DONOR_ID", "WL_ID_CODE", "REM_CD", "INIT_AGE", "INIT_DATE", "KDRI_MED", "KDRI_RAO", "TXHRT", "TXINT", "TXKID", "TXLNG", "TXPAN")
+LIVER_COLS <- c(
+  "PT_CODE", "DONOR_ID", "AGE", "TX_DATE", "NUM_PREV_TX", "DON_TY",
+  "TXHRT", "TXINT", "TXKID", "TXLNG", "TXPAN",
+  "AGE_DON", "ETHCAT_DON", "HGT_CM_DON_CALC", "COD_CAD_DON",
+  "SHARE_TY", "NON_HRT_DON", "LITYP", "COLD_ISCH",
+  "GENDER", "ETHCAT", "DIAB", "DGN_TCR", "DGN2_TCR",
+  "BMI_CALC", "FINAL_MELD_PELD_LAB_SCORE"
+)
+
+KID_COLS <- c(
+  "PT_CODE", "TRR_ID_CODE", "TX_DATE", "KDPI", "DONOR_ID", "WL_ID_CODE",
+  "REM_CD", "INIT_AGE", "INIT_DATE", "KDRI_MED", "KDRI_RAO",
+  "TXHRT", "TXINT", "TXKID", "TXLNG", "TXPAN",
+  "ON_DIALYSIS", "DGN_TCR", "DGN2_TCR"   # DGN_TCR/DGN2_TCR here = kidney/ESRD diagnosis
+)
 
 #WL
 WL_COLS = c("WL_ID_CODE")
@@ -118,7 +134,7 @@ WL_COLS = c("WL_ID_CODE")
 # ------------------- Loading different files ------------------------------
 # Just call the function for each file and assign to its own variable
 
-df_read_liver_main <- sas_to_array("~/Local Documents/AOT/UNOS Data/Liver/liver_data.sas7bdat", verbose = TRUE)
+df_read_liver_main <- sas_to_array("~/Local Documents/AOT/UNOS Data/Liver/liver_data.sas7bdat", verbose = TRUE, LIVER_COLS)
 df_read_decease_donor<- sas_to_array("~/Local Documents/AOT/UNOS Data/Deceased Donor/deceased_donor_data.sas7bdat", verbose = TRUE)
 df_read_kidpan_main <- sas_to_array("~/Local Documents/AOT/UNOS Data/Kidney_ Pancreas_ Kidney-Pancreas/kidpan_data.sas7bdat", verbose = TRUE, cols = KID_COLS)
 df_read_kidpan_wl <- sas_to_array("~/Local Documents/AOT/UNOS Data/Kidney_ Pancreas_ Kidney-Pancreas/Waiting List History/kidpan_wlhistory_data.sas7bdat", verbose = TRUE, cols = WL_COLS)
@@ -156,7 +172,7 @@ SIM_TX_COLS = c("TXHRT", "TXINT", "TXKID", "TXLNG", "TXPAN")
 df_filterEC_liver_main <- df_read_liver_main |> 
   filter(NUM_PREV_TX == "0") |> # Patients should have no HX of previous transplants any
   filter(if_all(all_of(SIM_TX_COLS), ~ is.na(.) | trimws(.) == "")) |> # getting rid of the simultaneous transplants
-  filter(DON_TY == "C") # removing the living donor recipients
+  filter(DON_TY == "C") # removing the living donor recipients (this also happens to filter for patients that did NOT receive tx)
   
 #------------------------Donor Main Filters-------------------------------------
 #-------------------------------------------------------------------------------
@@ -172,19 +188,356 @@ LDRI_VAL_COL = c(
 df_filterEC_liver_main |> # filters out patients missing component to calc LDRI
   filter(if_all(all_of(LDRI_VAL_COL), ~ is.na(.) | trimws(.) == ""))
 
+vect_filterEC_liver_ID <- df_filterEC_liver_main |> 
+  pull(PT_CODE)
+
 #-------------------------------------------------------------------------------
 #Kidney donation
+SIM_TX_COLS2 = c("TXHRT", "TXINT", "TXLNG", "TXPAN")
 
-df_filter_kidpan_main |> 
+df_filterEC_kidpan_main <- df_filter_kidpan_main |> 
   filter(!is.na(KDPI) & trimws(as.character(KDPI)) != "") |> 
-  filter(if_all(all_of(SIM_TX_COLS), ~ is.na(.) | trimws(.) == ""))
+  filter(if_all(all_of(SIM_TX_COLS2), ~ is.na(.) | trimws(.) == ""))
   
+vect_filterEC_kidney_ID <- df_filterEC_kidpan_main |> 
+  pull(PT_CODE)
 
 #=============================================================
-# Cross referencing patients placed on WL 
+# Cross referencing patients placed on WL Kidney for those that had a liver tx 
+
+# Rename all overlapping columns on the kidney side before merging
+#=============================================================
+# Cross referencing patients placed on WL Kidney for those that had a liver tx 
+
+# Kidney side: dedupe to earliest kidney waitlist listing, then rename all overlapping columns
+df_filter_kidpan_main_dedup <- df_filterEC_kidpan_main |>
+  arrange(PT_CODE, desc(!is.na(TX_DATE)), TX_DATE, INIT_DATE) |>
+  group_by(PT_CODE) |>
+  slice(1) |>
+  ungroup() |>
+  rename(TX_DATE_KIDNEY = TX_DATE, INIT_AGE_KIDNEY = INIT_AGE,
+         TXHRT_KIDNEY = TXHRT, TXINT_KIDNEY = TXINT, TXKID_KIDNEY = TXKID,
+         TXLNG_KIDNEY = TXLNG, TXPAN_KIDNEY = TXPAN, REM_CD_KIDNEY = REM_CD,
+         INIT_DATE_KIDNEY = INIT_DATE, WL_ID_CODE_KIDNEY = WL_ID_CODE, 
+         TRR_ID_CODE_KIDNEY = TRR_ID_CODE, DONOR_ID_KIDNEY = DONOR_ID,
+         DGN_TCR_KIDNEY = DGN_TCR, DGN2_TCR_KIDNEY = DGN2_TCR)   # new
+
+# Liver side: keep the row tied to the actual transplant event (also missing in this version — needed below)
+df_filterEC_liver_main_dedup <- df_filterEC_liver_main |>
+  group_by(PT_CODE) |>
+  slice_min(TX_DATE, n = 1, with_ties = FALSE) |>
+  ungroup()
+
+# Confirm no other collisions before merging
+intersect(names(df_filterEC_liver_main_dedup), names(df_filter_kidpan_main_dedup))
+# rename anything else that shows up here the same way, then proceed
+
+df_liver_kidney_merged <- df_filterEC_liver_main_dedup |>
+  left_join(df_filter_kidpan_main_dedup, by = "PT_CODE")
+
+df_liver_kidney_merged <- df_liver_kidney_merged |>
+  mutate(
+    days_liver_to_kidney_tx = as.numeric(TX_DATE_KIDNEY - TX_DATE),
+    KALT_STATUS = case_when(
+      is.na(TX_DATE_KIDNEY) ~ "Liver only",
+      days_liver_to_kidney_tx >= 0 & days_liver_to_kidney_tx < 365 ~ "KALT (<365 days)",
+      days_liver_to_kidney_tx >= 365 ~ "Kidney TX, but >=365 days after liver TX",
+      days_liver_to_kidney_tx < 0 ~ "Kidney TX before liver TX",
+      TRUE ~ NA_character_
+    ),
+    KALT_STATUS_CALC = case_when(
+      is.na(TX_DATE_KIDNEY) ~ 0L,
+      days_liver_to_kidney_tx >= 0 & days_liver_to_kidney_tx < 365 ~ 1L,
+      days_liver_to_kidney_tx >= 365 ~ 2L,
+      days_liver_to_kidney_tx < 0 ~ 3L,
+      TRUE ~ NA_integer_
+    )
+    )
+
+# Simplified Array to look at
+df_wombocombo <- df_liver_kidney_merged |> 
+  select(PT_CODE, KALT_STATUS, KALT_STATUS_CALC, KDPI, DONOR_ID_KIDNEY, 
+         DONOR_ID, days_liver_to_kidney_tx, TX_DATE, TX_DATE_KIDNEY, 
+         INIT_DATE_KIDNEY, INIT_DATE_KIDNEY) |> 
+  filter(PT_CODE %in% vect_filterEC_kidney_ID) |> 
+  filter(PT_CODE %in% vect_filterEC_liver_ID) |> 
+  filter(KALT_STATUS_CALC < 3)
+
+#===============================================================================
+# LDRI (Liver Donor Risk Index) Calculation — Feng et al. 2006, Am J Transplant 6:783-790
+#===============================================================================
+
+# Step 1: Ensure only donors with complete data across all 8 LDRI components are included
+# (fixing the inverted filter logic flagged earlier — this KEEPS complete rows, not blank ones)
+df_liver_ldri_complete <- df_filterEC_liver_main |>
+  filter(if_all(all_of(LDRI_VAL_COL), ~ !is.na(.) & trimws(as.character(.)) != ""))
+
+nrow(df_filterEC_liver_main) - nrow(df_liver_ldri_complete)  # how many donors got dropped for missing data
+
+# ------------------------------------------------------------------------------
+# BEFORE running the calc below, confirm your actual code values against the
+# data dictionary. Run these and compare to the assumptions in the mutate() below:
+table(df_liver_ldri_complete$ETHCAT_DON, useNA = "always")
+table(df_liver_ldri_complete$COD_CAD_DON, useNA = "always")
+table(df_liver_ldri_complete$SHARE_TY, useNA = "always")
+table(df_liver_ldri_complete$LITYP, useNA = "always")
+table(df_liver_ldri_complete$NON_HRT_DON, useNA = "always")
+# ------------------------------------------------------------------------------
+
+df_ldri_scored <- df_liver_ldri_complete |>
+  mutate(
+    AGE_DON = as.numeric(AGE_DON),
+    HGT_CM_DON_CALC = as.numeric(HGT_CM_DON_CALC),
+    COLD_ISCH = as.numeric(COLD_ISCH),
+    
+    # --- Age component (reference: age < 40) ---
+    age_component = case_when(
+      AGE_DON >= 40 & AGE_DON < 50 ~ 0.154,
+      AGE_DON >= 50 & AGE_DON < 60 ~ 0.274,
+      AGE_DON >= 60 & AGE_DON < 70 ~ 0.424,
+      AGE_DON >= 70 ~ 0.501,
+      TRUE ~ 0
+    ),
+    
+    # --- Cause of death component (reference: trauma) ---
+    # ASSUMED OPTN coding: 1 = Anoxia, 2 = CVA/Stroke, 3 = Head Trauma, 4 = CNS Tumor, 999 = Other
+    # VERIFY against your data dictionary before trusting this.
+    cod_component = case_when(
+      COD_CAD_DON == 1 ~ 0.079,   # Anoxia
+      COD_CAD_DON == 2 ~ 0.145,   # CVA/Stroke
+      COD_CAD_DON == 3 ~ 0,       # Trauma (reference)
+      TRUE ~ 0.184                # Everything else (CNS tumor, other, unmapped) -> "Other"
+    ),
+    
+    # --- Race component (reference: White) ---
+    # ASSUMED OPTN coding: 1 = White, 2 = Black/African American, else = other race
+    # VERIFY against your data dictionary before trusting this.
+    race_component = case_when(
+      ETHCAT_DON == 1 ~ 0,        # White (reference)
+      ETHCAT_DON == 2 ~ 0.176,    # African American
+      TRUE ~ 0.126                # Other race
+    ),
+    
+    # --- DCD component ---
+    dcd_component = if_else(toupper(trimws(as.character(NON_HRT_DON))) == "Y", 0.411, 0),
+    
+    # --- Partial/split graft component ---
+    # ASSUMED: LITYP == 1 is "Whole" (reference); anything else is partial/split.
+    split_component = case_when(
+      LITYP == 0 ~ 0,                 # Whole liver (reference)
+      LITYP %in% 1:21 ~ 0.422,        # Any partial/split/reduced configuration
+      TRUE ~ NA_real_                 # Safety net for any undocumented/unexpected code
+    ),
+    
+    # --- Height component (per Feng formula, in cm) ---
+    height_component = 0.066 * ((170 - HGT_CM_DON_CALC) / 10),
+    
+    # --- Organ sharing component (reference: local) ---
+    # ASSUMED OPTN coding: 3 = Local, 4 = Regional, 5 = National
+    # VERIFY against your data dictionary before trusting this.
+    share_component = case_when(
+      SHARE_TY == 3 ~ 0,          # Local (reference)
+      SHARE_TY == 4 ~ 0.105,      # Regional
+      SHARE_TY == 5 ~ 0.244,      # National
+      TRUE ~ 0
+    ),
+    
+    # --- Cold ischemia time component (hours) ---
+    cit_component = 0.010 * COLD_ISCH,
+    
+    # --- Final LDRI ---
+    LDRI = exp(
+      age_component + cod_component + race_component + dcd_component +
+        split_component + height_component + share_component + cit_component
+    )
+  )
+
+# Pull just what you need downstream
+df_ldri_final <- df_ldri_scored |>
+  select(PT_CODE, LDRI, age_component, cod_component, race_component,
+         dcd_component, split_component, height_component, share_component,
+         cit_component)
+
+# Sanity check: LDRI values should mostly fall roughly between 0.8 and 3.5 in practice.
+# Anything wildly outside that range likely means a code-mapping assumption above is wrong.
+summary(df_ldri_final$LDRI)
+hist(df_ldri_final$LDRI, breaks = 30, main = "Distribution of LDRI scores", xlab = "LDRI")
+
+df_wombocombo2 <- df_wombocombo |>
+  left_join(df_ldri_final |> select(PT_CODE, LDRI), by = "PT_CODE") |> 
+  filter(!is.na(LDRI))
+
+#=================================================================================
+# Demographic Building
+#--------------------------------------------------------------------------------
+df_esrd_cohort <- df_liver_kidney_merged |>
+  left_join(df_ldri_final |> select(PT_CODE, LDRI), by = "PT_CODE") |>
+  filter(!is.na(INIT_DATE_KIDNEY)) |>
+  filter(KALT_STATUS_CALC != 3) |>
+  mutate(
+    # --- Grouping ---
+    Group = factor(
+      if_else(KALT_STATUS_CALC == 1, "KALT", "LTA"),
+      levels = c("LTA", "KALT")
+    ),
+    
+    # --- Continuous ---
+    AGE = as.numeric(AGE),
+    BMI_CALC = as.numeric(BMI_CALC),
+    FINAL_MELD_PELD_LAB_SCORE = as.numeric(FINAL_MELD_PELD_LAB_SCORE),
+    years_to_esrd = as.numeric(INIT_DATE_KIDNEY - TX_DATE) / 365.25,
+    
+    # --- Sex ---
+    sex_label = case_when(
+      toupper(trimws(as.character(GENDER))) == "M" ~ "Male",
+      toupper(trimws(as.character(GENDER))) == "F" ~ "Female",
+      TRUE ~ NA_character_
+    ),
+    sex_label = factor(sex_label, levels = c("Female", "Male")),
+    
+    # --- Recipient race/ethnicity ---
+    race_label = case_when(
+      ETHCAT == 1 ~ "White",
+      ETHCAT == 2 ~ "Black/African American",
+      ETHCAT == 4 ~ "Hispanic/Latino",
+      ETHCAT == 5 ~ "Asian",
+      ETHCAT %in% c(6, 7, 9) ~ "Other",
+      ETHCAT == 998 ~ NA_character_,
+      TRUE ~ NA_character_
+    ),
+    race_label = factor(race_label,
+                        levels = c("Asian", "Black/African American", "Hispanic/Latino", "White", "Other")),
+    
+    # --- Diabetes ---
+    diab_label = case_when(
+      DIAB == 1 ~ "No",
+      DIAB %in% c(2, 3, 4, 5) ~ "Yes",
+      DIAB == 998 ~ NA_character_,
+      TRUE ~ NA_character_
+    ),
+    diab_label = factor(diab_label, levels = c("No", "Yes")),
+    
+    # --- Dialysis (kidney file) ---
+    dialysis_label = case_when(
+      toupper(trimws(as.character(ON_DIALYSIS))) == "Y" ~ "Yes",
+      toupper(trimws(as.character(ON_DIALYSIS))) == "N" ~ "No",
+      toupper(trimws(as.character(ON_DIALYSIS))) == "U" ~ NA_character_,
+      TRUE ~ NA_character_
+    ),
+    dialysis_label = factor(dialysis_label, levels = c("No", "Yes")),
+    
+    # --- LDRI category ---
+    LDRI_cat = case_when(
+      LDRI <= 1.1 ~ "LDRI \u2264 1.1",
+      LDRI > 1.1 & LDRI <= 1.6 ~ "1.1 < LDRI \u2264 1.6",
+      LDRI > 1.6 ~ "LDRI > 1.6"
+    ),
+    LDRI_cat = factor(LDRI_cat,
+                      levels = c("LDRI \u2264 1.1", "1.1 < LDRI \u2264 1.6", "LDRI > 1.6")),
+    
+    # --- Etiology of liver failure (DGN_TCR, liver file) ---
+    liver_etiology = case_when(
+      DGN_TCR %in% c(4100, 4101, 4102, 4103, 4104, 4105,
+                     4106, 4107, 4108, 4110) ~ "Acute hepatic necrosis",
+      DGN_TCR %in% c(4270, 4271, 4272, 4275) ~ "Biliary atresia",
+      DGN_TCR %in% c(4220, 4230, 4231, 4235, 4240, 4241, 4242, 4245,
+                     4250, 4255, 4260, 4264, 4265, 4290) ~ "Cholestatic liver disease",
+      DGN_TCR %in% c(4280, 4285) ~ "Congenital",
+      DGN_TCR %in% c(4400, 4401, 4402, 4403, 4404, 4405,
+                     4410, 4420, 4430) ~ "Malignant neoplasm",
+      DGN_TCR %in% c(4300, 4301, 4302, 4303, 4304, 4305,
+                     4306, 4307, 4308, 4315) ~ "Metabolic disease",
+      DGN_TCR %in% c(4200, 4201, 4202, 4203, 4204, 4205, 4206, 4207,
+                     4208, 4209, 4210, 4212, 4213, 4214, 4215, 4216,
+                     4217, 4218, 4219, 4221, 4222,
+                     4592, 4593) ~ "Non-cholestatic liver disease",
+      DGN_TCR %in% c(999, 4500, 4510, 4520, 4597, 4598) ~ "Other",
+      TRUE ~ NA_character_
+    ),
+    liver_etiology = factor(liver_etiology, levels = c(
+      "Acute hepatic necrosis", "Biliary atresia", "Cholestatic liver disease",
+      "Congenital", "Malignant neoplasm", "Metabolic disease",
+      "Non-cholestatic liver disease", "Other"
+    )),
+    
+    # --- Etiology of ESRD (DGN_TCR_KIDNEY, kidney file) ---
+    esrd_etiology = case_when(
+      DGN_TCR_KIDNEY %in% c(3025, 3036, 3052, 3061, 3065) ~ "Congenital",
+      DGN_TCR_KIDNEY %in% c(3011, 3012, 3038, 3039,
+                            3069, 3070, 3071) ~ "Diabetes",
+      DGN_TCR_KIDNEY %in% c(3000, 3001, 3002, 3003, 3004, 3005, 3006,
+                            3009, 3018, 3033, 3035, 3041, 3042, 3043,
+                            3054, 3055, 3067, 3068, 3074) ~ "Glomerular disease",
+      DGN_TCR_KIDNEY %in% c(3034, 3040, 3051) ~ "Hypertensive nephrosclerosis",
+      DGN_TCR_KIDNEY %in% c(3020, 3021, 3022, 3023, 3058) ~ "Neoplasm",
+      DGN_TCR_KIDNEY %in% c(3008, 3028) ~ "Polycystic kidney disease",
+      DGN_TCR_KIDNEY %in% c(3050, 3056, 3059, 3060, 3066) ~ "Renovascular related disease",
+      DGN_TCR_KIDNEY %in% c(3007, 3010, 3024, 3026, 3027, 3029, 3030,
+                            3031, 3032, 3044, 3045, 3046, 3047, 3048,
+                            3049, 3053, 3062, 3063, 3064,
+                            3072, 3073) ~ "Tubular and interstitial disease",
+      DGN_TCR_KIDNEY %in% c(3013, 3014, 3015, 3016, 3017,
+                            3037, 3057) ~ "Other",
+      TRUE ~ NA_character_
+    ),
+    esrd_etiology = factor(esrd_etiology, levels = c(
+      "Congenital", "Diabetes", "Glomerular disease", "Hypertensive nephrosclerosis",
+      "Neoplasm", "Polycystic kidney disease", "Renovascular related disease",
+      "Tubular and interstitial disease", "Other"
+    ))
+  )
+
+# Sanity checks before building table
+df_esrd_cohort |> count(Group)
+df_esrd_cohort |> filter(is.na(liver_etiology)) |> count(DGN_TCR) |> arrange(desc(n))
+df_esrd_cohort |> filter(is.na(esrd_etiology)) |> count(DGN_TCR_KIDNEY) |> arrange(desc(n))
+
+#=================================================================================
+# Table 1
+#---------------------------------------------------------------------------------
+table1 <- df_esrd_cohort |>
+  select(
+    Group, AGE, sex_label, BMI_CALC, race_label,
+    diab_label, dialysis_label, years_to_esrd,
+    FINAL_MELD_PELD_LAB_SCORE, LDRI_cat,
+    liver_etiology, esrd_etiology
+  ) |>
+  tbl_summary(
+    by = Group,
+    statistic = list(
+      all_continuous()  ~ "{mean} ({sd})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits = all_continuous() ~ 1,
+    label = list(
+      AGE                       ~ "Age, mean (SD), y",
+      sex_label                 ~ "Sex, n (%)",
+      BMI_CALC                  ~ "BMI, mean (SD), kg/m\u00b2",
+      race_label                ~ "Race/ethnicity, n (%)",
+      diab_label                ~ "History of diabetes, n (%)",
+      dialysis_label            ~ "Dialysis, n (%)",
+      years_to_esrd             ~ "Time between OLT and ESRD, mean (SD), y",
+      FINAL_MELD_PELD_LAB_SCORE ~ "MELD, mean (SD)",
+      LDRI_cat                  ~ "Liver donor risk index, n (%)",
+      liver_etiology            ~ "Etiology of liver failure, n (%)",
+      esrd_etiology             ~ "Etiology of ESRD, n (%)"
+    ),
+    missing = "no"
+  ) |>
+  add_p(test = list(
+    all_continuous()  ~ "t.test",
+    all_categorical() ~ "chisq.test"
+  )) |>
+  modify_header(label ~ "**Characteristic**") |>
+  modify_caption("**Table 1. Baseline Characteristics: LTA vs. KALT**") |>
+  bold_labels()
+
+table1
 
 
-
+#================================================================================
+# Debugging
+#-----------------------------------------------------------------
 
 
 
