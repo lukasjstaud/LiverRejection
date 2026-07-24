@@ -556,7 +556,22 @@ prep_match_df <- function(df) {
 }
 
 match_covariates <- c("AGE", "GENDER", "ETHCAT", "MELD_PELD_LAB_SCORE",
-                      "DIAB_BIN", "COLD_ISCH", "MM_TOTAL")
+                      "DIAB_BIN", "COLD_ISCH")
+
+# MM_TOTAL (HLA mismatch) is deliberately NOT matched on. It is missing for
+# roughly 60% of the cohort -- MM_TOTAL is NA whenever ANY of the six alleles
+# is untyped, which in UNOS is the norm rather than the exception. Because
+# matching is complete-case, including it discarded the majority of both arms
+# and, worse, discarded them non-randomly: centres that type HLA completely
+# differ systematically from those that don't. Buying balance on a variable
+# observed in 40% of patients was costing more in selection bias than it
+# removed in confounding.
+#
+# It is still carried alongside the matching frame so covariate balance can be
+# REPORTED on it (via the addl = argument to love.plot below) without it
+# influencing who gets matched, and it remains in the descriptive tables and
+# in the adjusted year-2 regression models.
+balance_only_covariates <- c("MM_TOTAL")
 
 match_formula <- as.formula(paste("treat ~", paste(match_covariates, collapse = " + ")))
 
@@ -592,11 +607,16 @@ match_df_combined_steroid_raw <- bind_rows(
   prep_match_df(pat_combined_demo_table) %>% mutate(treat = 1),
   prep_match_df(pat_steroid_demo_table)  %>% mutate(treat = 0)
 ) %>%
-  select(TRR_ID_CODE, treat, all_of(match_covariates))
+  select(TRR_ID_CODE, treat, all_of(match_covariates), any_of(balance_only_covariates))
 
 report_complete_case_loss(match_df_combined_steroid_raw, "Combined vs Steroid")
 
-match_df_combined_steroid <- match_df_combined_steroid_raw %>% drop_na()
+# drop_na() with no arguments drops a row with NA in ANY column -- which would
+# re-delete every HLA-untyped patient the moment MM_TOTAL is carried in the
+# frame, silently undoing the point of excluding it from the match. Scope it
+# explicitly to the matching covariates.
+match_df_combined_steroid <- match_df_combined_steroid_raw %>%
+  drop_na(all_of(match_covariates))
 
 set.seed(1234)
 
@@ -635,11 +655,12 @@ match_df_combined_ctrl_raw <- bind_rows(
   prep_match_df(pat_combined_demo_table) %>% mutate(treat = 1),
   prep_match_df(pat_ctrl_demo_table)     %>% mutate(treat = 0)
 ) %>%
-  select(TRR_ID_CODE, treat, all_of(match_covariates))
+  select(TRR_ID_CODE, treat, all_of(match_covariates), any_of(balance_only_covariates))
 
 report_complete_case_loss(match_df_combined_ctrl_raw, "Combined vs Control")
 
-match_df_combined_ctrl <- match_df_combined_ctrl_raw %>% drop_na()
+match_df_combined_ctrl <- match_df_combined_ctrl_raw %>%
+  drop_na(all_of(match_covariates))
 
 set.seed(1234)
 
@@ -669,19 +690,29 @@ pat_ctrl_demo_table_m          <- pat_ctrl_demo_table     %>% filter(TRR_ID_CODE
 
 #===============================================================================
 # 14. Love Plots: Covariate Balance Before/After Matching
+#-------------------------------------------------------------------------------
+# addl = passes MM_TOTAL (HLA mismatch) in as a covariate to REPORT balance on
+# without it having influenced the matching -- so it is possible to see
+# whether the arms happen to differ on HLA despite not being matched on it.
+# cobalt handles its missingness by adding an explicit <NA> indicator, which
+# doubles as a check on whether HLA typing itself differs between arms.
+# If cobalt errors on this, dropping the addl = argument returns the plain
+# matched-covariate plot.
 #===============================================================================
 love.plot(
   m_combined_steroid,
   binary = "std", stats = "mean.diffs", abs = TRUE, var.order = "unadjusted",
   thresholds = c(m = 0.1), title = "Covariate Balance: Combined vs Steroid",
-  sample.names = c("Unmatched", "Matched")
+  sample.names = c("Unmatched", "Matched"),
+  addl = match_df_combined_steroid[balance_only_covariates]
 )
 
 love.plot(
   m_combined_ctrl,
   binary = "std", stats = "mean.diffs", abs = TRUE, var.order = "unadjusted",
   thresholds = c(m = 0.1), title = "Covariate Balance: Combined vs Control",
-  sample.names = c("Unmatched", "Matched")
+  sample.names = c("Unmatched", "Matched"),
+  addl = match_df_combined_ctrl[balance_only_covariates]
 )
 
 
@@ -1305,11 +1336,11 @@ match_within_landmark <- function(df_lm, treat_arm, ctrl_arm, label, seed = 1234
     mutate(treat = as.integer(ARM == treat_arm)) %>%
     left_join(baseline_covs, by = "TRR_ID_CODE")
   
-  md <- d %>% select(TRR_ID_CODE, treat, all_of(match_covariates))
+  md <- d %>% select(TRR_ID_CODE, treat, all_of(match_covariates), any_of(balance_only_covariates))
   report_complete_case_loss(md, label)
   
   md <- md %>%
-    drop_na() %>%
+    drop_na(all_of(match_covariates)) %>%   # scoped: see note in section 13
     mutate(across(where(is.factor), droplevels))
   
   if (length(unique(md$treat)) < 2 || min(table(md$treat)) < 5) {
@@ -1330,6 +1361,9 @@ match_within_landmark <- function(df_lm, treat_arm, ctrl_arm, label, seed = 1234
   
   list(
     matchit = m,
+    # the exact frame passed to matchit(), row-aligned with it, so balance can
+    # be reported on balance_only_covariates that weren't matched on
+    match_frame = md,
     data = d %>% filter(TRR_ID_CODE %in% matched_ids) %>% mutate(ARM = droplevels(ARM))
   )
 }
@@ -1351,7 +1385,8 @@ if (!is.null(lm_match_steroid_combined)) {
                   binary = "std", stats = "mean.diffs", abs = TRUE,
                   var.order = "unadjusted", thresholds = c(m = 0.1),
                   title = "Landmark Cohort Balance: Combined vs Steroid",
-                  sample.names = c("Unmatched", "Matched")))
+                  sample.names = c("Unmatched", "Matched"),
+                  addl = lm_match_steroid_combined$match_frame[balance_only_covariates]))
 }
 
 if (!is.null(lm_match_combined_control)) {
@@ -1360,7 +1395,8 @@ if (!is.null(lm_match_combined_control)) {
                   binary = "std", stats = "mean.diffs", abs = TRUE,
                   var.order = "unadjusted", thresholds = c(m = 0.1),
                   title = "Landmark Cohort Balance: Combined vs Control",
-                  sample.names = c("Unmatched", "Matched")))
+                  sample.names = c("Unmatched", "Matched"),
+                  addl = lm_match_combined_control$match_frame[balance_only_covariates]))
 }
 
 # --- Matched KM curves ---
@@ -1454,7 +1490,7 @@ hr_table_lm %>%
                       "; follow-up from landmark to day ", round(LM_HORIZON_LONG))
   ) %>%
   tab_options(table.font.size = 13, data_row.padding = px(4), column_labels.font.weight = "bold") %>%
-  tab_source_note("LANDMARK DESIGN: exposure defined over the first year post-transplant; only patients still under observation at the landmark are included; the survival clock starts AT the landmark. This removes the immortal time bias present in transplant-anchored analyses of a year-1 exposure. Hazard ratios are therefore for CONDITIONAL survival (given survival to 1 year), not overall post-transplant survival. Matched comparisons use 1:1 nearest-neighbour propensity matching performed WITHIN the landmark cohort (caliper 0.2 SD of the propensity logit; age, gender, ethnicity, MELD, diabetes, cold ischemic time, HLA mismatch). PH Assumption P from cox.zph().")
+  tab_source_note("LANDMARK DESIGN: exposure defined over the first year post-transplant; only patients still under observation at the landmark are included; the survival clock starts AT the landmark. This removes the immortal time bias present in transplant-anchored analyses of a year-1 exposure. Hazard ratios are therefore for CONDITIONAL survival (given survival to 1 year), not overall post-transplant survival. Matched comparisons use 1:1 nearest-neighbour propensity matching performed WITHIN the landmark cohort (caliper 0.2 SD of the propensity logit; age, gender, ethnicity, MELD, diabetes, cold ischemic time). HLA mismatch was not matched on because it is missing for roughly 60% of the cohort; balance on it is reported descriptively in the Love plots. PH Assumption P from cox.zph().")
 
 # --- Forest plots ---
 ggforest(fit_lm_3arm, data = df_lm_3arm)
@@ -1813,12 +1849,30 @@ df_yr2_model <- df_yr2_by_group %>%
 
 stopifnot(nrow(df_yr2_model) == nrow(df_yr2_by_group))
 
+# Adjustment covariate set for the year-2 logistic models, defined ONCE so the
+# rejection and graft-failure models cannot drift apart.
+#
+# HLA mismatch (MM_TOTAL) is deliberately excluded, for the same reason it was
+# removed from the propensity matching in section 13: it is missing for ~60% of
+# the cohort, and glm() is complete-case. Including it silently fitted every
+# "Adjusted" model on roughly 40% of the landmark cohort while the neighbouring
+# "Unadjusted" model used all of it -- so the two were never estimated on the
+# same patients and the difference between them could not be attributed to the
+# adjustment. The retained sample was also selected on HLA-typing availability,
+# which varies systematically by centre.
+yr2_adj_covs <- "AGE + GENDER + MELD_PELD_LAB_SCORE + COLD_ISCH + DIAB_BIN"
+
+# N is carried through to the output tables because the remaining covariates
+# (COLD_ISCH and DIAB in particular) still have some missingness, so adjusted
+# and unadjusted models may STILL be fitted on slightly different samples.
+# Reporting it makes any such gap visible instead of silent.
 tidy_glm_or <- function(fit) {
   co <- summary(fit)$coefficients
   ci <- suppressMessages(confint.default(fit))  # Wald CIs
   
   tibble(
     term     = rownames(co),
+    N        = stats::nobs(fit),
     OR       = exp(co[, "Estimate"]),
     CI_lower = exp(ci[, 1]),
     CI_upper = exp(ci[, 2]),
@@ -1836,7 +1890,7 @@ anova(fit_null, fit_unadj, test = "LRT")
 or_unadj <- tidy_glm_or(fit_unadj) %>% mutate(Model = "Unadjusted")
 
 fit_adj <- glm(
-  ANY_ANTI_REJ_YR2 ~ FIRST_YEAR_GROUP + AGE + GENDER + MELD_PELD_LAB_SCORE + COLD_ISCH + DIAB_BIN + MM_TOTAL,
+  as.formula(paste("ANY_ANTI_REJ_YR2 ~ FIRST_YEAR_GROUP +", yr2_adj_covs)),
   data = df_yr2_model, family = binomial
 )
 summary(fit_adj)
@@ -1849,7 +1903,7 @@ df_yr2_model_steroid_ref <- df_yr2_model %>% mutate(FIRST_YEAR_GROUP = relevel(F
 
 fit_unadj_steroid_ref <- glm(ANY_ANTI_REJ_YR2 ~ FIRST_YEAR_GROUP, data = df_yr2_model_steroid_ref, family = binomial)
 fit_adj_steroid_ref <- glm(
-  ANY_ANTI_REJ_YR2 ~ FIRST_YEAR_GROUP + AGE + GENDER + MELD_PELD_LAB_SCORE + COLD_ISCH + DIAB_BIN + MM_TOTAL,
+  as.formula(paste("ANY_ANTI_REJ_YR2 ~ FIRST_YEAR_GROUP +", yr2_adj_covs)),
   data = df_yr2_model_steroid_ref, family = binomial
 )
 
@@ -1870,7 +1924,7 @@ or_results_yr2 <- bind_rows(or_unadj, or_adj, or_unadj_combined_vs_steroid, or_a
       TRUE ~ term
     )
   ) %>%
-  select(Comparison, Model, OR, CI_lower, CI_upper, p_value)
+  select(Comparison, Model, N, OR, CI_lower, CI_upper, p_value)
 
 or_results_yr2
 
@@ -1879,23 +1933,24 @@ or_table_yr2 <- or_results_yr2 %>%
     `OR (95% CI)` = sprintf("%.2f (%.2f\u2013%.2f)", OR, CI_lower, CI_upper),
     `P value` = case_when(p_value < 0.001 ~ "<0.001", TRUE ~ sprintf("%.3f", p_value))
   ) %>%
-  select(Comparison, Model, `OR (95% CI)`, `P value`) %>%
+  select(Comparison, Model, N, `OR (95% CI)`, `P value`) %>%
   arrange(Comparison, Model)
 
 or_table_yr2 %>%
   gt(groupname_col = "Comparison") %>%
-  cols_label(Model = "Model", `OR (95% CI)` = "Odds Ratio (95% CI)", `P value` = "P value") %>%
+  cols_label(Model = "Model", N = "N in model",
+             `OR (95% CI)` = "Odds Ratio (95% CI)", `P value` = "P value") %>%
   tab_header(title = "Odds of Anti-Rejection Treatment in Year 2, by First-Year Treatment Group") %>%
   tab_options(table.font.size = 13, data_row.padding = px(4),
               column_labels.font.weight = "bold", row_group.font.weight = "bold") %>%
-  tab_source_note("OR > 1 indicates higher odds of being treated for rejection in year 2 relative to the comparison group. Adjusted model controls for recipient age, gender, MELD score, cold ischemic time, diabetes status, and HLA mismatch level (MM_TOTAL). Landmark cohort restricted to patients followed through 1 year (PTIME >= 365.25).")
+  tab_source_note("PRIMARY ANALYSIS (covariate-adjusted, full landmark cohort). OR > 1 indicates higher odds of being treated for rejection in year 2 relative to the comparison group. Adjusted model controls for recipient age, gender, MELD score, cold ischemic time, and diabetes status. HLA mismatch is NOT included: it is missing for roughly 60% of the cohort and, because model fitting is complete-case, including it would restrict the adjusted models to a minority of patients selected on HLA-typing availability. N is reported per model so any remaining difference in analysed sample between the unadjusted and adjusted rows is visible. Landmark cohort restricted to patients followed through 1 year (PTIME >= 365.25). See section 25 for a propensity-matched sensitivity analysis of the same comparisons.")
 
 # --- Model diagnostics ---
 summary(fit_adj)$coefficients
 fit_adj$converged
 
 fit_adj_no_group <- glm(
-  ANY_ANTI_REJ_YR2 ~ AGE + GENDER + MELD_PELD_LAB_SCORE + COLD_ISCH + DIAB_BIN + MM_TOTAL,
+  as.formula(paste("ANY_ANTI_REJ_YR2 ~", yr2_adj_covs)),
   data = df_yr2_model, family = binomial
 )
 anova(fit_adj_no_group, fit_adj, test = "LRT")
@@ -1999,7 +2054,7 @@ anova(fit_grf_null, fit_grf_unadj, test = "LRT")
 or_grf_unadj <- tidy_glm_or(fit_grf_unadj) %>% mutate(Model = "Unadjusted")
 
 fit_grf_adj <- glm(
-  ANY_GRF_FAIL_YR2 ~ FIRST_YEAR_GROUP + AGE + GENDER + MELD_PELD_LAB_SCORE + COLD_ISCH + DIAB_BIN + MM_TOTAL,
+  as.formula(paste("ANY_GRF_FAIL_YR2 ~ FIRST_YEAR_GROUP +", yr2_adj_covs)),
   data = df_grf_yr2_model, family = binomial
 )
 summary(fit_grf_adj)
@@ -2012,7 +2067,7 @@ df_grf_yr2_model_steroid_ref <- df_grf_yr2_model %>% mutate(FIRST_YEAR_GROUP = r
 
 fit_grf_unadj_steroid_ref <- glm(ANY_GRF_FAIL_YR2 ~ FIRST_YEAR_GROUP, data = df_grf_yr2_model_steroid_ref, family = binomial)
 fit_grf_adj_steroid_ref <- glm(
-  ANY_GRF_FAIL_YR2 ~ FIRST_YEAR_GROUP + AGE + GENDER + MELD_PELD_LAB_SCORE + COLD_ISCH + DIAB_BIN + MM_TOTAL,
+  as.formula(paste("ANY_GRF_FAIL_YR2 ~ FIRST_YEAR_GROUP +", yr2_adj_covs)),
   data = df_grf_yr2_model_steroid_ref, family = binomial
 )
 
@@ -2035,7 +2090,7 @@ or_grf_results_yr2 <- bind_rows(
       TRUE ~ term
     )
   ) %>%
-  select(Comparison, Model, OR, CI_lower, CI_upper, p_value)
+  select(Comparison, Model, N, OR, CI_lower, CI_upper, p_value)
 
 or_grf_results_yr2
 
@@ -2044,22 +2099,171 @@ or_grf_table_yr2 <- or_grf_results_yr2 %>%
     `OR (95% CI)` = sprintf("%.2f (%.2f\u2013%.2f)", OR, CI_lower, CI_upper),
     `P value` = case_when(p_value < 0.001 ~ "<0.001", TRUE ~ sprintf("%.3f", p_value))
   ) %>%
-  select(Comparison, Model, `OR (95% CI)`, `P value`) %>%
+  select(Comparison, Model, N, `OR (95% CI)`, `P value`) %>%
   arrange(Comparison, Model)
 
 or_grf_table_yr2 %>%
   gt(groupname_col = "Comparison") %>%
-  cols_label(Model = "Model", `OR (95% CI)` = "Odds Ratio (95% CI)", `P value` = "P value") %>%
+  cols_label(Model = "Model", N = "N in model",
+             `OR (95% CI)` = "Odds Ratio (95% CI)", `P value` = "P value") %>%
   tab_header(title = "Odds of Graft Failure in Year 2, by First-Year Treatment Group") %>%
   tab_options(table.font.size = 13, data_row.padding = px(4),
               column_labels.font.weight = "bold", row_group.font.weight = "bold") %>%
-  tab_source_note("OR > 1 indicates higher odds of graft failure in year 2 relative to the comparison group. Adjusted model controls for recipient age, gender, MELD score, cold ischemic time, diabetes status, and HLA mismatch level (MM_TOTAL). Landmark cohort restricted to patients with a functioning graft through 1 year (GRF_TIME_DAYS >= 365.25).")
+  tab_source_note("PRIMARY ANALYSIS (covariate-adjusted, full landmark cohort). OR > 1 indicates higher odds of graft failure in year 2 relative to the comparison group. Adjusted model controls for recipient age, gender, MELD score, cold ischemic time, and diabetes status. HLA mismatch is NOT included: it is missing for roughly 60% of the cohort and, because model fitting is complete-case, including it would restrict the adjusted models to a minority of patients selected on HLA-typing availability. N is reported per model so any remaining difference in analysed sample between the unadjusted and adjusted rows is visible. Landmark cohort restricted to patients with a functioning graft through 1 year (GRF_TIME_DAYS >= 365.25). See section 25 for a propensity-matched sensitivity analysis of the same comparisons.")
 
 # --- Model diagnostics ---
 summary(fit_grf_adj)$coefficients   # check for very large |estimate|/SE (separation)
 
 fit_grf_adj_no_group <- glm(
-  ANY_GRF_FAIL_YR2 ~ AGE + GENDER + MELD_PELD_LAB_SCORE + COLD_ISCH + DIAB_BIN + MM_TOTAL,
+  as.formula(paste("ANY_GRF_FAIL_YR2 ~", yr2_adj_covs)),
   data = df_grf_yr2_model, family = binomial
 )
 anova(fit_grf_adj_no_group, fit_grf_adj, test = "LRT")
+
+
+#===============================================================================
+# 25. Year-2 Outcomes: Propensity-Matched Sensitivity Analysis
+#-------------------------------------------------------------------------------
+# The year-2 tables above (sections 22 and 24) are the PRIMARY analysis:
+# covariate-adjusted logistic regression on the full landmark cohort. This
+# section repeats both outcomes on propensity-matched arms as a SENSITIVITY
+# analysis, so the two approaches to confounding control can be compared.
+#
+# WHY MATCH HERE RATHER THAN REUSE THE SECTION-13 / SECTION-17 MATCHES:
+#   - The section-13 matches were fit on the full year-1 demographic cohort.
+#   - The section-17 matches were fit within the *survival* landmark cohort
+#     (patients with PTIME >= landmark), a different eligibility rule.
+#   Neither is the year-2 outcome cohort, which is defined by a DIFFERENT
+#   landmark restriction (PTIME >= 365.25 for rejection; GRF_TIME_DAYS >=
+#   365.25 for graft failure) applied to a DIFFERENT denominator. As the
+#   section-17 comment explains, applying a downstream restriction to an
+#   already-matched set breaks pairs non-randomly and reintroduces the
+#   imbalance matching removed. So each outcome is matched on its OWN eligible
+#   cohort, pairs intact.
+#
+# COVARIATES: same set as match_covariates MINUS HLA (removed cohort-wide in
+# section 13 for 60% missingness), i.e. AGE, GENDER, ETHCAT, MELD, DIAB_BIN,
+# COLD_ISCH. ETHCAT is not carried in the year-2 model frames, so it is joined
+# in here.
+#
+# ESTIMAND NOTE: matching is pairwise between two arms, so unlike the pooled
+# 3-level regression above, each matched comparison is its own 1:1 matched
+# cohort. "Combined vs Control" and "Steroid vs Control" therefore do NOT share
+# a control set and their Ns will not add up to a single control group.
+#===============================================================================
+
+# ETHCAT for the year-2 cohort (the only match covariate not already present).
+ethcat_yr2 <- df_liver_data_filtered %>%
+  select(TRR_ID_CODE, ETHCAT) %>%
+  distinct(TRR_ID_CODE, .keep_all = TRUE) %>%
+  mutate(ETHCAT = factor(ETHCAT))
+
+# Generic: match two first-year groups within a year-2 model frame, then fit
+# unadjusted + adjusted logistic models on the matched set for a given binary
+# outcome. Returns the OR rows for both models, or NULL if an arm is too small.
+match_yr2_outcome <- function(model_df, outcome, treat_grp, ctrl_grp, label, seed = 1234) {
+  
+  d <- model_df %>%
+    filter(FIRST_YEAR_GROUP %in% c(treat_grp, ctrl_grp)) %>%
+    mutate(FIRST_YEAR_GROUP = droplevels(FIRST_YEAR_GROUP)) %>%
+    left_join(ethcat_yr2, by = "TRR_ID_CODE") %>%
+    mutate(treat = as.integer(FIRST_YEAR_GROUP == treat_grp))
+  
+  md <- d %>% select(TRR_ID_CODE, treat, all_of(match_covariates))
+  report_complete_case_loss(md, label)
+  md <- md %>% drop_na(all_of(match_covariates)) %>% mutate(across(where(is.factor), droplevels))
+  
+  if (length(unique(md$treat)) < 2 || min(table(md$treat)) < 5) {
+    message("skipping match -- too few complete cases in one arm: ", label)
+    return(NULL)
+  }
+  
+  set.seed(seed)
+  m <- matchit(match_formula, data = md, method = "nearest",
+               distance = "logit", ratio = 1, caliper = 0.2, std.caliper = TRUE)
+  message("[", label, "] treated units unmatched by caliper: ",
+          sum(m$treat == 1 & is.na(m$subclass)))
+  
+  matched_ids <- match.data(m)$TRR_ID_CODE
+  dm <- d %>%
+    filter(TRR_ID_CODE %in% matched_ids) %>%
+    mutate(FIRST_YEAR_GROUP = relevel(droplevels(FIRST_YEAR_GROUP), ref = ctrl_grp))
+  
+  # Guard against a zero-event arm (would make the OR non-estimable).
+  ev <- tapply(dm[[outcome]], dm$FIRST_YEAR_GROUP, sum, na.rm = TRUE)
+  if (any(ev == 0)) {
+    message("skipping models -- an arm has zero year-2 events after matching: ", label,
+            " (events by arm: ", paste(names(ev), ev, sep = "=", collapse = ", "), ")")
+    return(NULL)
+  }
+  
+  f_unadj <- glm(as.formula(paste(outcome, "~ FIRST_YEAR_GROUP")), data = dm, family = binomial)
+  f_adj   <- glm(as.formula(paste(outcome, "~ FIRST_YEAR_GROUP +", yr2_adj_covs)),
+                 data = dm, family = binomial)
+  
+  bind_rows(
+    tidy_glm_or(f_unadj) %>% filter(str_detect(term, "^FIRST_YEAR_GROUP")) %>% mutate(Model = "Unadjusted"),
+    tidy_glm_or(f_adj)   %>% filter(str_detect(term, "^FIRST_YEAR_GROUP")) %>% mutate(Model = "Adjusted")
+  ) %>%
+    mutate(Comparison = label) %>%
+    select(Comparison, Model, N, OR, CI_lower, CI_upper, p_value)
+}
+
+# Small helper to render a matched OR results tibble as a gt table.
+render_yr2_matched_table <- function(res, title, outcome_phrase) {
+  if (is.null(res) || nrow(res) == 0) {
+    message("no matched results to render for: ", title)
+    return(invisible(NULL))
+  }
+  res %>%
+    mutate(
+      `OR (95% CI)` = sprintf("%.2f (%.2f\u2013%.2f)", OR, CI_lower, CI_upper),
+      `P value` = case_when(p_value < 0.001 ~ "<0.001", TRUE ~ sprintf("%.3f", p_value))
+    ) %>%
+    select(Comparison, Model, N, `OR (95% CI)`, `P value`) %>%
+    arrange(Comparison, Model) %>%
+    gt(groupname_col = "Comparison") %>%
+    cols_label(Model = "Model", N = "N in matched model",
+               `OR (95% CI)` = "Odds Ratio (95% CI)", `P value` = "P value") %>%
+    tab_header(title = title, subtitle = "Sensitivity analysis: 1:1 propensity-matched arms") %>%
+    tab_options(table.font.size = 13, data_row.padding = px(4),
+                column_labels.font.weight = "bold", row_group.font.weight = "bold") %>%
+    tab_source_note(paste0(
+      "OR > 1 indicates higher odds of ", outcome_phrase, " relative to the comparison group. ",
+      "SENSITIVITY ANALYSIS: each comparison is a separate 1:1 nearest-neighbour propensity match ",
+      "(caliper 0.2 SD of the propensity logit; age, gender, ethnicity, MELD, diabetes, cold ischemic time; ",
+      "HLA mismatch excluded for missingness). Matching is performed on the year-2 eligible cohort with pairs ",
+      "intact. The 'Adjusted' model additionally fits the same covariates on the matched set. Because each ",
+      "comparison has its own matched control set, Ns across comparisons are not additive. Compare against the ",
+      "full-cohort adjusted-regression table, which is the primary analysis."))
+}
+
+# --- Outcome 1: Year-2 anti-rejection treatment ---
+matched_or_rej_yr2 <- bind_rows(
+  match_yr2_outcome(df_yr2_model, "ANY_ANTI_REJ_YR2", "Steroid",  "Control", "Steroid vs Control"),
+  match_yr2_outcome(df_yr2_model, "ANY_ANTI_REJ_YR2", "Combined", "Control", "Combined vs Control"),
+  match_yr2_outcome(df_yr2_model, "ANY_ANTI_REJ_YR2", "Combined", "Steroid", "Combined vs Steroid")
+)
+
+matched_or_rej_yr2
+
+render_yr2_matched_table(
+  matched_or_rej_yr2,
+  "Odds of Anti-Rejection Treatment in Year 2 (Propensity-Matched Sensitivity Analysis)",
+  "being treated for rejection in year 2"
+)
+
+# --- Outcome 2: Year-2 graft failure ---
+matched_or_grf_yr2 <- bind_rows(
+  match_yr2_outcome(df_grf_yr2_model, "ANY_GRF_FAIL_YR2", "Steroid",  "Control", "Steroid vs Control"),
+  match_yr2_outcome(df_grf_yr2_model, "ANY_GRF_FAIL_YR2", "Combined", "Control", "Combined vs Control"),
+  match_yr2_outcome(df_grf_yr2_model, "ANY_GRF_FAIL_YR2", "Combined", "Steroid", "Combined vs Steroid")
+)
+
+matched_or_grf_yr2
+
+render_yr2_matched_table(
+  matched_or_grf_yr2,
+  "Odds of Graft Failure in Year 2 (Propensity-Matched Sensitivity Analysis)",
+  "graft failure in year 2"
+)
