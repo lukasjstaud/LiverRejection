@@ -2961,3 +2961,327 @@ timing_summary %>%
               column_labels.font.weight = "bold") %>%
   tab_source_note("Control is treated-by-definition-never and so has no timing row content; its N appears in the faceted figure. Median and IQR use only events with an observed follow-up date -- index-admission therapy is recorded without a date and is imputed to day 0 (INPATIENT_RX_DAY), so including it would bias the median downward in proportion to each arm's inpatient share. The cumulative percentages DO include the imputed day-0 events, and are therefore upper bounds on how early each arm was treated.")
 
+#===============================================================================
+# 17c. Timing of anti-rejection treatment DURING the post-landmark year
+#-------------------------------------------------------------------------------
+# Companion to 17b. Same arms, opposite side of the landmark.
+#
+# Depends on: arm_at_landmark + pat_rej_first (17), LANDMARK_DAY,
+#             LM_HORIZON_SHORT, RITUXAN_AS_OWN_ARM + TIMING_BINWIDTH (17b),
+#             df_immuno_fol_read, df_liver_data_filtered.
+#
+# READ BEFORE INTERPRETING:
+#  1. ARMS ARE FIXED AT THE LANDMARK. A Control patient treated on day 500 is
+#     still plotted in the Control panel -- being treated in year 2 is the
+#     OUTCOME here, not a reclassification. This is the timing view of the
+#     section 21/22 analysis.
+#  2. Bars are not the same event across arms. Control = first-ever treatment.
+#     Treated arms = RE-treatment after a year-1 course.
+#  3. Year-2 UNOS follow-up is usually annual, so the raw histogram mostly
+#     reproduces the VISIT SCHEDULE. Plot B normalises by visits per bin and
+#     is the one to interpret. Plot A is there to show the schedule problem,
+#     not to be read past it.
+#  4. No imputed day-0 spike here -- every event in this window carries a real
+#     follow-up date. The 17b day-0 caveat does not apply.
+#===============================================================================
+
+stopifnot(exists("arm_at_landmark"), exists("pat_rej_first"))
+
+POST_LM_END <- LANDMARK_DAY + LM_HORIZON_SHORT   # 730.5 when LANDMARK_DAY = 365.25
+POSTLM_BINWIDTH <- 30                            # coarser than 17b: annual visits
+
+# --- Step 0: per-patient arm label, carried over from year 1 --------------
+# Factored out so 17b and 17c cannot drift apart. (17b's inline RITUX_MONO
+# block can be replaced with a join to this lookup.)
+build_timing_arm_lookup <- function(rituxan_own_arm = RITUXAN_AS_OWN_ARM) {
+  
+  ritux_mono_ids <- pat_rej_first %>%
+    filter(NUM_ANTI_REJ_RXED < 2,
+           !is.na(RITUXAN_ANTIREJ), RITUXAN_ANTIREJ == 1,
+           !is.na(REJ_TX_DAY), REJ_TX_DAY >= 0, REJ_TX_DAY < LANDMARK_DAY) %>%
+    pull(TRR_ID_CODE)
+  
+  if (rituxan_own_arm) {
+    arm_at_landmark %>%
+      mutate(TIMING_ARM = case_when(
+        ARM == "Combined" &  TRR_ID_CODE %in% ritux_mono_ids ~ "Rituxan only",
+        ARM == "Combined" & !TRR_ID_CODE %in% ritux_mono_ids ~ "Combined (non-Rituxan)",
+        TRUE ~ as.character(ARM)
+      ))
+  } else {
+    # Overlapping view: Rituxan patients appear TWICE, once in Combined and
+    # once in their own row. Denominators below are computed from this same
+    # frame, so they stay internally consistent -- but arm Ns will not sum to
+    # the cohort N.
+    bind_rows(
+      arm_at_landmark %>% mutate(TIMING_ARM = as.character(ARM)),
+      arm_at_landmark %>%
+        filter(ARM == "Combined", TRR_ID_CODE %in% ritux_mono_ids) %>%
+        mutate(TIMING_ARM = "Rituxan only (subset of Combined)")
+    )
+  }
+}
+
+timing_arm_lookup <- build_timing_arm_lookup()
+
+# --- Step 1: landmark-eligible cohort -------------------------------------
+# Same restriction as the survival landmark: only patients still under
+# observation at the landmark can contribute post-landmark follow-up. Without
+# it, an arm with more year-1 deaths looks like it had less year-2 treatment
+# purely because its members were gone.
+postlm_eligible_ids <- df_liver_data_filtered %>%
+  filter(!is.na(PTIME), PTIME >= LANDMARK_DAY) %>%
+  pull(TRR_ID_CODE) %>%
+  unique()
+
+arm_postlm <- timing_arm_lookup %>%
+  filter(TRR_ID_CODE %in% postlm_eligible_ids)
+
+# --- Step 2: every follow-up visit in the post-landmark year --------------
+# Built from df_immuno_fol_read, not df_immuno_fol -- the latter was already
+# filtered to < 365 days in section 4 and contains nothing in this window.
+#
+# Note the defensive select(-any_of(...)) before the join: section 21 builds
+# its year-2 frame the same way WITHOUT it, so if a future extract of
+# liver_immuno_followup.csv ever carries its own TX_DATE, that section will
+# break on TX_DATE.x/.y while this one won't. Worth aligning them.
+postlm_visits <- df_immuno_fol_read %>%
+  filter(TRR_ID_CODE %in% arm_postlm$TRR_ID_CODE) %>%
+  select(-any_of(c("TX_DATE", "DISCHARGE_DATE"))) %>%
+  left_join(df_liver_data_filtered %>% select(TRR_ID_CODE, TX_DATE),
+            by = "TRR_ID_CODE") %>%
+  filter(!is.na(TX_DATE)) %>%
+  mutate(
+    PX_STAT_DATE_FOL = as.Date(PX_STAT_DATE_FOL),
+    TX_DATE          = as.Date(TX_DATE),
+    FOL_DATE_DAYS_DELTA = time_length(interval(TX_DATE, PX_STAT_DATE_FOL), "days")
+  ) %>%
+  filter(FOL_DATE_DAYS_DELTA >= LANDMARK_DAY, FOL_DATE_DAYS_DELTA <= POST_LM_END) %>%
+  mutate(
+    TREATED_VISIT = if_any(all_of(COLS_TO_CHECK), ~ !is.na(.x) & .x == 1),
+    DAY_SINCE_LM  = FOL_DATE_DAYS_DELTA - LANDMARK_DAY
+  ) %>%
+  inner_join(arm_postlm %>% select(TRR_ID_CODE, TIMING_ARM), by = "TRR_ID_CODE")
+
+# Arm level order, Control LAST so it reads as the reference panel.
+postlm_levels <- c(
+  intersect(c("Steroids", "Combined (non-Rituxan)", "Combined", "Rituxan only",
+              "Rituxan only (subset of Combined)", "Dual Therapy", "Other Rejection"),
+            unique(arm_postlm$TIMING_ARM)),
+  "Control"
+)
+
+postlm_visits <- postlm_visits %>%
+  mutate(TIMING_ARM = factor(TIMING_ARM, levels = postlm_levels))
+
+arm_postlm <- arm_postlm %>%
+  mutate(TIMING_ARM = factor(TIMING_ARM, levels = postlm_levels))
+
+# --- Step 3: first treated visit per patient in the window ----------------
+# First-event-in-window, matching 17b's first-event convention. Patients
+# treated at several year-2 visits contribute one point, so the histogram is
+# "patients newly treated by day X", not "treatment episodes".
+postlm_first <- postlm_visits %>%
+  filter(TREATED_VISIT) %>%
+  group_by(TRR_ID_CODE) %>%
+  slice_min(order_by = DAY_SINCE_LM, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+# --- Step 4: denominators and ascertainment check -------------------------
+# % of each arm with ANY post-landmark visit is the number to check first. If
+# Control is followed up less often than the treated arms, a lower Control
+# treatment rate is partly an ASCERTAINMENT difference, not a clinical one --
+# the same "no visit coded as no rejection" assumption flagged in section 21.
+arm_denom <- arm_postlm %>%
+  count(TIMING_ARM, .drop = FALSE, name = "n_arm") %>%
+  left_join(
+    postlm_visits %>%
+      group_by(TIMING_ARM, .drop = FALSE) %>%
+      summarise(n_seen = n_distinct(TRR_ID_CODE),
+                n_visits = n(), .groups = "drop"),
+    by = "TIMING_ARM"
+  ) %>%
+  left_join(
+    postlm_first %>% count(TIMING_ARM, .drop = FALSE, name = "n_treated"),
+    by = "TIMING_ARM"
+  ) %>%
+  mutate(across(c(n_seen, n_visits, n_treated), ~ coalesce(.x, 0L)),
+         pct_seen    = 100 * n_seen / n_arm,
+         pct_treated = 100 * n_treated / n_arm)
+
+arm_denom
+
+# --- Plot A: raw histogram (shows the visit-schedule artifact) ------------
+p_postlm_facet <- ggplot(postlm_first, aes(x = DAY_SINCE_LM)) +
+  geom_histogram(binwidth = POSTLM_BINWIDTH, boundary = 0,
+                 fill = "steelblue", colour = "white", linewidth = 0.2) +
+  geom_text(data = arm_denom,
+            aes(x = Inf, y = Inf,
+                label = sprintf("n = %d in arm\n%d treated (%.1f%%)",
+                                n_arm, n_treated, pct_treated)),
+            inherit.aes = FALSE, hjust = 1.05, vjust = 1.3, size = 3) +
+  facet_wrap(~ TIMING_ARM, ncol = 2, drop = FALSE, scales = "free_y") +
+  scale_x_continuous(breaks = seq(0, LM_HORIZON_SHORT, by = 60),
+                     limits = c(0, LM_HORIZON_SHORT),
+                     expand = expansion(mult = c(0, 0.02))) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    title = "Timing of Anti-Rejection Therapy in the Post-Landmark Year, by Year-1 Arm",
+    subtitle = paste0("Days ", round(LANDMARK_DAY), "-", round(POST_LM_END),
+                      " post-transplant; ", POSTLM_BINWIDTH, "-day bins"),
+    x = paste0("Days since landmark (day ", round(LANDMARK_DAY), " post-transplant)"),
+    y = "Patients newly treated",
+    caption = "Y axes independent per panel. Shape is driven largely by the annual visit schedule -- see next figure."
+  ) +
+  theme_minimal() +
+  theme(strip.text = element_text(face = "bold"))
+
+print(p_postlm_facet)
+
+# --- Plot B: treatment RATE per visit, schedule divided out ---------------
+# treated visits / total visits within each bin. This is the informative
+# version: a bin with 400 visits and 4 treatments is a 1% rate whether or not
+# it happens to be the month everyone is seen.
+#
+# Bins with very few visits give wildly unstable rates, so bins under
+# MIN_VISITS_PER_BIN are dropped rather than plotted as noise.
+MIN_VISITS_PER_BIN <- 20
+
+postlm_rate <- postlm_visits %>%
+  mutate(bin = floor(DAY_SINCE_LM / POSTLM_BINWIDTH) * POSTLM_BINWIDTH) %>%
+  group_by(TIMING_ARM, bin, .drop = FALSE) %>%
+  summarise(n_visits = n(),
+            n_treated_visits = sum(TREATED_VISIT, na.rm = TRUE),
+            .groups = "drop") %>%
+  filter(n_visits >= MIN_VISITS_PER_BIN) %>%
+  mutate(rate = n_treated_visits / n_visits)
+
+p_postlm_rate <- ggplot(postlm_rate,
+                        aes(x = bin + POSTLM_BINWIDTH / 2, y = rate,
+                            colour = TIMING_ARM)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(aes(size = n_visits), alpha = 0.7) +
+  scale_x_continuous(breaks = seq(0, LM_HORIZON_SHORT, by = 60),
+                     limits = c(0, LM_HORIZON_SHORT)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  scale_colour_brewer(palette = "Dark2", drop = TRUE) +
+  scale_size_continuous(range = c(1, 4)) +
+  labs(
+    title = "Proportion of Follow-Up Visits at Which Anti-Rejection Therapy Was Given",
+    subtitle = paste0("Post-landmark year, ", POSTLM_BINWIDTH,
+                      "-day bins; bins with < ", MIN_VISITS_PER_BIN, " visits omitted"),
+    x = paste0("Days since landmark (day ", round(LANDMARK_DAY), " post-transplant)"),
+    y = "Treated visits / all visits", colour = "Year-1 arm", size = "Visits in bin"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+print(p_postlm_rate)
+
+# --- Plot C: naive cumulative incidence over the FULL arm -----------------
+# Denominator is every landmark-eligible patient in the arm, NOT just those
+# treated -- so curves plateau at each arm's overall year-2 treatment rate and
+# are directly comparable. (stat_ecdf would rescale each arm to 100% and hide
+# exactly the difference of interest.)
+#
+# NAIVE: patients who die or lose the graft mid-window stay in the denominator
+# forever, so this UNDERSTATES cumulative incidence, and does so most in the
+# arm with the most year-2 deaths. A competing-risks (Aalen-Johansen)
+# estimator is the rigorous version if this figure goes in a manuscript.
+cum_postlm <- postlm_first %>%
+  arrange(TIMING_ARM, DAY_SINCE_LM) %>%
+  group_by(TIMING_ARM) %>%
+  mutate(cum_n = row_number()) %>%
+  ungroup() %>%
+  left_join(arm_denom %>% select(TIMING_ARM, n_arm), by = "TIMING_ARM") %>%
+  mutate(cum_pct = cum_n / n_arm) %>%
+  select(TIMING_ARM, DAY_SINCE_LM, cum_pct)
+
+# Anchor each curve at (0, 0) and carry it to the horizon so the steps render
+# across the full window instead of stopping at the last event.
+cum_postlm <- bind_rows(
+  arm_denom %>% transmute(TIMING_ARM, DAY_SINCE_LM = 0, cum_pct = 0),
+  cum_postlm,
+  cum_postlm %>% group_by(TIMING_ARM) %>%
+    slice_max(DAY_SINCE_LM, n = 1, with_ties = FALSE) %>%
+    mutate(DAY_SINCE_LM = LM_HORIZON_SHORT) %>% ungroup()
+) %>%
+  arrange(TIMING_ARM, DAY_SINCE_LM)
+
+p_postlm_cum <- ggplot(cum_postlm,
+                       aes(x = DAY_SINCE_LM, y = cum_pct, colour = TIMING_ARM)) +
+  geom_step(linewidth = 0.8) +
+  scale_x_continuous(breaks = seq(0, LM_HORIZON_SHORT, by = 60),
+                     limits = c(0, LM_HORIZON_SHORT)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  scale_colour_brewer(palette = "Dark2", drop = TRUE) +
+  labs(
+    title = "Cumulative Proportion of Each Year-1 Arm Treated During the Post-Landmark Year",
+    subtitle = "Denominator is the full landmark-eligible arm; no competing-risk adjustment",
+    x = paste0("Days since landmark (day ", round(LANDMARK_DAY), " post-transplant)"),
+    y = "Cumulative % of arm treated", colour = "Year-1 arm"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+print(p_postlm_cum)
+
+# --- Summary table --------------------------------------------------------
+postlm_summary <- arm_denom %>%
+  left_join(
+    postlm_first %>%
+      group_by(TIMING_ARM, .drop = FALSE) %>%
+      summarise(
+        median_day = median(DAY_SINCE_LM, na.rm = TRUE),
+        q1_day     = quantile(DAY_SINCE_LM, 0.25, na.rm = TRUE),
+        q3_day     = quantile(DAY_SINCE_LM, 0.75, na.rm = TRUE),
+        .groups = "drop"
+      ),
+    by = "TIMING_ARM"
+  ) %>%
+  mutate(
+    visits_per_pt_seen = if_else(n_seen > 0, n_visits / n_seen, NA_real_),
+    across(where(is.numeric), ~ if_else(is.nan(.x), NA_real_, .x))
+  )
+
+postlm_summary %>%
+  mutate(
+    `Median (IQR) day` = if_else(
+      is.na(median_day), NA_character_,
+      sprintf("%.0f (%.0f\u2013%.0f)", median_day, q1_day, q3_day)
+    )
+  ) %>%
+  select(TIMING_ARM, n_arm, n_seen, pct_seen, visits_per_pt_seen,
+         n_treated, pct_treated, `Median (IQR) day`) %>%
+  gt() %>%
+  fmt_number(columns = c(pct_seen, pct_treated, visits_per_pt_seen), decimals = 1) %>%
+  sub_missing(missing_text = "\u2014") %>%
+  cols_label(
+    TIMING_ARM         = "Year-1 arm",
+    n_arm              = "N at landmark",
+    n_seen             = "N with any visit",
+    pct_seen           = "% seen",
+    visits_per_pt_seen = "Visits per patient seen",
+    n_treated          = "N treated",
+    pct_treated        = "% treated",
+    `Median (IQR) day` = "Median (IQR) day since landmark"
+  ) %>%
+  tab_header(
+    title = "Anti-Rejection Therapy During the Post-Landmark Year, by Year-1 Arm",
+    subtitle = paste0("Days ", round(LANDMARK_DAY), "-", round(POST_LM_END),
+                      " post-transplant")
+  ) %>%
+  tab_options(table.font.size = 13, data_row.padding = px(4),
+              column_labels.font.weight = "bold") %>%
+  tab_source_note("Arms are fixed at the year-1 landmark and are NOT reassigned by post-landmark treatment; for the Control arm, treatment here is a first-ever course, while for the treated arms it is re-treatment. Restricted to patients still under observation at the landmark (PTIME >= LANDMARK_DAY). '% seen' is the ascertainment check: an arm followed up less often will appear less treated regardless of its true rejection rate, because a patient with no visit is counted as untreated rather than unknown. Median and IQR are computed among treated patients only and are strongly influenced by the annual follow-up schedule -- see the visit-normalised rate figure. Cumulative incidence is naive with respect to death and graft failure during the window.")
+
+# --- Reconciliation against section 21 ------------------------------------
+# Same window, same landmark, different construction -- these should agree.
+# A gap points at the eligibility rule (section 21 uses landmark_ids_yr1 from
+# PTIME >= 365.25 hard-coded, this uses LANDMARK_DAY) or at the section-6 ID
+# vectors vs first-event arm assignment difference described in 17 Step 2.
+if (exists("year2_group_summary") && abs(LANDMARK_DAY - 365.25) < 1e-6) {
+  message("\nReconciliation, section 17c vs section 21 (n treated in year 2):")
+  print(year2_group_summary %>% select(FIRST_YEAR_GROUP, N, N_rejected_yr2))
+  print(arm_denom %>% select(TIMING_ARM, n_arm, n_treated))
+}
