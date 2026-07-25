@@ -7,6 +7,15 @@
 # propensity-score-matches treatment arms, and runs landmark + time-varying
 # survival and year-2 outcome analyses.
 #
+
+# TO DO:
+# 1.) histogram of when patients are treated for antirejection therayp s/p tx
+# 2.) Landmark moved to 6 months, then analyze outcomes after 1 year
+# 3.) "Survival curve" based on graft failure
+# 4.) adjust at risk charts in kaplan meier so that the number at risk day 0 is 
+# not cut off by axis
+
+
 # CLEANED VERSION -- reorganized into labeled sections and de-duplicated.
 # No analysis logic was changed from the reviewed/patched version; changes
 # here are purely structural:
@@ -114,7 +123,8 @@ if (length(rx_all_na)) {
 # Numeric coercion for the continuous recipient variables used in medians,
 # matching, and Cox/logistic models.
 df_liver_data <- df_liver_data %>%
-  mutate(across(any_of(c("AGE", "MELD_PELD_LAB_SCORE", "COLD_ISCH", "PTIME")),
+  mutate(across(any_of(c("AGE", "MELD_PELD_LAB_SCORE", "COLD_ISCH", "PTIME",
+                         "BMI_CALC", "BMI_TCR", "HGT_CM_CALC", "WGT_KG_CALC")),
                 ~ suppressWarnings(as.numeric(.x))))
 
 
@@ -140,6 +150,33 @@ tx_end_date   <- "2025-04-03"
 
 df_liver_data_filtered <- df_liver_data_filtered %>%
   filter(.data[[FILTER_DATE_COL_TX]] >= tx_start_date & .data[[FILTER_DATE_COL_TX]] <= tx_end_date)
+
+# Prefer BMI at transplant, fall back to the listing value, then derive from
+# height/weight. Kept as base assignment rather than mutate() so the "which
+# spelling exists" branch is explicit rather than buried in tidy-eval.
+bmi_src <- intersect(c("BMI_CALC", "BMI_TCR"), names(df_liver_data_filtered))
+
+df_liver_data_filtered$BMI_REC <- if (length(bmi_src)) {
+  suppressWarnings(as.numeric(df_liver_data_filtered[[bmi_src[1]]]))
+} else NA_real_
+
+if (all(c("HGT_CM_CALC", "WGT_KG_CALC") %in% names(df_liver_data_filtered))) {
+  h <- suppressWarnings(as.numeric(df_liver_data_filtered$HGT_CM_CALC))
+  w <- suppressWarnings(as.numeric(df_liver_data_filtered$WGT_KG_CALC))
+  df_liver_data_filtered$BMI_REC <- coalesce(df_liver_data_filtered$BMI_REC, w / (h / 100)^2)
+}
+
+# A recorded height of 0 yields Inf rather than NA, which would propagate
+# silently into the mean. Range-gate the obviously impossible values.
+df_liver_data_filtered$BMI_REC[
+  !is.finite(df_liver_data_filtered$BMI_REC) |
+    df_liver_data_filtered$BMI_REC < 10 |
+    df_liver_data_filtered$BMI_REC > 80
+] <- NA_real_
+
+message("Recipient BMI source: ", if (length(bmi_src)) bmi_src[1] else "derived from height/weight only",
+        " | missing: ", sum(is.na(df_liver_data_filtered$BMI_REC)),
+        " of ", nrow(df_liver_data_filtered))
 
 # --- Apply the resulting ID list to every other table ---
 tx_ids_to_keep  <- df_liver_data_filtered$TRR_ID_CODE
@@ -503,7 +540,8 @@ race_group <- function(df) {
 # duplicated" filter, rather than being deduplicated to one).
 pat_rej_demo_table <- pat_rej_array %>%
   left_join(df_liver_data_filtered %>%
-              select(TRR_ID_CODE, AGE, GENDER, ETHCAT, MELD_PELD_LAB_SCORE, TXKID, TXHRT, TXLNG, TXPAN,
+              select(TRR_ID_CODE, AGE, BMI_REC, GENDER, ETHCAT, MELD_PELD_LAB_SCORE,
+                     TXKID, TXHRT, TXLNG, TXPAN,
                      PREV_TX, PREV_TX_ANY_N, DON_TY, COLD_ISCH, DIAB), by = "TRR_ID_CODE") |>
   group_by(TRR_ID_CODE) %>%
   slice_min(order_by = source, n = 1, with_ties = FALSE) %>%
@@ -514,7 +552,8 @@ pat_rej_demo_table <- pat_rej_array %>%
 
 pat_ctrl_demo_table <- pat_ctrl_array %>%
   left_join(df_liver_data_filtered %>%
-              select(TRR_ID_CODE, AGE, GENDER, ETHCAT, MELD_PELD_LAB_SCORE, TXKID, TXHRT, TXLNG, TXPAN,
+              select(TRR_ID_CODE, AGE, BMI_REC, GENDER, ETHCAT, MELD_PELD_LAB_SCORE,
+                     TXKID, TXHRT, TXLNG, TXPAN,
                      PREV_TX, PREV_TX_ANY_N, DON_TY, COLD_ISCH, DIAB), by = "TRR_ID_CODE") |>
   mutate(DISCHARGE_DATE = as.Date(DISCHARGE_DATE)) %>%
   mutate(REJ_STAT = 0L) %>%
@@ -739,6 +778,7 @@ prep_gts_df <- function(df) {
     mutate(
       AGE   = as.numeric(AGE),
       MELD_PELD_LAB_SCORE = as.numeric(MELD_PELD_LAB_SCORE),
+      BMI_REC = as.numeric(BMI_REC),
       COLD_ISCH = as.numeric(COLD_ISCH),
       GENDER_LBL = case_when(
         GENDER == "M" ~ "Male",
@@ -778,7 +818,7 @@ prep_gts_df <- function(df) {
 }
 
 # Row order for every table.
-gts_vars <- c("AGE", "GENDER_LBL", "RACE_LBL", "DIAB_LBL", "MELD_PELD_LAB_SCORE",
+gts_vars <- c("AGE", "GENDER_LBL", "RACE_LBL", "BMI_REC", "DIAB_LBL", "MELD_PELD_LAB_SCORE",
               "ORGAN_LBL", "LIVING_DON_LBL", "COLD_ISCH", "PREV_LIV_LBL",
               "PREV_ANY_LBL", "HLA_MM", "PERFUSION_LBL", "PERFUSION_TY_LBL")
 
@@ -786,6 +826,7 @@ gts_labels <- list(
   AGE                 ~ "Recipient Age, y",
   GENDER_LBL          ~ "Sex, n (%)",
   RACE_LBL            ~ "Race/ethnicity, n (%)",
+  BMI_REC             ~ "Recipient BMI, kg/m\u00b2",
   DIAB_LBL            ~ "History of Diabetes, n (%)",
   MELD_PELD_LAB_SCORE ~ "MELD, mean (SD)",
   ORGAN_LBL           ~ "Organ Transplanted, n (%)",
@@ -2267,3 +2308,656 @@ render_yr2_matched_table(
   "Odds of Graft Failure in Year 2 (Propensity-Matched Sensitivity Analysis)",
   "graft failure in year 2"
 )
+
+#===============================================================================
+# ADD-ON: DECEASED DONOR CHARACTERISTIC TABLES BY REJECTION GROUP
+#
+# Produces "Table 2. Characteristics of Deceased Organ Donors"-style tables
+# (Characteristic / Group A / Group B / ... / P value) for every rejection-group
+# comparison already defined in the main script.
+#
+# THREE EDITS TO THE MAIN SCRIPT, in order:
+#   [A] Section 9  -- widen the donor select() so the extra donor fields survive
+#                     into df_deceased_don_fil2 (and therefore into every
+#                     pat_*_demo_table, which already left_join() it).
+#   [B] Section 15 -- generalize build_gts_table() to take vars/labels/prep_fn
+#                     (3 new arguments, all defaulted; existing calls unchanged).
+#   [C] Section 15b -- NEW, paste after Table 6. Builds the donor tables by
+#                     reusing the tbl1_df ... tbl6_df frames already assembled.
+#
+# WHY THIS WORKS WITH NO OTHER CHANGES: pat_rej_demo_table and
+# pat_ctrl_demo_table already carry `left_join(df_deceased_don_fil2)`, and
+# tbl1_df ... tbl6_df are built by bind_rows() from those. Widening the donor
+# select() in section 9 is enough to make donor columns available everywhere.
+#===============================================================================
+
+
+#===============================================================================
+# [A] REPLACEMENT FOR SECTION 9 (Deceased donor data)
+#===============================================================================
+# UNOS donor variable names differ slightly between DONOR_DECEASED file
+# vintages (e.g. HGT_CM_DON_CALC vs HGT_CM_DON, HEP_C_ANTI_DON vs
+# HEP_C_ANTIBODY_DON). Rather than hard-coding one spelling and getting a
+# cryptic "column doesn't exist" error -- or worse, an any_of() that silently
+# drops the variable and leaves an empty table row -- resolve each concept
+# against a list of candidate names and REPORT which ones were not found.
+donor_var_candidates <- list(
+  AGE_DON        = c("AGE_DON"),
+  GENDER_DON     = c("GENDER_DON"),
+  HGT_CM_DON     = c("HGT_CM_DON_CALC", "HGT_CM_DON"),
+  WGT_KG_DON     = c("WGT_KG_DON_CALC", "WGT_KG_DON"),
+  BMI_DON        = c("BMI_DON_CALC", "BMI_DON"),
+  ETHCAT_DON     = c("ETHCAT_DON"),
+  HIST_HTN_DON   = c("HIST_HYPERTENS_DON"),
+  HIST_DM_DON    = c("HIST_DIABETES_DON"),
+  COD_DON        = c("COD_CAD_DON"),
+  CREAT_DON      = c("CREAT_DON"),
+  SGOT_DON       = c("SGOT_DON"),
+  SGPT_DON       = c("SGPT_DON"),
+  TBILI_DON      = c("TBILI_DON"),
+  HCV_DON        = c("HEP_C_ANTI_DON", "HEP_C_ANTIBODY_DON", "HCV_SEROSTATUS"),
+  DCD_DON        = c("NON_HRT_DON"),
+  LI_FIBROSIS    = c("LI_FIBROSIS"),
+  LI_MACHINE_PERFUSION    = c("LI_MACHINE_PERFUSION"),
+  LI_MACHINE_PERFUSION_TY = c("LI_MACHINE_PERFUSION_TY")
+)
+
+resolve_donor_cols <- function(df, candidates) {
+  found <- vapply(candidates, function(cands) {
+    hit <- intersect(cands, names(df))
+    if (length(hit)) hit[1] else NA_character_
+  }, character(1))
+  
+  missing <- names(found)[is.na(found)]
+  if (length(missing)) {
+    message("Donor fields NOT found in the deceased donor file (rows will be omitted): ",
+            paste(missing, collapse = ", "))
+  }
+  found[!is.na(found)]   # named vector: canonical name -> actual column name
+}
+
+donor_cols_found <- resolve_donor_cols(df_deceased_don_fil, donor_var_candidates)
+
+# HAS_DECEASED_DON is the flag used downstream to restrict the donor tables to
+# recipients who actually have a deceased-donor record. Living-donor recipients
+# (and anyone whose donor row didn't join) would otherwise appear as an all-NA
+# column and quietly deflate every donor denominator.
+df_deceased_don_fil2 <- df_deceased_don_fil %>%
+  left_join(df_liver_data_filtered |> select(DONOR_ID, TRR_ID_CODE), by = "DONOR_ID") |>
+  filter(!is.na(TRR_ID_CODE)) |>
+  select(TRR_ID_CODE, all_of(unname(donor_cols_found))) |>
+  rename(!!!setNames(unname(donor_cols_found), names(donor_cols_found))) |>
+  mutate(HAS_DECEASED_DON = 1L) |>
+  distinct(TRR_ID_CODE, .keep_all = TRUE)
+
+# Diagnostic: confirms whether the source file itself carries duplicate donor
+# IDs (the reason distinct() above is necessary rather than optional).
+df_deceased_don_fil %>% count(DONOR_ID) %>% filter(n > 1)
+
+message("Recipients with a deceased-donor record: ", nrow(df_deceased_don_fil2),
+        " of ", length(tx_ids_to_keep), " in cohort")
+
+
+#===============================================================================
+# [B] REPLACEMENT FOR build_gts_table() IN SECTION 15
+#-------------------------------------------------------------------------------
+# Three additions, all defaulted so every existing Table 1-6 call behaves
+# identically:
+#   vars / labels  -- swap in a different row set (recipient vs donor)
+#   prep_fn        -- swap in a different recode step
+#   cont_test      -- "auto" picks t.test for 2 arms, one-way ANOVA for 3+.
+#
+# That last one matters for the EXISTING code too: Table 1 is a 3-arm
+# comparison (Rejection / Rituxan / Control) but hard-codes
+# all_continuous() ~ "t.test". A t-test cannot compare three groups, so
+# gtsummary catches the error per-variable and renders a BLANK p-value for
+# every continuous row of Table 1. With cont_test = "auto" those rows get a
+# one-way ANOVA p-value instead. (Use "kruskal.test" if MELD / cold ischemic
+# time / donor creatinine are skewed enough to make ANOVA inappropriate.)
+#===============================================================================
+build_gts_table <- function(df_combined, group_col, group_lbls = NULL, caption = NULL,
+                            vars     = gts_vars,
+                            labels   = gts_labels,
+                            prep_fn  = prep_gts_df,
+                            cont_test = c("auto", "t.test", "aov", "wilcox.test", "kruskal.test"),
+                            missing_disp = "no") {
+  
+  cont_test <- match.arg(cont_test)
+  
+  d <- prep_fn(df_combined)
+  d <- d %>% filter(!is.na(.data[[group_col]]))
+  
+  n_groups <- nlevels(droplevels(factor(d[[group_col]])))
+  if (cont_test == "auto") cont_test <- if (n_groups > 2) "aov" else "t.test"
+  
+  cont_lbl <- switch(cont_test,
+                     "t.test"       = "Welch two-sample t-test",
+                     "aov"          = "One-way ANOVA",
+                     "wilcox.test"  = "Wilcoxon rank-sum test",
+                     "kruskal.test" = "Kruskal-Wallis test")
+  
+  tbl <- d %>%
+    select(all_of(group_col), all_of(vars)) %>%
+    tbl_summary(
+      by = all_of(group_col),
+      label = labels,
+      statistic = list(
+        all_continuous()  ~ "{mean} ({sd})",
+        all_categorical() ~ "{n} ({p}%)"
+      ),
+      digits = list(all_continuous() ~ 1),
+      missing = missing_disp
+    ) %>%
+    add_p(
+      test = list(
+        all_continuous()  ~ cont_test,
+        all_categorical() ~ "gts_safe_cat_test"    # chi-square / Fisher, per expected counts
+      ),
+      pvalue_fun = ~ style_pvalue(.x, digits = 3)
+    ) %>%
+    bold_labels() %>%
+    modify_header(all_stat_cols() ~ "**{level}**, N = {n}") %>%
+    modify_footnote(all_stat_cols() ~ "Mean (SD); n (%)") %>%
+    modify_footnote(p.value ~ paste0(
+      cont_lbl,
+      "; Pearson's Chi-squared test / Fisher's exact test (simulated p-value where tables exceed 2x2)"))
+  
+  if (!is.null(group_lbls)) {
+    for (lv in names(group_lbls)) {
+      tbl <- tbl %>% modify_header(
+        !!rlang::sym(paste0("stat_", which(levels(factor(d[[group_col]])) == lv))) :=
+          paste0("**", group_lbls[[lv]], "**, N = {n}")
+      )
+    }
+  }
+  
+  if (!is.null(caption)) tbl <- tbl %>% modify_caption(caption)
+  
+  tbl
+}
+
+
+#===============================================================================
+# [C] NEW SECTION 15b -- DONOR TABLES (paste after Table 6)
+#===============================================================================
+
+# --- Step 0: donor-side recodes -------------------------------------------
+# Restricting to HAS_DECEASED_DON == 1 here (rather than in each caller) means
+# the "N = " in each column header is the DECEASED-DONOR N for that arm, not
+# the arm's total N. Those two numbers differ by the living-donor recipients,
+# so quote the donor-table N only alongside donor-table results.
+#
+# Unknown-code handling: UNOS uses out-of-range sentinels for "unknown"
+# (HIST_DIABETES_DON == 998, "U" for the Y/N/U history fields, "U"/"I"/"ND"
+# for serology). These are mapped to NA rather than being allowed to form
+# their own level, because a level called "U" silently competes for
+# percentage share with the real categories and drags an expected cell count
+# under 5, which flips the whole row to a simulated Fisher test for no reason.
+# missing = "ifany" below then shows how many are unknown, as its own row.
+prep_donor_gts_df <- function(df) {
+  donor_join_cols <- setdiff(names(df_deceased_don_fil2), "TRR_ID_CODE")
+  df %>%
+    select(-any_of(donor_join_cols)) %>%          # drop stale copies before joining
+    left_join(df_deceased_don_fil2, by = "TRR_ID_CODE") %>%
+    filter(!is.na(HAS_DECEASED_DON), HAS_DECEASED_DON == 1L) %>%
+    mutate(
+      across(any_of(c("AGE_DON", "HGT_CM_DON", "WGT_KG_DON", "BMI_DON",
+                      "CREAT_DON", "SGOT_DON", "SGPT_DON", "TBILI_DON")),
+             ~ suppressWarnings(as.numeric(.x))),
+      
+      DON_SEX_LBL = case_when(
+        GENDER_DON == "M" ~ "Male",
+        GENDER_DON == "F" ~ "Female",
+        TRUE ~ NA_character_
+      ),
+      
+      DON_RACE_LBL = case_when(
+        as.character(ETHCAT_DON) == "1" ~ "White",
+        as.character(ETHCAT_DON) == "2" ~ "Black/African American",
+        as.character(ETHCAT_DON) == "4" ~ "Hispanic/Latino",
+        as.character(ETHCAT_DON) == "5" ~ "Asian",
+        !is.na(ETHCAT_DON)              ~ "Other",
+        TRUE ~ NA_character_
+      ),
+      
+      DON_HTN_LBL = case_when(
+        HIST_HTN_DON == "Y" ~ "Yes",
+        HIST_HTN_DON == "N" ~ "No",
+        TRUE ~ NA_character_          # "U" / blank -> unknown
+      ),
+      
+      # HIST_DIABETES_DON mirrors the recipient DIAB coding: 1 = No,
+      # 2-5 = Yes (by duration), 998 = Unknown.
+      DON_DM_LBL = case_when(
+        suppressWarnings(as.numeric(HIST_DM_DON)) %in% 2:5 ~ "Yes",
+        suppressWarnings(as.numeric(HIST_DM_DON)) == 1     ~ "No",
+        HIST_DM_DON == "Y" ~ "Yes",                        # in case the field is Y/N
+        HIST_DM_DON == "N" ~ "No",
+        TRUE ~ NA_character_
+      ),
+      
+      # COD_CAD_DON: 1 Anoxia, 2 Cerebrovascular/Stroke, 3 Head Trauma,
+      # 4 CNS Tumor, 999 Other.
+      DON_COD_LBL = case_when(
+        as.character(COD_DON) == "1"   ~ "Anoxia",
+        as.character(COD_DON) == "2"   ~ "Cerebrovascular/Stroke",
+        as.character(COD_DON) == "3"   ~ "Head trauma",
+        as.character(COD_DON) == "4"   ~ "CNS tumor",
+        as.character(COD_DON) == "999" ~ "Other",
+        !is.na(COD_DON)                ~ "Other",
+        TRUE ~ NA_character_
+      ),
+      # Binary version, matching the reference table's single
+      # "Cause of death: cerebrovascular/stroke" row.
+      DON_COD_CVA_LBL = case_when(
+        is.na(DON_COD_LBL) ~ NA_character_,
+        DON_COD_LBL == "Cerebrovascular/Stroke" ~ "Yes",
+        TRUE ~ "No"
+      ),
+      
+      DON_HCV_LBL = case_when(
+        HCV_DON == "P" ~ "Yes",
+        HCV_DON == "N" ~ "No",
+        TRUE ~ NA_character_          # I / ND / U -> unknown
+      ),
+      
+      DON_DCD_LBL = case_when(
+        DCD_DON == "Y" ~ "Yes",
+        DCD_DON == "N" ~ "No",
+        TRUE ~ NA_character_
+      ),
+      
+      DON_PERFUSION_LBL = case_when(
+        LI_MACHINE_PERFUSION == "Y" ~ "Yes",
+        LI_MACHINE_PERFUSION == "N" ~ "No",
+        TRUE ~ NA_character_
+      ),
+      DON_PERFUSION_TY_LBL = case_when(
+        as.character(LI_MACHINE_PERFUSION_TY) == "1" ~ "Normothermic",
+        as.character(LI_MACHINE_PERFUSION_TY) == "2" ~ "Hypothermic",
+        TRUE ~ NA_character_
+      ),
+      DON_FIBROSIS_STAGE = factor(suppressWarnings(as.numeric(LI_FIBROSIS)), levels = 0:6),
+      
+      DON_FIBROSIS_ANY_LBL = case_when(
+        suppressWarnings(as.numeric(LI_FIBROSIS)) == 0     ~ "No",
+        suppressWarnings(as.numeric(LI_FIBROSIS)) %in% 1:6 ~ "Yes",
+        TRUE ~ NA_character_
+      )
+    )
+}
+
+# --- Step 1: row set and labels -------------------------------------------
+# Built by intersecting a wish-list against what actually resolved in [A], so
+# a donor field absent from this data extract drops out of the table instead
+# of erroring.
+donor_vars_all <- c(
+  "AGE_DON", "DON_SEX_LBL", "HGT_CM_DON", "WGT_KG_DON", "BMI_DON",
+  "DON_RACE_LBL", "DON_HTN_LBL", "DON_DM_LBL", "DON_COD_CVA_LBL", "DON_COD_LBL",
+  "CREAT_DON", "SGOT_DON", "SGPT_DON", "TBILI_DON",
+  "DON_HCV_LBL", "DON_DCD_LBL", "DON_FIBROSIS_ANY_LBL", "DON_FIBROSIS_STAGE",
+  "DON_PERFUSION_LBL", "DON_PERFUSION_TY_LBL"
+)
+
+donor_labels_all <- list(
+  AGE_DON              ~ "Donor age, mean (SD), y",
+  DON_SEX_LBL          ~ "Donor sex, n (%)",
+  HGT_CM_DON           ~ "Height, mean (SD), cm",
+  WGT_KG_DON           ~ "Weight, mean (SD), kg",
+  BMI_DON              ~ "BMI, mean (SD), kg/m2",
+  DON_RACE_LBL         ~ "Race/ethnicity, n (%)",
+  DON_HTN_LBL          ~ "History of hypertension, n (%)",
+  DON_DM_LBL           ~ "History of diabetes, n (%)",
+  DON_COD_CVA_LBL      ~ "Cause of death: cerebrovascular/stroke, n (%)",
+  DON_COD_LBL          ~ "Cause of death, n (%)",
+  CREAT_DON            ~ "Serum creatinine, mean (SD), mg/dL",
+  SGOT_DON             ~ "AST (SGOT), mean (SD), U/L",
+  SGPT_DON             ~ "ALT (SGPT), mean (SD), U/L",
+  TBILI_DON            ~ "Total bilirubin, mean (SD), mg/dL",
+  DON_HCV_LBL          ~ "HCV+ status, n (%)",
+  DON_DCD_LBL          ~ "Donation after circulatory death, n (%)",
+  DON_FIBROSIS_ANY_LBL ~ "Any fibrosis on biopsy, n (%)",
+  DON_FIBROSIS_STAGE   ~ "Fibrosis stage, n (%)",
+  DON_PERFUSION_LBL    ~ "Machine perfusion used, n (%)",
+  DON_PERFUSION_TY_LBL ~ "Perfusion type, n (%)"
+)
+
+# Keep only rows whose underlying source column actually resolved.
+donor_row_requires <- c(
+  AGE_DON = "AGE_DON", DON_SEX_LBL = "GENDER_DON", HGT_CM_DON = "HGT_CM_DON",
+  WGT_KG_DON = "WGT_KG_DON", BMI_DON = "BMI_DON", DON_RACE_LBL = "ETHCAT_DON",
+  DON_HTN_LBL = "HIST_HTN_DON", DON_DM_LBL = "HIST_DM_DON",
+  DON_COD_CVA_LBL = "COD_DON", DON_COD_LBL = "COD_DON", CREAT_DON = "CREAT_DON",
+  SGOT_DON = "SGOT_DON", SGPT_DON = "SGPT_DON", TBILI_DON = "TBILI_DON",
+  DON_HCV_LBL = "HCV_DON", DON_DCD_LBL = "DCD_DON",
+  DON_FIBROSIS_ANY_LBL = "LI_FIBROSIS", DON_FIBROSIS_STAGE = "LI_FIBROSIS", DON_PERFUSION_LBL = "LI_MACHINE_PERFUSION",
+  DON_PERFUSION_TY_LBL = "LI_MACHINE_PERFUSION_TY"
+)
+
+donor_vars <- donor_vars_all[
+  donor_row_requires[donor_vars_all] %in% names(donor_cols_found)
+]
+
+donor_labels <- donor_labels_all[
+  vapply(donor_labels_all, function(f) all.vars(f)[1] %in% donor_vars, logical(1))
+]
+
+message("Donor table rows included: ", paste(donor_vars, collapse = ", "))
+
+# Optional: drop the full cause-of-death breakdown and keep only the binary
+# stroke row, to match the reference table exactly.
+# donor_vars <- setdiff(donor_vars, "DON_COD_LBL")
+# donor_labels <- donor_labels[vapply(donor_labels, function(f) all.vars(f)[1] != "DON_COD_LBL", logical(1))]
+
+# --- Step 2: thin wrapper -------------------------------------------------
+build_donor_table <- function(df_combined, group_col = "REJ_GROUP", caption = NULL) {
+  build_gts_table(
+    df_combined, group_col,
+    caption      = caption,
+    vars         = donor_vars,
+    labels       = donor_labels,
+    prep_fn      = prep_donor_gts_df,
+    cont_test    = "auto",       # t-test for 2 arms, one-way ANOVA for 3+
+    missing_disp = "ifany"       # show how many donors are Unknown per field
+  )
+}
+
+# --- Step 3: one donor table per rejection-group comparison ---------------
+# tbl1_df ... tbl6_df already exist from section 15 and already carry the
+# donor columns via the pat_*_demo_table joins, so no new cohort assembly is
+# needed here.
+
+## Donor Table 1D: Rejection vs Rituxan vs Control (3-arm)
+gts_donor1 <- build_donor_table(
+  tbl1_df,
+  caption = "**Table 1D. Deceased Donor Characteristics: Rejection vs. Rituxan vs. Control**"
+)
+gts_donor1
+
+## Donor Table 2D: Combined vs Steroid (propensity matched)
+gts_donor2 <- build_donor_table(
+  tbl2_df,
+  caption = "**Table 2D. Deceased Donor Characteristics: Combined vs. Steroid (Propensity Matched)**"
+)
+gts_donor2
+
+## Donor Table 3D: Combined vs No Rejection (propensity matched)
+gts_donor3 <- build_donor_table(
+  tbl3_df,
+  caption = "**Table 3D. Deceased Donor Characteristics: Combined vs. No Rejection (Propensity Matched)**"
+)
+gts_donor3
+
+## Donor Table 4D: Combined vs Steroid (unmatched)
+gts_donor4 <- build_donor_table(
+  tbl4_df,
+  caption = "**Table 4D. Deceased Donor Characteristics: Combined vs. Steroid (Unmatched)**"
+)
+gts_donor4
+
+## Donor Table 5D: Combined vs No Rejection (unmatched)
+gts_donor5 <- build_donor_table(
+  tbl5_df,
+  caption = "**Table 5D. Deceased Donor Characteristics: Combined vs. No Rejection (Unmatched)**"
+)
+gts_donor5
+
+## Donor Table 6D: Any Therapy (Steroid + Combined) vs No Rejection (unmatched)
+gts_donor6 <- build_donor_table(
+  tbl6_df,
+  caption = "**Table 6D. Deceased Donor Characteristics: Any Anti-Rejection Therapy vs. No Rejection (Unmatched)**"
+)
+gts_donor6
+
+## Donor Table 7D: all four therapy arms at once (Steroid / Combined / Dual /
+## Control), which is the closest analogue to the 3-column reference table.
+## Built from the SAME first-event arm assignment used by the survival section
+## (assign_arm_at_landmark), not from the section-6 ID vectors, so a patient
+## with both an inpatient and an outpatient record lands in exactly one arm.
+## Requires section 17 to have run.
+if (exists("arm_at_landmark")) {
+  tbl7_df <- pat_all_demo_table %>%
+    inner_join(arm_at_landmark, by = "TRR_ID_CODE") %>%
+    filter(ARM %in% c("Control", "Steroids", "Combined", "Dual Therapy")) %>%
+    mutate(REJ_GROUP = factor(ARM, levels = c("Control", "Steroids", "Combined", "Dual Therapy"))) %>%
+    distinct(TRR_ID_CODE, .keep_all = TRUE)
+  
+  gts_donor7 <- build_donor_table(
+    tbl7_df,
+    caption = "**Table 7D. Deceased Donor Characteristics by Anti-Rejection Therapy Arm**"
+  )
+  print(gts_donor7)
+  
+  # Matching recipient-side table on the same four arms, for symmetry.
+  gts_recipient7 <- build_gts_table(
+    tbl7_df, "REJ_GROUP", cont_test = "auto",
+    caption = "**Table 7. Recipient Characteristics by Anti-Rejection Therapy Arm**"
+  )
+  print(gts_recipient7)
+}
+
+# --- Step 4: export -------------------------------------------------------
+# gtsummary tables render in the Viewer/knit output; use one of these to save.
+# library(flextable); library(officer)
+# read_docx() |>
+#   body_add_flextable(as_flex_table(gts_donor1)) |>
+#   body_add_break() |>
+#   body_add_flextable(as_flex_table(gts_donor2)) |>
+#   print(target = "donor_tables.docx")
+#
+# gt::gtsave(as_gt(gts_donor1), "table1D.html")
+
+# NOTES / things to check before trusting this output:
+# 1. These arms were propensity-matched on RECIPIENT covariates only. Donor
+#    characteristics were never balanced, so a significant donor-side p-value
+#    in Table 2D/3D is a real finding about residual confounding, not a
+#    matching failure. That is arguably the most useful thing these tables do:
+#    if donor age or DCD status differs between matched arms, it belongs in
+#    the adjusted models.
+# 2. Continuous donor labs (AST, ALT, bilirubin, creatinine) are heavily
+#    right-skewed. Mean (SD) with ANOVA is what the reference table format
+#    asks for, but consider cont_test = "kruskal.test" and
+#    statistic = "{median} ({p25}, {p75})" for those rows specifically.
+
+#===============================================================================
+# 17b. Timing of first anti-rejection treatment within the landmark window
+#-------------------------------------------------------------------------------
+# Depends on: pat_rej_first (17 Step 1), arm_at_landmark (17 Step 2),
+#             LANDMARK_DAY, INPATIENT_RX_DAY.
+#
+# READ BEFORE INTERPRETING:
+#  1. Control has no bars -- it is defined by the ABSENCE of treatment before
+#     the landmark. The empty panel is intentional.
+#  2. The day-0 bar is imputed, not observed (INPATIENT_RX_DAY). Fill colour
+#     separates it from genuinely dated outpatient events.
+#  3. Outpatient x-values are FOL_DATE_DAYS_DELTA, the date of the VISIT at
+#     which the drug was recorded -- an upper bound on the true treatment day.
+#     Peaks at ~180 and ~365 days reflect the visit schedule.
+#===============================================================================
+
+# TRUE  -> Rituxan monotherapy becomes its own mutually exclusive arm, and
+#          "Combined" means Simulect/Thymoglobulin only (bars are disjoint).
+# FALSE -> "Combined" keeps its original membership and Rituxan is plotted
+#          additionally as an overlapping subset (bars then double-count).
+RITUXAN_AS_OWN_ARM <- FALSE
+
+TIMING_BINWIDTH <- 14   # days per bin
+
+tx_timing_base <- pat_rej_first %>%
+  filter(!is.na(REJ_TX_DAY), REJ_TX_DAY >= 0, REJ_TX_DAY < LANDMARK_DAY) %>%
+  left_join(arm_at_landmark, by = "TRR_ID_CODE") %>%
+  filter(!is.na(ARM)) %>%
+  mutate(
+    # NA-safe: a bare `RITUXAN_ANTIREJ == 1` propagates NA into the logical
+    # and silently sends those patients to the case_when() fallback.
+    RITUX_MONO = NUM_ANTI_REJ_RXED < 2 &
+      !is.na(RITUXAN_ANTIREJ) & RITUXAN_ANTIREJ == 1,
+    SRC_LBL = if_else(source == 1L,
+                      "Index admission (day imputed to 0)",
+                      "Outpatient follow-up visit")
+  )
+
+tx_timing <- if (RITUXAN_AS_OWN_ARM) {
+  tx_timing_base %>%
+    mutate(TIMING_ARM = case_when(
+      ARM == "Combined" &  RITUX_MONO ~ "Rituxan only",
+      ARM == "Combined" & !RITUX_MONO ~ "Combined (non-Rituxan)",
+      TRUE                            ~ as.character(ARM)
+    ))
+} else {
+  bind_rows(
+    tx_timing_base %>% mutate(TIMING_ARM = as.character(ARM)),
+    tx_timing_base %>% filter(RITUX_MONO) %>%
+      mutate(TIMING_ARM = "Rituxan only (subset of Combined)")
+  )
+}
+
+# Level order fixed here, with Control last and ALWAYS present so facet_wrap
+# (drop = FALSE) renders its empty panel.
+timing_levels <- intersect(
+  c("Steroids", "Combined (non-Rituxan)", "Combined", "Rituxan only",
+    "Rituxan only (subset of Combined)", "Dual Therapy", "Other Rejection"),
+  unique(tx_timing$TIMING_ARM)
+)
+timing_levels <- c(timing_levels, "Control")
+
+tx_timing <- tx_timing %>%
+  mutate(TIMING_ARM = factor(TIMING_ARM, levels = timing_levels))
+
+# --- Per-arm N annotations -----------------------------------------------
+# Control's N comes from arm_at_landmark (patients assigned to it), not from
+# tx_timing (which has no Control rows at all).
+n_control <- sum(arm_at_landmark$ARM == "Control")
+
+timing_n <- tx_timing %>%
+  count(TIMING_ARM, .drop = FALSE, name = "n_treated") %>%
+  mutate(
+    lbl = if_else(
+      TIMING_ARM == "Control",
+      paste0("n = ", n_control, " assigned\n0 treated (arm definition)"),
+      paste0("n = ", n_treated, " treated")
+    )
+  )
+
+# --- Plot A: faceted histogram, split by timing source --------------------
+# scales = "free_y" because Steroids typically dwarfs the other arms; counts
+# are therefore NOT comparable across panels by bar height. Use Plot B or C
+# for cross-arm comparison.
+p_timing_facet <- ggplot(tx_timing, aes(x = REJ_TX_DAY, fill = SRC_LBL)) +
+  geom_histogram(binwidth = TIMING_BINWIDTH, boundary = 0,
+                 colour = "white", linewidth = 0.2) +
+  geom_text(data = timing_n, aes(x = Inf, y = Inf, label = lbl),
+            inherit.aes = FALSE, hjust = 1.05, vjust = 1.3, size = 3) +
+  facet_wrap(~ TIMING_ARM, ncol = 2, drop = FALSE, scales = "free_y") +
+  scale_x_continuous(breaks = seq(0, LANDMARK_DAY, by = 60),
+                     limits = c(0, LANDMARK_DAY),
+                     expand = expansion(mult = c(0, 0.02))) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  scale_fill_manual(values = c("Index admission (day imputed to 0)" = "grey60",
+                               "Outpatient follow-up visit" = "steelblue")) +
+  labs(
+    title = "Timing of First Anti-Rejection Therapy, by Arm",
+    subtitle = paste0("First post-transplant year (landmark day ",
+                      round(LANDMARK_DAY), "); ", TIMING_BINWIDTH, "-day bins"),
+    x = "Days since transplant", y = "Patients", fill = "Timing source",
+    caption = "Y axes are independent per panel. Day-0 bar is imputed, not observed."
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom",
+        strip.text = element_text(face = "bold"))
+
+print(p_timing_facet)
+
+# --- Plot B: overlaid distributions, day 0 dropped ------------------------
+# Density rather than counts so arms of very different size are comparable.
+# Excluding day 0 removes the imputed point mass that would otherwise dominate
+# every curve identically.
+tx_timing_dated <- tx_timing %>% filter(REJ_TX_DAY > 0)
+
+p_timing_overlay <- ggplot(tx_timing_dated,
+                           aes(x = REJ_TX_DAY, colour = TIMING_ARM)) +
+  geom_freqpoly(aes(y = after_stat(density)),
+                binwidth = TIMING_BINWIDTH, boundary = 0, linewidth = 0.8) +
+  scale_x_continuous(breaks = seq(0, LANDMARK_DAY, by = 60),
+                     limits = c(0, LANDMARK_DAY)) +
+  scale_colour_brewer(palette = "Dark2", drop = TRUE) +
+  labs(
+    title = "First Anti-Rejection Therapy: Distribution of Treatment Day",
+    subtitle = "Index-admission (day-0 imputed) events excluded; density-scaled for cross-arm comparison",
+    x = "Days since transplant", y = "Density", colour = "Arm"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+print(p_timing_overlay)
+
+# --- Plot C: cumulative proportion treated --------------------------------
+# The estimate least sensitive to bin width AND to visit-date clustering: a
+# step at day 180 in a histogram is ambiguous, but the ECDF still reads
+# correctly as "x% of this arm had been treated by day 180."
+p_timing_ecdf <- ggplot(tx_timing, aes(x = REJ_TX_DAY, colour = TIMING_ARM)) +
+  stat_ecdf(geom = "step", linewidth = 0.8, na.rm = TRUE) +
+  scale_x_continuous(breaks = seq(0, LANDMARK_DAY, by = 60),
+                     limits = c(0, LANDMARK_DAY)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     limits = c(0, 1)) +
+  scale_colour_brewer(palette = "Dark2", drop = TRUE) +
+  labs(
+    title = "Cumulative Proportion of Each Treated Arm Already Treated, by Day",
+    subtitle = "Denominator is the arm's treated patients, not the full cohort",
+    x = "Days since transplant", y = "Cumulative % of arm treated", colour = "Arm"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+print(p_timing_ecdf)
+
+# --- Summary table --------------------------------------------------------
+# Median/IQR computed on DATED events only; including the imputed zeros would
+# drag the median toward 0 by an amount that depends entirely on what fraction
+# of the arm was treated inpatient.
+timing_summary <- tx_timing %>%
+  group_by(TIMING_ARM, .drop = FALSE) %>%
+  summarise(
+    n_treated   = n(),
+    n_inpatient = sum(source == 1L, na.rm = TRUE),
+    n_dated     = sum(REJ_TX_DAY > 0, na.rm = TRUE),
+    median_day  = median(REJ_TX_DAY[REJ_TX_DAY > 0], na.rm = TRUE),
+    q1_day      = quantile(REJ_TX_DAY[REJ_TX_DAY > 0], 0.25, na.rm = TRUE),
+    q3_day      = quantile(REJ_TX_DAY[REJ_TX_DAY > 0], 0.75, na.rm = TRUE),
+    pct_by_30   = 100 * mean(REJ_TX_DAY <= 30,  na.rm = TRUE),
+    pct_by_90   = 100 * mean(REJ_TX_DAY <= 90,  na.rm = TRUE),
+    pct_by_180  = 100 * mean(REJ_TX_DAY <= 180, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), ~ if_else(is.nan(.x), NA_real_, .x)))
+
+timing_summary %>%
+  mutate(
+    `Median (IQR), d` = if_else(
+      is.na(median_day), NA_character_,
+      sprintf("%.0f (%.0f\u2013%.0f)", median_day, q1_day, q3_day)
+    )
+  ) %>%
+  select(TIMING_ARM, n_treated, n_inpatient, n_dated,
+         `Median (IQR), d`, pct_by_30, pct_by_90, pct_by_180) %>%
+  gt() %>%
+  fmt_number(columns = c(pct_by_30, pct_by_90, pct_by_180), decimals = 1) %>%
+  sub_missing(missing_text = "\u2014") %>%
+  cols_label(
+    TIMING_ARM  = "Arm",
+    n_treated   = "N treated",
+    n_inpatient = "N index admission",
+    n_dated     = "N with observed date",
+    pct_by_30   = "% by d30",
+    pct_by_90   = "% by d90",
+    pct_by_180  = "% by d180"
+  ) %>%
+  tab_header(
+    title = "Timing of First Anti-Rejection Therapy Within the Landmark Window",
+    subtitle = paste0("Landmark day ", round(LANDMARK_DAY), " post-transplant")
+  ) %>%
+  tab_options(table.font.size = 13, data_row.padding = px(4),
+              column_labels.font.weight = "bold") %>%
+  tab_source_note("Control is treated-by-definition-never and so has no timing row content; its N appears in the faceted figure. Median and IQR use only events with an observed follow-up date -- index-admission therapy is recorded without a date and is imputed to day 0 (INPATIENT_RX_DAY), so including it would bias the median downward in proportion to each arm's inpatient share. The cumulative percentages DO include the imputed day-0 events, and are therefore upper bounds on how early each arm was treated.")
+
