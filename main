@@ -1,5 +1,4223 @@
 #===============================================================================
 # UNOS Liver Transplant Anti-Rejection Therapy Analysis
+# LANDMARK = 90 DAYS POST-TRANSPLANT
+#
+# Parses UNOS liver transplant patients into rejection-therapy groups
+# (no rejection / steroid monotherapy / combined therapy / dual therapy),
+# builds baseline recipient and donor tables, propensity-score-matches
+# treatment arms, and runs landmark + time-varying survival and year-2
+# outcome analyses.
+#
+# TO DO:
+# 3.) "Survival curve" based on graft failure
+# 4.) adjust at risk charts in kaplan meier so that the number at risk day 0 is
+#     not cut off by axis
+#
+#-------------------------------------------------------------------------------
+# WHAT CHANGED IN THIS VERSION, AND WHY
+#
+# The exposure landmark moved from 365.25 days to 90 days. That is a one-line
+# change to a constant, but it is NOT a one-line change to the analysis,
+# because several parts of the previous script defined treatment arms from
+# year-long ID vectors that had no notion of a landmark at all. Left alone,
+# the script would have carried two mutually inconsistent definitions of
+# "Steroid group" -- one at day 90 (survival) and one over the full year
+# (year-2 outcomes, demographic tables) -- and silently reported both.
+#
+# Structural changes made to prevent that:
+#
+#   1. ALL analysis parameters were hoisted into section 0b. Nothing
+#      downstream hard-codes 365.25, 730.5, or 90 any more.
+#
+#   2. The landmark arm assignment (pat_rej_first + assign_arm_at_landmark)
+#      moved UP, from the survival section to section 7, so that every
+#      downstream section -- demographic tables, propensity matching,
+#      survival, year-2 outcomes -- draws its arms from the same object.
+#
+#   3. The Control definition changed. See section 7; this is the one edit
+#      that moves numbers rather than tidying them.
+#
+#   4. The year-2 outcome sections now take their arms from the landmark
+#      assignment instead of the section-6 full-year ID vectors. The grouping
+#      column was renamed FIRST_YEAR_GROUP -> EXPOSURE_GROUP, because at a
+#      90-day landmark it is no longer a first-year group and leaving the old
+#      name invites exactly the wrong sentence in a manuscript.
+#
+#   5. The appended add-on blocks (donor tables, timing histograms) were
+#      folded into the main flow in dependency order rather than left at the
+#      end as replacement patches.
+#
+# READ BEFORE INTERPRETING ANYTHING BELOW: the exposure window is now
+# [0, 90) days, the year-2 outcome window is still day 365-730, and the
+# interval between them (day 90-365) is a GAP in which anti-rejection therapy
+# is neither exposure nor outcome. Section 7 quantifies how many nominal
+# Controls were treated in that gap. That number is the main threat to this
+# design and belongs in the limitations paragraph.
+#===============================================================================
+
+
+#===============================================================================
+# 0. Libraries
+#===============================================================================
+required_pkgs <- c(
+  "ggplot2", "haven", "tidyr", "dplyr", "knitr", "kableExtra", "stringr",
+  "lubridate", "gt", "tibble", "survminer", "survival", "scales",
+  "MatchIt", "cobalt", "gtsummary"
+)
+
+invisible(lapply(required_pkgs, function(pkg) {
+  if (!requireNamespace(pkg, quietly = TRUE)) install.packages(pkg)
+  library(pkg, character.only = TRUE)
+}))
+
+
+#===============================================================================
+# 0b. Analysis parameters  -- THE ONLY PLACE THESE ARE SET
+#-------------------------------------------------------------------------------
+# Everything downstream derives from this block. If a number below needs to
+# change, change it here and nowhere else; the previous version of this script
+# hard-coded 365.25 in five separate places, which is how the landmark and the
+# year-2 eligibility rule drifted apart.
+#===============================================================================
+
+# --- Exposure ---
+# Anti-rejection therapy given in [0, LANDMARK_DAY) defines the arm.
+LANDMARK_DAY <- 90
+
+# --- Outcome window (unchanged: "analyze outcomes after 1 year") ---
+YR2_START        <- 365.25   # outcome window opens
+YR2_END          <- 730.5    # outcome window closes
+YR2_ELIGIBLE_DAY <- 365.25   # must still be under observation here to have an outcome
+
+# The dead zone between exposure and outcome. Non-empty only when the landmark
+# is earlier than the outcome window, i.e. exactly the situation created by
+# moving to 90 days.
+GAP_START <- LANDMARK_DAY
+GAP_END   <- YR2_START
+HAS_GAP   <- GAP_END > GAP_START
+
+# --- Survival horizons, measured FROM THE LANDMARK ---
+# At LANDMARK_DAY = 90 these cover post-transplant days 90-455 and 90-820,
+# NOT "years 1-2" and "years 1-3" as they did at the 365-day landmark. The
+# axis labels and table captions below are built from the constants so they
+# cannot go stale.
+LM_HORIZON_SHORT <- 365.25
+LM_HORIZON_LONG  <- 730.5
+
+# --- Time-varying model horizon, measured from TRANSPLANT ---
+TV_HORIZON <- YR2_END
+
+# --- Discharge-anchored design (section 21b) ---
+# Measured FROM DISCHARGE, not from transplant. Used only by the
+# discharge-anchored analysis, which is the design that actually matches an
+# exposure known entirely at discharge. See section 21b.
+DC_HORIZON_SHORT <- 365.25
+DC_HORIZON_LONG  <- 730.5
+
+# --- Index-admission treatment timing ---
+# The UNOS discharge file records THAT anti-rejection therapy was given during
+# the index admission, not WHEN. Day 0 assigns those patients no immortal time
+# at all; a positive value would credit them unexposed person-time they may
+# not have had. Sensitivity: try DAYS_HOSP_SP_TX / 2.
+#
+# This matters MORE at a 90-day landmark than it did at 365, because the
+# index admission is now a large fraction of the exposure window rather than a
+# small one.
+INPATIENT_RX_DAY <- 0
+
+# --- Control definition ---
+# How a patient qualifies as "observed during the exposure window", and so as
+# an eligible Control.
+#
+#   "interval"  (default, correct for UNOS) -- any index-admission record OR any
+#               follow-up form. UNOS follow-up forms report on the INTERVAL
+#               since the previous form (or since transplant), which is why
+#               TRTREJ6M / TRTREJ1Y exist as interval flags. A patient whose
+#               first form is at 6 months HAS been assessed for days 0-90; the
+#               assessment is simply recorded later. Excludes only patients
+#               with no records at all, which is the real "no data" group.
+#   "strict"    -- requires a form DATED before the landmark. Wrong for UNOS:
+#               routine follow-up is at 6 months and 1 year, so this discards
+#               most of the cohort and collapses the Control arm (which in turn
+#               takes every demographic table down with it). Kept only to
+#               reproduce that run.
+#   "any_year1" -- the original behaviour: any year-1 follow-up form. Differs
+#               from "interval" only by excluding patients who have a discharge
+#               record but never a follow-up form.
+ASSESSMENT_RULE <- "interval"   # "interval" | "strict" | "any_year1"
+
+# --- Which arm definition feeds which section ---
+# Both default TRUE so the whole script speaks with one voice. Setting either
+# to FALSE reverts that part to the legacy full-year ID vectors, which is
+# useful only for reproducing the previous run.
+DEMO_TABLES_USE_LANDMARK_ARMS <- TRUE
+USE_LANDMARK_ARMS_FOR_YR2     <- TRUE
+
+# Include Dual Therapy as a fourth level in the year-2 models. At a 90-day
+# landmark the Dual arm grows substantially, because index-admission
+# steroid + ATG/Thymoglobulin combinations now fall inside the exposure
+# window. Section 7 prints its N -- check it before leaving this FALSE.
+YR2_INCLUDE_DUAL <- FALSE
+
+# --- Rituxan handling in the timing figures ---
+# TRUE  -> Rituxan monotherapy becomes its own mutually exclusive arm and
+#          "Combined" means Simulect/Thymoglobulin only (bars are disjoint).
+# FALSE -> "Combined" keeps its membership; Rituxan is plotted additionally as
+#          an overlapping subset (bars double-count).
+# In this cohort the Rituxan-monotherapy sub-arm is n = 5, which cannot support
+# its own panel or comparison, so FALSE (fold back into Combined) is correct
+# here. Check the "Rituxan at landmark" message in section 7 before flipping it.
+RITUXAN_AS_OWN_ARM <- FALSE
+
+# --- Follow-up window used to build the year-1 rejection cohort ---
+YEAR1_DAYS <- 365.24219
+
+# --- Derived display constants ---
+LM_LABEL       <- paste0("day ", round(LANDMARK_DAY), " post-transplant")
+EXPOSURE_LABEL <- paste0("first ", round(LANDMARK_DAY), " days post-transplant")
+LM_SHORT_END   <- LANDMARK_DAY + LM_HORIZON_SHORT
+LM_LONG_END    <- LANDMARK_DAY + LM_HORIZON_LONG
+
+# Bin widths scale with the landmark: 14-day bins across 90 days would give
+# six bars.
+TIMING_BINWIDTH <- if (LANDMARK_DAY <= 120) 7 else 14
+TIMING_BREAK_BY <- if (LANDMARK_DAY <= 120) 15 else 60
+
+# --- Parameter validation ---
+# These are all failure modes that otherwise surface hundreds of lines later as
+# a cryptic error in an unrelated function.
+if (LANDMARK_DAY <= INPATIENT_RX_DAY) {
+  stop("LANDMARK_DAY (", LANDMARK_DAY, ") must be GREATER than INPATIENT_RX_DAY (",
+       INPATIENT_RX_DAY, ").\n",
+       "  The exposure filter is `REJ_TX_DAY < LANDMARK_DAY`, and index-admission therapy is\n",
+       "  imputed to day ", INPATIENT_RX_DAY, ". A landmark at or below that value excludes every\n",
+       "  treated patient, collapses all arms into Control, and the first Cox model fails with\n",
+       "  \"'ref' must be an existing level\".\n",
+       "  In this cohort ALL exposure events occur on the imputed day, so any LANDMARK_DAY > ",
+       INPATIENT_RX_DAY, "\n",
+       "  yields IDENTICAL arms -- 1, 30, 90 and 365 are interchangeable for arm membership.\n",
+       "  If the intent was to have no landmark at all, use the discharge-anchored design in\n",
+       "  section 21b rather than setting LANDMARK_DAY to 0.")
+}
+if (LM_HORIZON_SHORT <= 0 || LM_HORIZON_LONG <= 0) {
+  stop("LM_HORIZON_SHORT and LM_HORIZON_LONG must both be > 0; a zero-length horizon censors ",
+       "every patient at t = 0 and yields an empty survival fit.")
+}
+if (DC_HORIZON_SHORT <= 0 || DC_HORIZON_LONG <= 0) {
+  stop("DC_HORIZON_SHORT and DC_HORIZON_LONG must both be > 0.")
+}
+if (YR2_END <= YR2_START) {
+  stop("YR2_END (", YR2_END, ") must exceed YR2_START (", YR2_START, ").")
+}
+if (YR2_START < LANDMARK_DAY) {
+  stop("YR2_START (", YR2_START, ") is BEFORE the landmark (", LANDMARK_DAY, ").\n",
+       "  The outcome window would then overlap the exposure window, so the same treatment\n",
+       "  episode could be counted as both exposure and outcome for one patient.")
+}
+if (YR2_ELIGIBLE_DAY < LANDMARK_DAY) {
+  stop("YR2_ELIGIBLE_DAY (", YR2_ELIGIBLE_DAY, ") is before the landmark (", LANDMARK_DAY, ").")
+}
+
+message("\n=== Analysis parameters ===")
+message("  Exposure window : [0, ", LANDMARK_DAY, ") days post-transplant")
+message("  Gap window      : ", if (HAS_GAP) paste0("[", GAP_START, ", ", GAP_END, ") days") else "none",
+        "  <- neither exposure nor outcome")
+message("  Outcome window  : (", YR2_START, ", ", YR2_END, "] days post-transplant")
+message("  Survival window : landmark to day ", round(LM_LONG_END), " post-transplant")
+
+
+#===============================================================================
+# 1. Reading data
+#===============================================================================
+# Mac paths (active)
+df_immuno_fol_read <- read.csv("~/Local Documents/AOT/Analysis/FilteredData/liver_immuno_followup.csv", stringsAsFactors = FALSE, na.strings = c("", " ", "NA", "."))
+df_liver_data      <- read.csv("~/Local Documents/AOT/Analysis/FilteredData/liver_data.csv", stringsAsFactors = FALSE, na.strings = c("", " ", "NA", "."))
+df_immuno_induc    <- read.csv("~/Local Documents/AOT/Analysis/FilteredData/liver-immuno-discharge_unfilter.csv", stringsAsFactors = FALSE, na.strings = c("", " ", "NA", "."))
+df_hla             <- read.csv("~/Local Documents/AOT/Analysis/FilteredData/liver_addtl_hla.csv", stringsAsFactors = FALSE, na.strings = c("", " ", "NA", "."))
+df_pra             <- read.csv("~/Local Documents/AOT/Analysis/FilteredData/liver_pra_crossmatch_data.csv", stringsAsFactors = FALSE, na.strings = c("", " ", "NA", "."))
+df_deceased_don    <- read.csv("~/Local Documents/AOT/Analysis/FilteredData/deceased_donor_data.csv", stringsAsFactors = FALSE, na.strings = c("", " ", "NA", "."))
+df_liver_fol       <- read.csv("~/Local Documents/AOT/Analysis/FilteredData/liver_followup_data.csv", stringsAsFactors = FALSE, na.strings = c("", " ", "NA", "."))
+# TODO: living donor data still needs to be loaded
+
+# Windows paths (kept for reference; swap the block above for this one on Windows)
+# df_immuno_fol_read <- read.csv("C:/Users/lukas/Documents/Med School/AOT/R/Output/Filtered Data by Date/liver-immuno-follow-up_date-filtered.csv", stringsAsFactors = FALSE)
+# df_liver_data      <- read.csv("C:/Users/lukas/Documents/Med School/AOT/R/Output/Filtered Data by Date/liver-data_date-filtered.csv", stringsAsFactors = FALSE)
+# df_immuno_induc    <- read.csv("C:/Users/lukas/Documents/Med School/AOT/R/Output/Filtered Data by Date/liver-immuno-discharge_unfilter.csv")
+
+
+#===============================================================================
+# 2. Drug column definitions and numeric coercion
+#===============================================================================
+# Defined up front so the 0/1 indicator columns can be coerced to numeric
+# immediately after reading. If any of these columns come in as character (a
+# stray "Y"/"N", a quoted "1", a blank-padded field), `rowSums(across(...) ==
+# 1)` silently evaluates to 0 for that whole column and the drug looks like it
+# was never prescribed. Coercing once, at the source, avoids that failure mode
+# everywhere downstream.
+#
+# GENERICMMF, GENERICTACROLIMUS, ASTAGRAFXL, NULOJIX are maintenance-only drugs
+# and are intentionally excluded from this list.
+RX_COLS <- c(
+  "ALG", "CYCLOSPORIN", "OKT4", "CYTOXAN", "METHOTREXATE", "BREQUINARSODIUM",
+  "MIZORIBINE", "ATGAM", "NRATGNRATS", "OKT3", "XOMAZYMECD5", "DAB486IL2",
+  "ANTILFA1", "ANTIICAM1", "IL1RECEPTORANTAGONIST", "ANTIIL6", "ANTITNF",
+  "SOLUBLEIL1RECEPTOR", "ALDESLEUKIN", "T10B9", "SANDIMMUNE",
+  "DEOXYSPERGUALIN", "NEORAL", "SANGCYA", "THYMOGLOBULIN", "ZENAPAX",
+  "SIMULECT", "GENGRAF", "ZORTRESS", "EON", "MYFORTIC", "GENERICCYCLOSPORIN",
+  "STEROIDS", "PROGRAF", "CAMPATH", "FTY720", "RITUXAN", "GENERICMYFORTIC",
+  "GENERICSIROLIMUS", "ENVARSUSXR", "RAPAMUNE", "LEFLUNOMIDE", "IMURAN",
+  "CELLCEPT"
+) # does not capture the "other drug" column
+
+COL_TAIL <- "_ANTIREJ" # change based on whether this is induction, maintenance, or anti-rejection
+
+COLS_TO_CHECK <- paste0(RX_COLS, COL_TAIL)
+
+# any_of() so a missing column is skipped rather than erroring
+coerce_rx_numeric <- function(df) {
+  df %>% mutate(across(any_of(COLS_TO_CHECK), ~ suppressWarnings(as.numeric(.x))))
+}
+
+df_immuno_fol_read <- coerce_rx_numeric(df_immuno_fol_read)
+df_immuno_induc    <- coerce_rx_numeric(df_immuno_induc)
+
+# Report any drug column that is entirely NA after coercion -- a fast way to
+# catch a source-encoding change (e.g. a column switching from 0/1 to Y/N).
+rx_all_na <- names(which(sapply(
+  intersect(COLS_TO_CHECK, names(df_immuno_fol_read)),
+  function(cn) all(is.na(df_immuno_fol_read[[cn]]))
+)))
+if (length(rx_all_na)) {
+  message("Drug columns entirely NA after numeric coercion (check source encoding): ",
+          paste(rx_all_na, collapse = ", "))
+}
+
+# Numeric coercion for the continuous recipient variables used in medians,
+# matching, and Cox/logistic models.
+df_liver_data <- df_liver_data %>%
+  mutate(across(any_of(c("AGE", "MELD_PELD_LAB_SCORE", "COLD_ISCH", "PTIME",
+                         "BMI_CALC", "BMI_TCR", "HGT_CM_CALC", "WGT_KG_CALC")),
+                ~ suppressWarnings(as.numeric(.x))))
+
+# Small utility used in several recode steps: guarantee a set of columns
+# exists (as NA) so a downstream mutate() referencing them cannot error when a
+# particular data extract is missing one.
+ensure_cols <- function(df, cols) {
+  miss <- setdiff(cols, names(df))
+  if (length(miss)) df[miss] <- NA
+  df
+}
+
+
+#===============================================================================
+# 3. Cohort filters
+#===============================================================================
+# --- Filter 1: recipient age ---
+col_age_range <- "AGE"
+age_min <- 18
+age_max <- 80
+
+df_liver_data$AGE <- as.numeric(df_liver_data$AGE)
+
+df_liver_data_filtered <- df_liver_data %>%
+  filter(.data[[col_age_range]] >= age_min & .data[[col_age_range]] <= age_max)
+
+# --- Filter 2: transplant date window (03APR2015 - 03APR2025) ---
+FILTER_DATE_COL_FOL <- "PX_STAT_DATE_FOL" # follow-up date column
+FILTER_DATE_COL_TX  <- "TX_DATE"
+
+tx_start_date <- "2015-04-03"
+tx_end_date   <- "2025-04-03"
+
+df_liver_data_filtered <- df_liver_data_filtered %>%
+  filter(.data[[FILTER_DATE_COL_TX]] >= tx_start_date & .data[[FILTER_DATE_COL_TX]] <= tx_end_date)
+
+# Prefer BMI at transplant, fall back to the listing value, then derive from
+# height/weight. Kept as base assignment rather than mutate() so the "which
+# spelling exists" branch is explicit rather than buried in tidy-eval.
+bmi_src <- intersect(c("BMI_CALC", "BMI_TCR"), names(df_liver_data_filtered))
+
+df_liver_data_filtered$BMI_REC <- if (length(bmi_src)) {
+  suppressWarnings(as.numeric(df_liver_data_filtered[[bmi_src[1]]]))
+} else NA_real_
+
+if (all(c("HGT_CM_CALC", "WGT_KG_CALC") %in% names(df_liver_data_filtered))) {
+  h <- suppressWarnings(as.numeric(df_liver_data_filtered$HGT_CM_CALC))
+  w <- suppressWarnings(as.numeric(df_liver_data_filtered$WGT_KG_CALC))
+  df_liver_data_filtered$BMI_REC <- coalesce(df_liver_data_filtered$BMI_REC, w / (h / 100)^2)
+}
+
+# A recorded height of 0 yields Inf rather than NA, which would propagate
+# silently into the mean. Range-gate the obviously impossible values.
+df_liver_data_filtered$BMI_REC[
+  !is.finite(df_liver_data_filtered$BMI_REC) |
+    df_liver_data_filtered$BMI_REC < 10 |
+    df_liver_data_filtered$BMI_REC > 80
+] <- NA_real_
+
+message("Recipient BMI source: ", if (length(bmi_src)) bmi_src[1] else "derived from height/weight only",
+        " | missing: ", sum(is.na(df_liver_data_filtered$BMI_REC)),
+        " of ", nrow(df_liver_data_filtered))
+
+# --- Apply the resulting ID list to every other table ---
+tx_ids_to_keep  <- df_liver_data_filtered$TRR_ID_CODE
+dnr_ids_to_keep <- df_liver_data_filtered$DONOR_ID
+
+df_immuno_induc     <- df_immuno_induc    %>% filter(TRR_ID_CODE %in% tx_ids_to_keep)
+df_liver_fol_fil    <- df_liver_fol       %>% filter(TRR_ID_CODE %in% tx_ids_to_keep)
+df_immuno_fol       <- df_immuno_fol_read %>% filter(TRR_ID_CODE %in% tx_ids_to_keep)
+df_deceased_don_fil <- df_deceased_don    %>% filter(DONOR_ID %in% dnr_ids_to_keep)
+df_hla_fil          <- df_hla             %>% filter(TRR_ID_CODE %in% tx_ids_to_keep)
+df_pra_fil          <- df_pra             %>% filter(TRR_ID_CODE %in% tx_ids_to_keep)
+# TODO: living donor data still needs to be loaded/filtered
+
+
+#===============================================================================
+# 4. Follow-up window and rejection-therapy running counts
+#-------------------------------------------------------------------------------
+# NOTE ON THE WINDOW: this section still assembles the FULL first post-
+# transplant year of follow-up, not just the first 90 days. That is
+# deliberate. The year-1 frame is needed to (a) identify who was treated in
+# the gap between the landmark and the outcome window, which section 7 reports
+# as the main threat to this design, and (b) keep the legacy comparison arms
+# available. The 90-day restriction is applied where the arms are assigned,
+# not here.
+#===============================================================================
+# Merge in TX_DATE / rejection flags, then drop any follow-up row whose
+# transplant fell outside the date-filtered cohort.
+#
+# Dropping any pre-existing TX_DATE/DISCHARGE_DATE/etc. from df_immuno_fol
+# before the join (any_of() = no-op if they aren't present) avoids the
+# TX_DATE.x/TX_DATE.y column-name-collision problem handled below for
+# df_immuno_induc, in case the follow-up file ever carries its own copies.
+df_immuno_fol <- df_immuno_fol %>%
+  select(-any_of(c("TX_DATE", "DISCHARGE_DATE", "TRTREJ6M", "TRTREJ1Y"))) %>%
+  left_join(df_liver_data_filtered %>%
+              select(TRR_ID_CODE, TX_DATE, DISCHARGE_DATE, TRTREJ6M, TRTREJ1Y),
+            by = "TRR_ID_CODE") %>%
+  filter(!is.na(TX_DATE))
+
+df_immuno_fol <- df_immuno_fol %>%
+  mutate(
+    PX_STAT_DATE_FOL = as.Date(PX_STAT_DATE_FOL),
+    TX_DATE = as.Date(TX_DATE)
+  ) %>%
+  mutate(FOL_DATE_DAYS_DELTA = time_length(interval(TX_DATE, PX_STAT_DATE_FOL), "days")) %>%
+  filter(FOL_DATE_DAYS_DELTA >= 0 & FOL_DATE_DAYS_DELTA < YEAR1_DAYS) %>%
+  arrange(PX_STAT_DATE_FOL)
+
+# Running count of rejection-therapy follow-up events per patient, plus a
+# count of how many distinct drugs were given at each visit.
+df_immuno_fol <- df_immuno_fol %>%
+  group_by(TRR_ID_CODE) %>%
+  mutate(REJECT_RUNNING_COUNT = cumsum(if_any(all_of(COLS_TO_CHECK), ~ !is.na(.) & . == 1))) %>%
+  ungroup() %>%
+  mutate(NUM_ANTI_REJ_RXED = rowSums(across(all_of(COLS_TO_CHECK)) == 1, na.rm = TRUE))
+
+# Cache so downstream sections don't have to recompute this.
+df_immuno_fol_calc <- df_immuno_fol
+
+# Per-drug frequency of use, overall and within the exposure / 6-month /
+# 1-year windows. The exposure-window column is new and is the one that
+# matters now: it shows which drugs actually define the arms at a 90-day
+# landmark, as opposed to which drugs appear anywhere in year 1.
+freq_drug_fol_antirej_indiv <- data.frame(
+  drug_name    = str_remove(COLS_TO_CHECK, COL_TAIL),
+  drug_count   = sapply(df_immuno_fol[COLS_TO_CHECK], function(x) sum(x == 1, na.rm = TRUE)),
+  rej_lm_count = sapply(COLS_TO_CHECK, function(col) {
+    sum(df_immuno_fol[[col]] == 1 & df_immuno_fol$FOL_DATE_DAYS_DELTA < LANDMARK_DAY, na.rm = TRUE)
+  }),
+  rej6m_count  = sapply(COLS_TO_CHECK, function(col) {
+    sum(df_immuno_fol[[col]] == 1 & df_immuno_fol$FOL_DATE_DAYS_DELTA <= 182.62110, na.rm = TRUE)
+  }),
+  rej1y_count  = sapply(COLS_TO_CHECK, function(col) {
+    sum(df_immuno_fol[[col]] == 1 & df_immuno_fol$FOL_DATE_DAYS_DELTA <= YEAR1_DAYS, na.rm = TRUE)
+  })
+)
+
+# Inpatient (index-admission) anti-rejection therapy, plus length of stay.
+#
+# df_immuno_induc (read from the discharge/induction file) commonly already
+# carries its own TX_DATE / DISCHARGE_DATE / DEATH_DATE columns natively.
+# Left-joining df_liver_data_filtered's copies on top of those WITHOUT
+# dropping the originals first doesn't error -- dplyr just silently renames
+# the colliding, non-key columns to "TX_DATE.x"/"TX_DATE.y" etc. -- so there
+# is then no plain "TX_DATE" column left for arrange()/mutate() to find.
+# Dropping any pre-existing copies first (any_of() so this is a no-op if they
+# aren't present) guarantees the join produces one clean, unsuffixed copy of
+# each from the master file.
+df_immuno_induc <- df_immuno_induc |>
+  semi_join(df_liver_data_filtered, by = "TRR_ID_CODE") |>
+  mutate(NUM_ANTI_REJ_RXED = rowSums(across(all_of(COLS_TO_CHECK)) == 1, na.rm = TRUE)) |>
+  select(-any_of(c("TX_DATE", "DISCHARGE_DATE", "DEATH_DATE"))) |>
+  left_join(df_liver_data_filtered %>%
+              select(TRR_ID_CODE, TX_DATE, DISCHARGE_DATE, DEATH_DATE), by = "TRR_ID_CODE") |>
+  arrange(TX_DATE) |>
+  mutate(
+    DISCHARGE_DATE = as.Date(DISCHARGE_DATE),
+    TX_DATE = as.Date(TX_DATE)
+  ) %>%
+  mutate(DAYS_HOSP_SP_TX = time_length(interval(TX_DATE, DISCHARGE_DATE), "days"))
+
+# Length of stay now carries analytic weight, not just descriptive weight: it
+# is what decides whether an index admission covers the whole 90-day exposure
+# window (see the Control definition in section 7). Worth eyeballing.
+message("Index admission length of stay (days):")
+print(summary(df_immuno_induc$DAYS_HOSP_SP_TX))
+message("  admissions extending past the landmark (day ", LANDMARK_DAY, "): ",
+        sum(df_immuno_induc$DAYS_HOSP_SP_TX >= LANDMARK_DAY, na.rm = TRUE))
+
+
+#===============================================================================
+# 5. Year-1 rejection vs. no-rejection cohorts (source frames for everything)
+#-------------------------------------------------------------------------------
+# These frames are landmark-agnostic. They record WHO was treated and WHEN
+# across all of year 1; section 7 is what applies the 90-day cut.
+#===============================================================================
+# Patients treated for rejection during the index admission.
+# distinct() guards against a duplicated discharge record silently
+# double-counting a patient later on.
+pat_rej_array_dis <- df_immuno_induc %>%
+  filter(NUM_ANTI_REJ_RXED >= 1) %>%
+  mutate(DISCHARGE_DATE = as.Date(DISCHARGE_DATE)) %>%
+  select(TRR_ID_CODE, TX_DATE, DISCHARGE_DATE, DAYS_HOSP_SP_TX,
+         NUM_ANTI_REJ_RXED, all_of(COLS_TO_CHECK)) %>%
+  distinct(TRR_ID_CODE, .keep_all = TRUE)
+
+inpatient_reject_ID_vect <- pat_rej_array_dis |> pull(TRR_ID_CODE)
+
+# First instance of rejection therapy recorded at a follow-up visit within
+# year 1 (patients already flagged as inpatient rejectors get their running
+# count bumped by one so they aren't double-counted as a "first" event here).
+pat_rej_array_fol <- df_immuno_fol_calc %>%
+  mutate(
+    REJECT_RUNNING_COUNT = if_else(
+      TRR_ID_CODE %in% inpatient_reject_ID_vect,
+      REJECT_RUNNING_COUNT + 1,
+      REJECT_RUNNING_COUNT
+    )
+  ) |>
+  filter(REJECT_RUNNING_COUNT == 1, NUM_ANTI_REJ_RXED >= 1) %>%
+  group_by(TRR_ID_CODE) %>%
+  slice_min(order_by = PX_STAT_DATE_FOL, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(
+    TRR_ID_CODE, TRR_FOL_ID_CODE, TX_DATE, DISCHARGE_DATE, PX_STAT_DATE_FOL,
+    FOL_DATE_DAYS_DELTA, REJECT_RUNNING_COUNT, NUM_ANTI_REJ_RXED,
+    all_of(COLS_TO_CHECK)
+  ) %>%
+  mutate(DISCHARGE_DATE = as.Date(DISCHARGE_DATE))
+
+# Combine inpatient + follow-up rejection events into one array.
+# source is coerced to integer so slice_min(source) elsewhere orders it
+# numerically (1 = discharge event, 2 = follow-up event).
+pat_rej_array <- bind_rows(pat_rej_array_dis, pat_rej_array_fol, .id = "source") %>%
+  mutate(source = as.integer(source))
+
+# Rejector IDs, defined once from the combined array, and used to define the
+# year-1 control cohort BY EXCLUSION. A row-wise REJECT_RUNNING_COUNT == 0
+# filter alone would retain rows from patients who were rejection-free early
+# but treated later in year 1.
+rejector_ids <- unique(pat_rej_array$TRR_ID_CODE)
+
+pat_ctrl_array <- df_immuno_fol_calc %>%
+  filter(!TRR_ID_CODE %in% rejector_ids) %>%
+  filter(REJECT_RUNNING_COUNT == 0) %>%   # redundant given the exclusion above; belt-and-braces
+  select(
+    TRR_ID_CODE, TRR_FOL_ID_CODE, TX_DATE, DISCHARGE_DATE, PX_STAT_DATE_FOL,
+    FOL_DATE_DAYS_DELTA, REJECT_RUNNING_COUNT, NUM_ANTI_REJ_RXED, all_of(COLS_TO_CHECK)
+  ) %>%
+  group_by(TRR_ID_CODE) %>%
+  slice_max(order_by = PX_STAT_DATE_FOL, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+# Patients with NO follow-up rows at all never enter df_immuno_fol and are
+# therefore neither cases nor controls. If that group is large, "no rejection"
+# is partly "no data".
+message("Patients in cohort with no year-1 follow-up rows: ",
+        length(setdiff(tx_ids_to_keep,
+                       union(rejector_ids, pat_ctrl_array$TRR_ID_CODE))))
+
+
+#===============================================================================
+# 6. LEGACY full-year treatment-arm ID vectors
+#-------------------------------------------------------------------------------
+# These are the arms the previous version of the script used everywhere. They
+# are retained for exactly two purposes: the reconciliation report in section
+# 7, and reproducing the old run via the DEMO_TABLES_USE_LANDMARK_ARMS /
+# USE_LANDMARK_ARMS_FOR_YR2 switches.
+#
+# DO NOT use them to define an analysis arm directly. They classify a patient
+# from whichever pat_rej_array row happened to match, with no deduplication
+# and no notion of the landmark, so a patient treated with steroids inpatient
+# and Thymoglobulin at month 8 can appear in two vectors at once.
+#===============================================================================
+monotherapy_reject <- pat_rej_array |> filter(NUM_ANTI_REJ_RXED < 2)
+
+rituxan_id_all_vect <- monotherapy_reject %>%
+  filter(RITUXAN_ANTIREJ == 1) %>% pull(TRR_ID_CODE)
+
+steroid_id_all_vect <- monotherapy_reject %>%
+  filter(STEROIDS_ANTIREJ == 1) %>% pull(TRR_ID_CODE)
+
+thymo_id_all_vect <- monotherapy_reject %>%
+  filter(THYMOGLOBULIN_ANTIREJ == 1) %>% pull(TRR_ID_CODE)
+
+simulect_id_all_vect <- monotherapy_reject %>%
+  filter(SIMULECT_ANTIREJ == 1) %>% pull(TRR_ID_CODE)
+
+dual_therapy_id_vect <- pat_rej_array %>%
+  filter(STEROIDS_ANTIREJ == 1) %>%
+  filter(SIMULECT_ANTIREJ == 1 | THYMOGLOBULIN_ANTIREJ == 1 | RITUXAN_ANTIREJ == 1) |>
+  pull(TRR_ID_CODE)
+
+rituxan_any_id_vect <- pat_rej_array %>%
+  filter(RITUXAN_ANTIREJ == 1) %>% pull(TRR_ID_CODE)
+
+arm2_ID_vect <- unique(c(simulect_id_all_vect, thymo_id_all_vect, rituxan_id_all_vect))
+
+ctrl_id_vect <- pat_ctrl_array %>% pull(TRR_ID_CODE)
+
+stopifnot(length(intersect(arm2_ID_vect, ctrl_id_vect)) == 0)
+stopifnot(length(intersect(steroid_id_all_vect, ctrl_id_vect)) == 0)
+
+# Legacy arms expressed in the same one-row-per-patient shape as the landmark
+# assignment, so the two can be swapped by a switch downstream.
+legacy_arm_lookup <- tibble(TRR_ID_CODE = unique(c(rejector_ids, ctrl_id_vect))) %>%
+  mutate(ARM = case_when(
+    TRR_ID_CODE %in% dual_therapy_id_vect ~ "Dual Therapy",
+    TRR_ID_CODE %in% steroid_id_all_vect  ~ "Steroids",
+    TRR_ID_CODE %in% arm2_ID_vect         ~ "Combined",
+    TRR_ID_CODE %in% ctrl_id_vect         ~ "Control",
+    TRUE                                  ~ "Other Rejection"
+  ))
+
+
+#===============================================================================
+# 7. TREATMENT TIMING AND LANDMARK ARM ASSIGNMENT  (moved up from section 17)
+#-------------------------------------------------------------------------------
+# This section is the hinge of the whole script. Every arm used anywhere below
+# -- demographic tables, propensity matching, survival, year-2 outcomes --
+# comes from arm_at_landmark, so there is exactly one definition of "Steroid
+# group" in the file.
+#
+# It used to live inside the survival section, which is why the year-2
+# sections and the demographic tables had grown their own, different, arm
+# definitions from the section-6 vectors.
+#===============================================================================
+
+# --- Step 1: day of FIRST anti-rejection treatment, per patient ---
+# Timing sources and their caveats:
+#   source == 1 (index admission) -> INPATIENT_RX_DAY (0). The discharge file
+#     records THAT therapy was given, not WHEN.
+#   source == 2 (outpatient) -> FOL_DATE_DAYS_DELTA, the date of the VISIT at
+#     which the drug was recorded. The treatment happened at some point since
+#     the previous visit, so this is an UPPER BOUND on the true treatment day.
+#
+# At a 90-day landmark that upper bound has teeth. A patient treated on day 80
+# but not seen until their day-100 visit is recorded at day 100 and lands in
+# Control. Misclassification therefore runs one way only: from treated into
+# Control, never the reverse. It biases treated-vs-Control contrasts toward
+# the null, in the same direction as the gap contamination below.
+pat_rej_first <- pat_rej_array %>%
+  group_by(TRR_ID_CODE) %>%
+  slice_min(order_by = source, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(
+    REJ_TX_DAY = if_else(source == 1L,
+                         as.numeric(INPATIENT_RX_DAY),
+                         as.numeric(FOL_DATE_DAYS_DELTA))
+  )
+
+message("Rejectors with unusable REJ_TX_DAY (should be 0): ",
+        sum(is.na(pat_rej_first$REJ_TX_DAY)))
+message("Distribution of first anti-rejection treatment day (all year-1 rejectors):")
+print(summary(pat_rej_first$REJ_TX_DAY))
+message("  treated before landmark (day ", LANDMARK_DAY, "): ",
+        sum(pat_rej_first$REJ_TX_DAY < LANDMARK_DAY, na.rm = TRUE),
+        " of ", nrow(pat_rej_first),
+        sprintf(" (%.1f%%)", 100 * mean(pat_rej_first$REJ_TX_DAY < LANDMARK_DAY, na.rm = TRUE)))
+
+# --- Step 2: arm assignment AS OF a given landmark ---
+# Arms are mutually exclusive and derived from the patient's FIRST
+# anti-rejection event only, which is the classification coherent with a
+# time-to-event design.
+#
+# THE CONTROL DEFINITION IS THE SUBSTANTIVE CHANGE AT 90 DAYS. Two issues that
+# did not exist at a 365-day landmark:
+#
+#   (a) CONTAMINATION BY DESIGN. A patient first treated on day 200 is not in
+#       treated_before and therefore becomes a Control. That is the correct
+#       treat-as-of-landmark semantics, but it means the Control arm is no
+#       longer "never treated" -- it is "not treated in the first 90 days".
+#       Quantified in Step 4 below.
+#
+#   (b) ASSESSMENT AND EXPOSURE WINDOWS CAME APART. The old code took
+#       assessed_ids from any visit in year 1. At a 365-day landmark the
+#       assessment and exposure windows were the same interval, so this was
+#       invisible. At 90 days they separate -- but the fix is NOT to require a
+#       form dated before day 90. UNOS follow-up forms report on the INTERVAL
+#       since the previous form (or since transplant), so a patient whose first
+#       form is at 6 months has been assessed for days 0-90; the assessment is
+#       simply recorded later. ASSESSMENT_RULE = "interval" is therefore the
+#       correct setting for UNOS; "strict" is retained only to reproduce the
+#       earlier, wrong run, which collapsed the Control arm and with it every
+#       demographic table.
+assign_arm_at_landmark <- function(landmark_day,
+                                   assessment_rule = ASSESSMENT_RULE) {
+  
+  treated_before <- pat_rej_first %>%
+    filter(!is.na(REJ_TX_DAY), REJ_TX_DAY < landmark_day)
+  
+  mono <- treated_before %>% filter(NUM_ANTI_REJ_RXED < 2)
+  
+  steroid_lm <- mono %>% filter(STEROIDS_ANTIREJ == 1) %>% pull(TRR_ID_CODE)
+  
+  combined_lm <- mono %>%
+    filter(SIMULECT_ANTIREJ == 1 | THYMOGLOBULIN_ANTIREJ == 1 | RITUXAN_ANTIREJ == 1) %>%
+    pull(TRR_ID_CODE)
+  
+  dual_lm <- treated_before %>%
+    filter(STEROIDS_ANTIREJ == 1,
+           SIMULECT_ANTIREJ == 1 | THYMOGLOBULIN_ANTIREJ == 1 | RITUXAN_ANTIREJ == 1) %>%
+    pull(TRR_ID_CODE)
+  
+  assessed_ids <- switch(
+    assessment_rule,
+    
+    # Any record at all: the discharge record documents from day 0, and the
+    # first follow-up form reports back to transplant.
+    "interval" = unique(c(df_immuno_induc$TRR_ID_CODE,
+                          df_immuno_fol_calc$TRR_ID_CODE)),
+    
+    # Form dated inside the window, or still admitted at the landmark.
+    "strict" = unique(c(
+      df_immuno_fol_calc %>%
+        filter(FOL_DATE_DAYS_DELTA < landmark_day) %>% pull(TRR_ID_CODE),
+      df_immuno_induc %>%
+        filter(!is.na(DAYS_HOSP_SP_TX), DAYS_HOSP_SP_TX >= landmark_day) %>%
+        pull(TRR_ID_CODE)
+    )),
+    
+    "any_year1" = unique(df_immuno_fol_calc$TRR_ID_CODE),
+    
+    stop("unknown ASSESSMENT_RULE: ", assessment_rule)
+  )
+  
+  control_lm <- setdiff(assessed_ids, treated_before$TRR_ID_CODE)
+  
+  tibble(TRR_ID_CODE = unique(c(treated_before$TRR_ID_CODE, control_lm))) %>%
+    mutate(ARM = case_when(
+      TRR_ID_CODE %in% dual_lm     ~ "Dual Therapy",
+      TRR_ID_CODE %in% steroid_lm  ~ "Steroids",
+      TRR_ID_CODE %in% combined_lm ~ "Combined",
+      TRR_ID_CODE %in% control_lm  ~ "Control",
+      TRUE                         ~ "Other Rejection"
+    ))
+}
+
+arm_at_landmark <- assign_arm_at_landmark(LANDMARK_DAY)
+
+ARM_LEVELS <- c("Control", "Steroids", "Combined", "Dual Therapy", "Other Rejection")
+arm_at_landmark <- arm_at_landmark %>%
+  mutate(ARM = factor(ARM, levels = ARM_LEVELS))
+
+message("\nArm sizes at landmark day ", LANDMARK_DAY, ":")
+print(table(arm_at_landmark$ARM, useNA = "ifany"))
+
+# Catch a collapsed arm here, where the cause is visible, rather than 800 lines
+# later inside relevel() where it is not.
+arm_n <- table(arm_at_landmark$ARM)
+if (sum(arm_n[setdiff(ARM_LEVELS, "Control")]) == 0) {
+  stop("EVERY treated arm is empty -- all ", sum(arm_n), " patients are Control.\n",
+       "  Almost always this means LANDMARK_DAY (", LANDMARK_DAY, ") is at or below the day ",
+       "exposure events are recorded.\n",
+       "  Exposure filter: REJ_TX_DAY < LANDMARK_DAY. Observed REJ_TX_DAY range: ",
+       paste(range(pat_rej_first$REJ_TX_DAY, na.rm = TRUE), collapse = " to "), ".\n",
+       "  Raise LANDMARK_DAY above ", min(pat_rej_first$REJ_TX_DAY, na.rm = TRUE), ".")
+}
+small_arms <- names(arm_n)[arm_n > 0 & arm_n < 10 & names(arm_n) != "Control"]
+if (length(small_arms)) {
+  warning("Arm(s) with fewer than 10 patients: ", paste(small_arms, collapse = ", "),
+          ". Comparisons involving them will be unstable or skipped.")
+}
+
+# --- Step 3: how much the assessment rule matters ---
+# "strict" is shown only to document how the Control arm collapses under it.
+ctrl_by_rule <- vapply(
+  c("interval", "any_year1", "strict"),
+  function(r) sum(assign_arm_at_landmark(LANDMARK_DAY, r)$ARM == "Control"),
+  numeric(1)
+)
+message("\nControl arm size by assessment rule at day ", LANDMARK_DAY, ":")
+print(ctrl_by_rule)
+message("  in use: ", ASSESSMENT_RULE)
+if (ctrl_by_rule[["strict"]] < 0.5 * ctrl_by_rule[["interval"]]) {
+  message("  As expected: routine UNOS follow-up is at 6mo/1yr, so requiring a form DATED",
+          " before day ", LANDMARK_DAY, " discards most Controls. Do not use 'strict'.")
+}
+
+n_ctrl_strict <- ctrl_by_rule[["strict"]]   # names kept for the section 27 checklist
+n_ctrl_loose  <- ctrl_by_rule[["any_year1"]]
+
+# Under "interval", a patient with a discharge record but NO follow-up form
+# still counts as an observed Control. Their "no rejection" rests entirely on
+# the index admission, and they will also have no year-2 visit -- where the
+# code treats "no visit" as "no rejection". That is the same assumption
+# applied twice to the same patients, so it is worth knowing how many there
+# are before quoting any Control-arm rate.
+ctrl_now <- assign_arm_at_landmark(LANDMARK_DAY) %>%
+  filter(ARM == "Control") %>% pull(TRR_ID_CODE)
+ctrl_discharge_only <- setdiff(ctrl_now, unique(df_immuno_fol_calc$TRR_ID_CODE))
+message("  Controls resting on a discharge record only (no follow-up form): ",
+        length(ctrl_discharge_only), " of ", length(ctrl_now),
+        sprintf(" (%.1f%%)", 100 * length(ctrl_discharge_only) / max(length(ctrl_now), 1)))
+
+# Patients in the cohort who are in NO arm. Under ASSESSMENT_RULE = "interval"
+# this means NO RECORDS AT ALL -- neither a discharge record nor any follow-up
+# form -- which is the genuine "no data" group rather than a artefact of form
+# timing. They are excluded from every analysis below.
+unassigned_ids <- setdiff(tx_ids_to_keep, arm_at_landmark$TRR_ID_CODE)
+message("  patients excluded entirely (no records of any kind): ",
+        length(unassigned_ids), " of ", length(tx_ids_to_keep),
+        sprintf(" (%.1f%%)", 100 * length(unassigned_ids) / max(length(tx_ids_to_keep), 1)))
+
+# --- Step 4: gap contamination -- the headline limitation of this design ---
+# How many day-90 "Controls" were actually treated later in year 1? At a
+# 365-day landmark this is zero by construction. At 90 days it is the price of
+# the shorter exposure window and it attenuates every treated-vs-Control
+# contrast toward the null.
+control_at_lm <- arm_at_landmark %>% filter(ARM == "Control") %>% pull(TRR_ID_CODE)
+
+gap_contamination <- if (HAS_GAP) {
+  pat_rej_first %>%
+    filter(TRR_ID_CODE %in% control_at_lm,
+           !is.na(REJ_TX_DAY), REJ_TX_DAY >= GAP_START, REJ_TX_DAY < GAP_END)
+} else {
+  pat_rej_first[0, ]
+}
+
+message(sprintf(
+  "\nGAP CONTAMINATION: Controls at day %g later treated in day %g-%g: %d of %d (%.1f%%)",
+  LANDMARK_DAY, GAP_START, GAP_END,
+  nrow(gap_contamination), length(control_at_lm),
+  100 * nrow(gap_contamination) / max(length(control_at_lm), 1)))
+
+# Sensitivity handle: a "clean" comparator excluding gap-treated Controls.
+# Use ALONGSIDE the main arms, never instead of them -- excluding patients on
+# the basis of a post-landmark event reintroduces exactly the selection the
+# landmark design exists to remove.
+arm_at_landmark_clean_ctrl <- arm_at_landmark %>%
+  filter(!TRR_ID_CODE %in% gap_contamination$TRR_ID_CODE)
+
+# --- Step 5: reconciliation against the legacy full-year vectors ---
+# These will NOT agree closely any more, and that is the point: the difference
+# is the population of patients first treated between day 90 and day 365, who
+# the legacy vectors call treated and the landmark design calls Control.
+reconcile_arm <- function(arm_name, old_vect) {
+  new_vect <- arm_at_landmark %>% filter(ARM == arm_name) %>% pull(TRR_ID_CODE)
+  message(sprintf("  %-14s landmark n=%5d | legacy n=%5d | landmark-only=%4d | legacy-only=%4d",
+                  arm_name, length(new_vect), length(old_vect),
+                  length(setdiff(new_vect, old_vect)),
+                  length(setdiff(old_vect, new_vect))))
+}
+message("\nArm reconciliation (landmark day ", LANDMARK_DAY, " vs legacy full-year vectors):")
+print(
+  reconcile_arm("Steroids",     steroid_id_all_vect)
+)
+print(
+  reconcile_arm("Combined",     arm2_ID_vect)
+)
+print(
+  reconcile_arm("Dual Therapy", dual_therapy_id_vect)
+)
+print(
+  reconcile_arm("Control",      ctrl_id_vect)
+)
+
+# --- Step 6: Dual Therapy is no longer a rounding error ---
+# Moving the landmark inside the index admission pulls steroid + ATG /
+# Thymoglobulin combinations into the exposure window. Check this N before
+# leaving YR2_INCLUDE_DUAL = FALSE.
+n_dual_lm <- sum(arm_at_landmark$ARM == "Dual Therapy")
+message("\nDual Therapy arm at landmark: n = ", n_dual_lm,
+        " (legacy full-year n = ", length(unique(dual_therapy_id_vect)), ")")
+if (n_dual_lm >= 50 && !YR2_INCLUDE_DUAL) {
+  message("  NOTE: Dual arm is large enough to model. Consider YR2_INCLUDE_DUAL <- TRUE.")
+}
+
+# --- Step 7: Rituxan sub-arm, defined at the landmark ---
+rituxan_lm_ids <- pat_rej_first %>%
+  filter(!is.na(REJ_TX_DAY), REJ_TX_DAY < LANDMARK_DAY,
+         !is.na(RITUXAN_ANTIREJ), RITUXAN_ANTIREJ == 1) %>%
+  pull(TRR_ID_CODE)
+
+ritux_mono_lm_ids <- pat_rej_first %>%
+  filter(!is.na(REJ_TX_DAY), REJ_TX_DAY < LANDMARK_DAY,
+         NUM_ANTI_REJ_RXED < 2,
+         !is.na(RITUXAN_ANTIREJ), RITUXAN_ANTIREJ == 1) %>%
+  pull(TRR_ID_CODE)
+
+message("Rituxan at landmark: any use n = ", length(rituxan_lm_ids),
+        " | monotherapy n = ", length(ritux_mono_lm_ids))
+
+# --- Step 7b: length of stay by arm -- the remaining confounding threat ---
+# Every exposed patient in this cohort is an index-admission record (see the
+# "% index admission" column in section 18b), so the exposure is really
+# "anti-rejection therapy during the index admission" and INPATIENT_RX_DAY is
+# the entire timing model rather than an approximation affecting a minority.
+#
+# Two consequences that this table is the diagnostic for:
+#   1. If LOS differs materially by arm, it confounds the exposure contrast
+#      (longer stays go to sicker patients) AND it is not in match_covariates.
+#   2. Under the discharge-anchored design in section 21b, LOS IS the time
+#      origin, so an arm with systematically longer stays starts its clock
+#      later and is compared over a different calendar window.
+los_by_arm <- pat_rej_first %>%
+  filter(source == 1L) %>%
+  left_join(arm_at_landmark, by = "TRR_ID_CODE") %>%
+  bind_rows(
+    arm_at_landmark %>%
+      filter(ARM == "Control") %>%
+      left_join(df_immuno_induc %>%
+                  select(TRR_ID_CODE, DAYS_HOSP_SP_TX) %>%
+                  distinct(TRR_ID_CODE, .keep_all = TRUE),
+                by = "TRR_ID_CODE")
+  ) %>%
+  group_by(ARM) %>%
+  summarise(
+    n            = n(),
+    n_los_known  = sum(!is.na(DAYS_HOSP_SP_TX)),
+    median_los   = median(DAYS_HOSP_SP_TX, na.rm = TRUE),
+    q1_los       = quantile(DAYS_HOSP_SP_TX, 0.25, na.rm = TRUE),
+    q3_los       = quantile(DAYS_HOSP_SP_TX, 0.75, na.rm = TRUE),
+    p90_los      = quantile(DAYS_HOSP_SP_TX, 0.90, na.rm = TRUE),
+    pct_ge_lm    = 100 * mean(DAYS_HOSP_SP_TX >= LANDMARK_DAY, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(!is.na(ARM))
+
+print(
+  los_by_arm %>%
+    mutate(`Median (IQR), d` = sprintf("%.0f (%.0f\u2013%.0f)", median_los, q1_los, q3_los)) %>%
+    select(ARM, n, n_los_known, `Median (IQR), d`, p90_los, pct_ge_lm) %>%
+    gt() %>%
+    fmt_number(columns = c(p90_los, pct_ge_lm), decimals = 1) %>%
+    sub_missing(missing_text = "\u2014") %>%
+    cols_label(
+      ARM         = "Arm",
+      n           = "N in arm",
+      n_los_known = "N with LOS recorded",
+      p90_los     = "90th pct LOS, d",
+      pct_ge_lm   = paste0("% LOS >= ", round(LANDMARK_DAY), "d")
+    ) %>%
+    tab_header(
+      title = "Index-Admission Length of Stay by Exposure Arm",
+      subtitle = "LOS confounds the exposure contrast and defines the time origin in section 21b"
+    ) %>%
+    tab_options(table.font.size = 13, data_row.padding = px(4),
+                column_labels.font.weight = "bold") %>%
+    tab_source_note(paste0(
+      "In this cohort every exposed patient was treated during the index admission, so LOS is not a ",
+      "background covariate -- it is entangled with the exposure itself. If the treated arms have ",
+      "materially longer stays than Control, LOS belongs in match_covariates. The '% LOS >= ",
+      round(LANDMARK_DAY), "d' column flags patients whose admission extended past the landmark: for them ",
+      "the discharge record may document therapy given AFTER the nominal exposure window, so day-0 ",
+      "imputation is wrong in a direction that cannot be checked from the registry."))
+)
+
+# --- Step 8: the one arm lookup used by the timing figures ---
+# Defined once here so sections 18b and 18c cannot drift apart.
+build_timing_arm_lookup <- function(rituxan_own_arm = RITUXAN_AS_OWN_ARM) {
+  if (rituxan_own_arm) {
+    arm_at_landmark %>%
+      mutate(TIMING_ARM = case_when(
+        ARM == "Combined" &  TRR_ID_CODE %in% ritux_mono_lm_ids ~ "Rituxan only",
+        ARM == "Combined" & !TRR_ID_CODE %in% ritux_mono_lm_ids ~ "Combined (non-Rituxan)",
+        TRUE ~ as.character(ARM)
+      ))
+  } else {
+    # Overlapping view: Rituxan patients appear TWICE, once in Combined and
+    # once in their own row. Denominators downstream come from this same frame
+    # so they stay internally consistent, but arm Ns will not sum to the
+    # cohort N.
+    bind_rows(
+      arm_at_landmark %>% mutate(TIMING_ARM = as.character(ARM)),
+      arm_at_landmark %>%
+        filter(ARM == "Combined", TRR_ID_CODE %in% ritux_mono_lm_ids) %>%
+        mutate(TIMING_ARM = "Rituxan only (subset of Combined)")
+    )
+  }
+}
+
+timing_arm_lookup <- build_timing_arm_lookup()
+
+TIMING_LEVELS <- c(
+  intersect(c("Steroids", "Combined (non-Rituxan)", "Combined", "Rituxan only",
+              "Rituxan only (subset of Combined)", "Dual Therapy", "Other Rejection"),
+            unique(timing_arm_lookup$TIMING_ARM)),
+  "Control"
+)
+
+timing_arm_lookup <- timing_arm_lookup %>%
+  mutate(TIMING_ARM = factor(TIMING_ARM, levels = TIMING_LEVELS))
+
+
+#===============================================================================
+# 8. HLA mismatch calculation (A, B, DR loci; 0-6 scale)
+#===============================================================================
+# Use retyped donor HLA if available, else original typing.
+df_hla_fil <- df_hla_fil %>%
+  mutate(
+    DA1_final  = coalesce(RT_DA1, DA1),
+    DA2_final  = coalesce(RT_DA2, DA2),
+    DB1_final  = coalesce(RT_DB1, DB1),
+    DB2_final  = coalesce(RT_DB2, DB2),
+    DDR1_final = coalesce(RT_DDR1, DDR1),
+    DDR2_final = coalesce(RT_DDR2, DDR2)
+  )
+
+locus_mismatch <- function(r1, r2, d1, d2) {
+  if (any(is.na(c(r1, r2, d1, d2)))) return(NA_integer_)
+  rec_alleles <- c(r1, r2)
+  don_alleles <- c(d1, d2)
+  sum(!don_alleles %in% rec_alleles)
+}
+
+df_hla_calc <- df_hla_fil %>%
+  rowwise() %>%
+  mutate(
+    MM_A  = locus_mismatch(RA1, RA2, DA1_final, DA2_final),
+    MM_B  = locus_mismatch(RB1, RB2, DB1_final, DB2_final),
+    MM_DR = locus_mismatch(RDR1, RDR2, DDR1_final, DDR2_final),
+    MM_TOTAL = if_else(any(is.na(c(MM_A, MM_B, MM_DR))), NA_integer_, MM_A + MM_B + MM_DR)
+  ) %>%
+  ungroup() %>%
+  select(TRR_ID_CODE, MM_A, MM_B, MM_DR, MM_TOTAL) |>
+  distinct(TRR_ID_CODE, .keep_all = TRUE)
+
+
+#===============================================================================
+# 9. PRA data
+#===============================================================================
+# Cannot use: physicians/centers stopped reporting PRA around mid-March 2015.
+
+
+#===============================================================================
+# 10. Deceased donor data
+#-------------------------------------------------------------------------------
+# UNOS donor variable names differ between DONOR_DECEASED file vintages (e.g.
+# HGT_CM_DON_CALC vs HGT_CM_DON, HEP_C_ANTI_DON vs HEP_C_ANTIBODY_DON). Rather
+# than hard-coding one spelling and getting a cryptic "column doesn't exist"
+# error -- or worse, an any_of() that silently drops the variable and leaves an
+# empty table row -- resolve each concept against a list of candidate names and
+# REPORT which ones were not found.
+#
+# A single donor can map to more than one recipient (split liver), and
+# df_deceased_don itself contains some duplicate DONOR_IDs, so distinct() on
+# the recipient key is necessary rather than optional: without it every
+# downstream demographic count is multiplied once the donor table is joined.
+#===============================================================================
+donor_var_candidates <- list(
+  AGE_DON        = c("AGE_DON"),
+  GENDER_DON     = c("GENDER_DON"),
+  HGT_CM_DON     = c("HGT_CM_DON_CALC", "HGT_CM_DON"),
+  WGT_KG_DON     = c("WGT_KG_DON_CALC", "WGT_KG_DON"),
+  BMI_DON        = c("BMI_DON_CALC", "BMI_DON"),
+  ETHCAT_DON     = c("ETHCAT_DON"),
+  HIST_HTN_DON   = c("HIST_HYPERTENS_DON"),
+  HIST_DM_DON    = c("HIST_DIABETES_DON"),
+  COD_DON        = c("COD_CAD_DON"),
+  CREAT_DON      = c("CREAT_DON"),
+  SGOT_DON       = c("SGOT_DON"),
+  SGPT_DON       = c("SGPT_DON"),
+  TBILI_DON      = c("TBILI_DON"),
+  HCV_DON        = c("HEP_C_ANTI_DON", "HEP_C_ANTIBODY_DON", "HCV_SEROSTATUS"),
+  DCD_DON        = c("NON_HRT_DON"),
+  LI_FIBROSIS    = c("LI_FIBROSIS"),
+  LI_MACHINE_PERFUSION    = c("LI_MACHINE_PERFUSION"),
+  LI_MACHINE_PERFUSION_TY = c("LI_MACHINE_PERFUSION_TY")
+)
+
+resolve_donor_cols <- function(df, candidates) {
+  found <- vapply(candidates, function(cands) {
+    hit <- intersect(cands, names(df))
+    if (length(hit)) hit[1] else NA_character_
+  }, character(1))
+  
+  missing <- names(found)[is.na(found)]
+  if (length(missing)) {
+    message("Donor fields NOT found in the deceased donor file (rows will be omitted): ",
+            paste(missing, collapse = ", "))
+  }
+  found[!is.na(found)]   # named vector: canonical name -> actual column name
+}
+
+donor_cols_found <- resolve_donor_cols(df_deceased_don_fil, donor_var_candidates)
+
+# HAS_DECEASED_DON restricts the donor tables to recipients who actually have
+# a deceased-donor record. Living-donor recipients (and anyone whose donor row
+# didn't join) would otherwise appear as an all-NA column and quietly deflate
+# every donor denominator.
+df_deceased_don_fil2 <- df_deceased_don_fil %>%
+  left_join(df_liver_data_filtered |> select(DONOR_ID, TRR_ID_CODE), by = "DONOR_ID") |>
+  filter(!is.na(TRR_ID_CODE)) |>
+  select(TRR_ID_CODE, all_of(unname(donor_cols_found))) |>
+  rename(!!!setNames(unname(donor_cols_found), names(donor_cols_found))) |>
+  mutate(HAS_DECEASED_DON = 1L) |>
+  distinct(TRR_ID_CODE, .keep_all = TRUE)
+
+# Diagnostic: confirms whether the source file itself carries duplicate donor
+# IDs (the reason distinct() above is necessary).
+print(
+  df_deceased_don_fil %>% count(DONOR_ID) %>% filter(n > 1)
+)
+
+message("Recipients with a deceased-donor record: ", nrow(df_deceased_don_fil2),
+        " of ", length(tx_ids_to_keep), " in cohort")
+
+
+#===============================================================================
+# 11. Anti-rejection therapy frequency tables (descriptive)
+#===============================================================================
+print(
+  freq_drug_fol_antirej_indiv %>%
+    arrange(desc(drug_count)) %>%
+    filter(drug_count > 0) %>%
+    kable(
+      caption = paste0("Anti-Rejection Therapy Frequency at Follow-Up, With the Exposure Window (< day ",
+                       LANDMARK_DAY, ") Broken Out"),
+      col.names = c("Drug", "All year-1 visits",
+                    paste0("< day ", LANDMARK_DAY), "<= 6 months", "<= 1 year")
+    ) %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+)
+
+post_tx_anti_rej_table <- data.frame(
+  AntiRejectionTherapy = str_remove(COLS_TO_CHECK, COL_TAIL),
+  Frequency = sapply(df_immuno_induc[COLS_TO_CHECK], function(x) sum(x == 1, na.rm = TRUE))
+)
+
+print(
+  post_tx_anti_rej_table %>%
+    arrange(desc(Frequency)) %>%
+    kable(caption = "Frequency of Anti-Rejection Therapies Used While Admitted s/p Liver Transplant") %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+)
+
+
+#===============================================================================
+# 12. Shared statistical helpers
+#===============================================================================
+# Chi-square vs. Fisher, decided on EXPECTED cell counts (not observed) -- the
+# standard rule of thumb, and more reliable than thresholding on the raw
+# observed counts (which over-triggers Fisher on large but lopsided tables and
+# under-triggers it on small balanced ones).
+safe_chisq_or_fisher <- function(tab) {
+  if (any(dim(tab) < 2) || sum(tab) == 0) return(NULL)
+  expected <- outer(rowSums(tab), colSums(tab)) / sum(tab)
+  if (any(expected < 5)) {
+    fisher.test(tab, simulate.p.value = (ncol(tab) > 2 || nrow(tab) > 2))
+  } else {
+    chisq.test(tab)
+  }
+}
+
+# Mutually-exclusive organ-transplanted grouping, shared by every table and
+# model that reports organ type.
+#
+# IMPORTANT: there is deliberately no "all four fields missing -> NA" gate.
+# TXKID/TXHRT/TXLNG/TXPAN record ADDITIONAL organs transplanted alongside the
+# liver; a liver-only recipient has all four blank, and read.csv() turns those
+# blanks into real NA. Gating on "at least one field non-NA" would discard
+# every liver-only patient and leave a denominator made up almost entirely of
+# multi-organ recipients -- which is what once produced an "87% kidney" row in
+# a liver transplant cohort.
+organ_group <- function(df) {
+  case_when(
+    df$TXKID %in% c("L", "R", "E") ~ "Kidney",
+    df$TXHRT == "Y"                ~ "Heart",
+    df$TXLNG %in% c("L", "R", "E") ~ "Lung",
+    df$TXPAN %in% c("L", "R", "E") ~ "Pancreas",
+    TRUE                           ~ "Liver only"
+  )
+}
+
+race_group <- function(df) {
+  case_when(
+    df$ETHCAT == "1"   ~ "White",
+    df$ETHCAT == "2"   ~ "Black",
+    df$ETHCAT == "4"   ~ "Hispanic",
+    df$ETHCAT == "5"   ~ "Asian",
+    !is.na(df$ETHCAT)  ~ "Other",
+    TRUE               ~ NA_character_
+  )
+}
+
+# Binary diabetes recode, used identically by the matching, the tables, and
+# every adjusted model. Defined once so they cannot disagree.
+diab_bin <- function(x) {
+  case_when(
+    suppressWarnings(as.numeric(x)) %in% 2:5 ~ 1,
+    suppressWarnings(as.numeric(x)) == 1     ~ 0,
+    TRUE                                     ~ NA_real_
+  )
+}
+
+
+#===============================================================================
+# 13. Per-patient demographic frame, arms attached
+#-------------------------------------------------------------------------------
+# RESTRUCTURED. The previous version built two separate frames (rejectors from
+# pat_rej_array, controls from pat_ctrl_array) and stacked them. That worked
+# when "rejector" and "year-1 control" partitioned the cohort, but it cannot
+# represent the day-90 arms: a patient first treated on day 200 is a Control
+# under the landmark design while their demographic row lives in the rejector
+# frame.
+#
+# So there is now ONE per-patient frame, built from the master recipient file,
+# with the arm joined on. Which arm definition gets used is the
+# DEMO_TABLES_USE_LANDMARK_ARMS switch.
+#===============================================================================
+demo_arm_lookup <- if (DEMO_TABLES_USE_LANDMARK_ARMS) {
+  arm_at_landmark
+} else {
+  legacy_arm_lookup %>% mutate(ARM = factor(ARM, levels = ARM_LEVELS))
+}
+
+pat_demo_base <- df_liver_data_filtered %>%
+  select(TRR_ID_CODE, AGE, BMI_REC, GENDER, ETHCAT, MELD_PELD_LAB_SCORE,
+         TXKID, TXHRT, TXLNG, TXPAN, PREV_TX, PREV_TX_ANY_N, DON_TY,
+         COLD_ISCH, DIAB, TX_DATE, DISCHARGE_DATE) %>%
+  distinct(TRR_ID_CODE, .keep_all = TRUE) %>%
+  left_join(df_deceased_don_fil2, by = "TRR_ID_CODE") %>%
+  left_join(df_hla_calc, by = "TRR_ID_CODE")
+
+pat_all_demo_table <- pat_demo_base %>%
+  inner_join(demo_arm_lookup, by = "TRR_ID_CODE") %>%
+  left_join(
+    pat_rej_first %>%
+      select(TRR_ID_CODE, source, REJ_TX_DAY, all_of(COLS_TO_CHECK)),
+    by = "TRR_ID_CODE"
+  ) %>%
+  mutate(
+    ARM = factor(as.character(ARM), levels = ARM_LEVELS),
+    REJ_STAT = as.integer(ARM != "Control")
+  )
+
+# Arm subsets. Every one of these is now a filter on the same frame, so they
+# cannot disagree about a patient's covariates the way two stacked frames could.
+pat_rej_demo_table      <- pat_all_demo_table %>% filter(REJ_STAT == 1L)
+pat_ctrl_demo_table     <- pat_all_demo_table %>% filter(ARM == "Control")
+pat_steroid_demo_table  <- pat_all_demo_table %>% filter(ARM == "Steroids")
+pat_combined_demo_table <- pat_all_demo_table %>% filter(ARM == "Combined")
+pat_dual_demo_table     <- pat_all_demo_table %>% filter(ARM == "Dual Therapy")
+
+ritux_demo_ids <- if (DEMO_TABLES_USE_LANDMARK_ARMS) rituxan_lm_ids else rituxan_any_id_vect
+pat_ritux_demo_table <- pat_rej_demo_table %>% filter(TRR_ID_CODE %in% ritux_demo_ids)
+
+# Integrity checks -- all should be empty / zero.
+stopifnot(!any(duplicated(pat_all_demo_table$TRR_ID_CODE)))
+stopifnot(length(intersect(pat_rej_demo_table$TRR_ID_CODE,
+                           pat_ctrl_demo_table$TRR_ID_CODE)) == 0)
+stopifnot(length(intersect(pat_steroid_demo_table$TRR_ID_CODE,
+                           pat_combined_demo_table$TRR_ID_CODE)) == 0)
+print(
+  df_liver_data_filtered %>% count(TRR_ID_CODE) %>% filter(n > 1)
+)
+
+message("\nDemographic frame arm sizes (",
+        if (DEMO_TABLES_USE_LANDMARK_ARMS) paste0("landmark day ", LANDMARK_DAY) else "legacy full-year",
+        "):")
+print(pat_all_demo_table %>% count(ARM))
+
+# Cohort flow into the demographic frame. Printed because the failure mode
+# here is silent: pat_all_demo_table is an inner_join on the arm lookup, so
+# anyone without an arm disappears from every table downstream with no error.
+cohort_flow <- tibble(
+  Stage = c("Date/age-filtered cohort",
+            "Has an arm at the landmark",
+            "In demographic frame"),
+  N = c(length(unique(tx_ids_to_keep)),
+        n_distinct(demo_arm_lookup$TRR_ID_CODE),
+        nrow(pat_all_demo_table))
+) %>%
+  mutate(Lost = lag(N) - N, Pct_lost = 100 * Lost / lag(N))
+
+print(cohort_flow)
+
+if (nrow(pat_all_demo_table) < 0.5 * length(unique(tx_ids_to_keep))) {
+  warning("More than half the cohort has no arm at the landmark -- check ASSESSMENT_RULE.")
+}
+if (any(table(pat_all_demo_table$ARM)[c("Control", "Steroids", "Combined")] < 2, na.rm = TRUE)) {
+  warning("At least one primary arm has < 2 patients; the demographic tables will be skipped.")
+}
+
+
+#===============================================================================
+# 14. Propensity Score Matching: Combined vs Steroid, Combined vs Control
+#-------------------------------------------------------------------------------
+# These matched sets feed the DESCRIPTIVE tables 2 and 3 only. The survival
+# analysis rematches within the landmark-eligible cohort (section 18) and the
+# year-2 analysis rematches within its own eligible cohort (section 26),
+# because applying a downstream eligibility restriction to an already-matched
+# set breaks pairs non-randomly.
+#
+# With DEMO_TABLES_USE_LANDMARK_ARMS = TRUE the arms here are the day-90 arms,
+# so these are day-90 matched cohorts on the full cohort denominator.
+#===============================================================================
+prep_match_df <- function(df) {
+  df %>%
+    mutate(
+      DIAB_BIN = diab_bin(DIAB),
+      GENDER = factor(GENDER),
+      ETHCAT = factor(ETHCAT),
+      DON_TY = factor(DON_TY)
+    )
+}
+
+match_covariates <- c("AGE", "GENDER", "ETHCAT", "MELD_PELD_LAB_SCORE",
+                      "DIAB_BIN", "COLD_ISCH")
+
+# MM_TOTAL (HLA mismatch) is deliberately NOT matched on. It is missing for
+# roughly 60% of the cohort -- MM_TOTAL is NA whenever ANY of the six alleles
+# is untyped, which in UNOS is the norm. Because matching is complete-case,
+# including it discarded the majority of both arms and, worse, discarded them
+# non-randomly: centres that type HLA completely differ systematically from
+# those that don't.
+#
+# It is still carried alongside the matching frame so balance can be REPORTED
+# on it (addl = in love.plot) without it influencing who gets matched.
+balance_only_covariates <- c("MM_TOTAL")
+
+match_formula <- as.formula(paste("treat ~", paste(match_covariates, collapse = " + ")))
+
+report_complete_case_loss <- function(df, label) {
+  n_before <- nrow(df)
+  n_after  <- nrow(tidyr::drop_na(df, all_of(match_covariates)))
+  message("\n[", label, "] complete-case attrition on matching covariates:")
+  message("  rows before drop_na: ", n_before,
+          " | after: ", n_after,
+          " | lost: ", n_before - n_after,
+          " (", sprintf("%.1f", 100 * (n_before - n_after) / max(n_before, 1)), "%)")
+  
+  per_arm <- df %>%
+    group_by(treat) %>%
+    summarise(before = n(),
+              after = sum(complete.cases(across(all_of(match_covariates)))),
+              .groups = "drop")
+  print(per_arm)
+  
+  miss_by_var <- sapply(match_covariates, function(v) sum(is.na(df[[v]])))
+  message("  missing count by covariate:")
+  print(miss_by_var[order(-miss_by_var)])
+  invisible(NULL)
+}
+
+# Generic 1:1 nearest-neighbour match with caliper, so the three places this
+# script matches all use identical settings.
+#
+# Caliper: without one, 1:1 nearest-neighbour forces a match for every treated
+# unit no matter how far the nearest control is, which with small treated arms
+# produces pairs that aren't comparable at all. 0.2 SD of the propensity logit
+# is the conventional cutoff (Austin 2011); std.caliper = TRUE makes it
+# SD-scaled rather than absolute.
+run_match <- function(raw_df, label, seed = 1234) {
+  report_complete_case_loss(raw_df, label)
+  
+  # drop_na() with no arguments drops a row with NA in ANY column -- which
+  # would re-delete every HLA-untyped patient the moment MM_TOTAL is carried
+  # in the frame, silently undoing the point of excluding it from the match.
+  # Scope it explicitly to the matching covariates.
+  md <- raw_df %>%
+    drop_na(all_of(match_covariates)) %>%
+    mutate(across(where(is.factor), droplevels))
+  
+  if (length(unique(md$treat)) < 2 || min(table(md$treat)) < 5) {
+    message("skipping match -- too few complete cases in one arm: ", label)
+    return(NULL)
+  }
+  
+  set.seed(seed)
+  m <- matchit(match_formula, data = md, method = "nearest", distance = "logit",
+               ratio = 1, caliper = 0.2, std.caliper = TRUE)
+  
+  message("[", label, "] treated units unmatched by caliper: ",
+          sum(m$treat == 1 & is.na(m$subclass)))
+  
+  list(matchit = m, match_frame = md, matched_ids = match.data(m)$TRR_ID_CODE)
+}
+
+# --- Comparison 1: Combined vs Steroid ---
+match_df_combined_steroid_raw <- bind_rows(
+  prep_match_df(pat_combined_demo_table) %>% mutate(treat = 1),
+  prep_match_df(pat_steroid_demo_table)  %>% mutate(treat = 0)
+) %>%
+  select(TRR_ID_CODE, treat, all_of(match_covariates), any_of(balance_only_covariates))
+
+mres_combined_steroid <- run_match(match_df_combined_steroid_raw, "Combined vs Steroid")
+
+if (!is.null(mres_combined_steroid)) {
+  summary(mres_combined_steroid$matchit)
+  matched_combined_steroid <- match.data(mres_combined_steroid$matchit)
+  combined_ids_1 <- matched_combined_steroid %>% filter(treat == 1) %>% pull(TRR_ID_CODE)
+  steroid_ids    <- matched_combined_steroid %>% filter(treat == 0) %>% pull(TRR_ID_CODE)
+} else {
+  combined_ids_1 <- character(0); steroid_ids <- character(0)
+}
+
+pat_combined_demo_table_m_steroid <- pat_combined_demo_table %>% filter(TRR_ID_CODE %in% combined_ids_1)
+pat_steroid_demo_table_m          <- pat_steroid_demo_table  %>% filter(TRR_ID_CODE %in% steroid_ids)
+
+# --- Comparison 2: Combined vs Control ---
+match_df_combined_ctrl_raw <- bind_rows(
+  prep_match_df(pat_combined_demo_table) %>% mutate(treat = 1),
+  prep_match_df(pat_ctrl_demo_table)     %>% mutate(treat = 0)
+) %>%
+  select(TRR_ID_CODE, treat, all_of(match_covariates), any_of(balance_only_covariates))
+
+mres_combined_ctrl <- run_match(match_df_combined_ctrl_raw, "Combined vs Control")
+
+if (!is.null(mres_combined_ctrl)) {
+  summary(mres_combined_ctrl$matchit)
+  matched_combined_ctrl <- match.data(mres_combined_ctrl$matchit)
+  combined_ids_2 <- matched_combined_ctrl %>% filter(treat == 1) %>% pull(TRR_ID_CODE)
+  ctrl_ids       <- matched_combined_ctrl %>% filter(treat == 0) %>% pull(TRR_ID_CODE)
+} else {
+  combined_ids_2 <- character(0); ctrl_ids <- character(0)
+}
+
+pat_combined_demo_table_m_ctrl <- pat_combined_demo_table %>% filter(TRR_ID_CODE %in% combined_ids_2)
+pat_ctrl_demo_table_m          <- pat_ctrl_demo_table     %>% filter(TRR_ID_CODE %in% ctrl_ids)
+
+
+#===============================================================================
+# 15. Love Plots: Covariate Balance Before/After Matching
+#-------------------------------------------------------------------------------
+# addl = passes MM_TOTAL in as a covariate to REPORT balance on without it
+# having influenced the matching. cobalt handles its missingness by adding an
+# explicit <NA> indicator, which doubles as a check on whether HLA typing
+# itself differs between arms. If cobalt errors, drop the addl = argument.
+#===============================================================================
+if (!is.null(mres_combined_steroid)) {
+  print(love.plot(
+    mres_combined_steroid$matchit,
+    binary = "std", stats = "mean.diffs", abs = TRUE, var.order = "unadjusted",
+    thresholds = c(m = 0.1),
+    title = paste0("Covariate Balance: Combined vs Steroid (", LM_LABEL, ")"),
+    sample.names = c("Unmatched", "Matched"),
+    addl = mres_combined_steroid$match_frame[balance_only_covariates]
+  ))
+}
+
+if (!is.null(mres_combined_ctrl)) {
+  print(love.plot(
+    mres_combined_ctrl$matchit,
+    binary = "std", stats = "mean.diffs", abs = TRUE, var.order = "unadjusted",
+    thresholds = c(m = 0.1),
+    title = paste0("Covariate Balance: Combined vs Control (", LM_LABEL, ")"),
+    sample.names = c("Unmatched", "Matched"),
+    addl = mres_combined_ctrl$match_frame[balance_only_covariates]
+  ))
+}
+
+
+#===============================================================================
+# 16. Demographic Tables 1-7 (gtsummary)
+#-------------------------------------------------------------------------------
+#   Table 1: Rejection vs Rituxan vs Control                     (3-arm)
+#   Table 2: Combined vs Steroid            (propensity matched)
+#   Table 3: Combined vs No Rejection       (propensity matched)
+#   Table 4: Combined vs Steroid            (unmatched)
+#   Table 5: Combined vs No Rejection       (unmatched)
+#   Table 6: Any Therapy (Steroid + Combined) vs No Rejection    (unmatched)
+#   Table 7: All four arms (Control / Steroids / Combined / Dual)
+#
+# ALL of these now describe arms AS OF THE LANDMARK (unless
+# DEMO_TABLES_USE_LANDMARK_ARMS is FALSE). "Control" means "not treated in the
+# first 90 days", NOT "never treated" -- see the gap contamination figure in
+# section 7 and say so in any table legend.
+#
+# Continuous vars: mean (SD). Categorical: n (%). Multi-level categorical
+# variables get ONE p-value on the group header row.
+#===============================================================================
+
+prep_gts_df <- function(df) {
+  df %>%
+    ensure_cols(c("LI_MACHINE_PERFUSION", "LI_MACHINE_PERFUSION_TY",
+                  "MM_TOTAL", "PREV_TX", "PREV_TX_ANY_N", "DON_TY")) %>%
+    mutate(
+      AGE                 = as.numeric(AGE),
+      MELD_PELD_LAB_SCORE = as.numeric(MELD_PELD_LAB_SCORE),
+      BMI_REC             = as.numeric(BMI_REC),
+      COLD_ISCH           = as.numeric(COLD_ISCH),
+      GENDER_LBL = case_when(
+        GENDER == "M" ~ "Male",
+        GENDER == "F" ~ "Female",
+        TRUE ~ NA_character_
+      ),
+      RACE_LBL = race_group(.),
+      DIAB_LBL = case_when(
+        diab_bin(DIAB) == 1 ~ "Yes",
+        diab_bin(DIAB) == 0 ~ "No",
+        TRUE ~ NA_character_
+      ),
+      ORGAN_LBL = organ_group(.),
+      LIVING_DON_LBL = case_when(
+        DON_TY == "L" ~ "Yes",
+        !is.na(DON_TY) ~ "No",
+        TRUE ~ NA_character_
+      ),
+      PREV_LIV_LBL = case_when(
+        PREV_TX == "Y" ~ "Yes",
+        !is.na(PREV_TX) ~ "No",
+        TRUE ~ NA_character_
+      ),
+      PREV_ANY_LBL = ifelse(is.na(PREV_TX_ANY_N), "0", as.character(PREV_TX_ANY_N)),
+      HLA_MM = factor(MM_TOTAL, levels = 0:6),
+      PERFUSION_LBL = case_when(
+        LI_MACHINE_PERFUSION == "Y" ~ "Yes",
+        !is.na(LI_MACHINE_PERFUSION) ~ "No",
+        TRUE ~ NA_character_
+      ),
+      PERFUSION_TY_LBL = case_when(
+        as.character(LI_MACHINE_PERFUSION_TY) == "1" ~ "Normothermic",
+        as.character(LI_MACHINE_PERFUSION_TY) == "2" ~ "Hypothermic",
+        TRUE ~ NA_character_
+      )
+    )
+}
+
+gts_vars <- c("AGE", "GENDER_LBL", "RACE_LBL", "BMI_REC", "DIAB_LBL", "MELD_PELD_LAB_SCORE",
+              "ORGAN_LBL", "LIVING_DON_LBL", "COLD_ISCH", "PREV_LIV_LBL",
+              "PREV_ANY_LBL", "HLA_MM", "PERFUSION_LBL", "PERFUSION_TY_LBL")
+
+gts_labels <- list(
+  AGE                 ~ "Recipient Age, y",
+  GENDER_LBL          ~ "Sex, n (%)",
+  RACE_LBL            ~ "Race/ethnicity, n (%)",
+  BMI_REC             ~ "Recipient BMI, kg/m\u00b2",
+  DIAB_LBL            ~ "History of Diabetes, n (%)",
+  MELD_PELD_LAB_SCORE ~ "MELD, mean (SD)",
+  ORGAN_LBL           ~ "Organ Transplanted, n (%)",
+  LIVING_DON_LBL      ~ "Living Donor, n (%)",
+  COLD_ISCH           ~ "Cold Ischemic Time, hr",
+  PREV_LIV_LBL        ~ "Previous Liver Transplant, n (%)",
+  PREV_ANY_LBL        ~ "Previous Any Transplant, n (%)",
+  HLA_MM              ~ "HLA Mismatch Level (0-6), n (%)",
+  PERFUSION_LBL       ~ "Liver Perfusion Used, n (%)",
+  PERFUSION_TY_LBL    ~ "Perfusion Type, n (%)"
+)
+
+# Categorical-test wrapper so the tables use the SAME chi-square/Fisher rule
+# as safe_chisq_or_fisher().
+#
+# This is not cosmetic. gtsummary's built-in default also falls back to Fisher
+# on small expected counts, but calls fisher.test() WITHOUT simulation -- and
+# an exact test on a 2x5 or 2x7 table with tens of thousands of patients
+# exhausts the workspace and errors, which gtsummary renders as a silently
+# BLANK p-value. That is what once emptied the "Previous Any Transplant" and
+# "HLA Mismatch Level" rows.
+gts_safe_cat_test <- function(data, variable, by, ...) {
+  tab <- table(data[[variable]], data[[by]])
+  # Fisher fallbacks above 2x2 use simulate.p.value, which is stochastic --
+  # seed it so re-running the script reproduces the same table.
+  set.seed(1234)
+  res <- safe_chisq_or_fisher(tab)
+  dplyr::tibble(
+    p.value = if (is.null(res)) NA_real_ else res$p.value,
+    method  = if (is.null(res)) NA_character_ else res$method
+  )
+}
+
+# Generalized builder. cont_test = "auto" picks t.test for 2 arms and one-way
+# ANOVA for 3+, which matters for Tables 1 and 7: a t-test cannot compare
+# three groups, so gtsummary catches the error per-variable and renders a
+# BLANK p-value for every continuous row. Use "kruskal.test" if MELD / cold
+# ischemic time / donor labs are skewed enough to make ANOVA inappropriate.
+build_gts_table <- function(df_combined, group_col, group_lbls = NULL, caption = NULL,
+                            vars      = gts_vars,
+                            labels    = gts_labels,
+                            prep_fn   = prep_gts_df,
+                            cont_test = c("auto", "t.test", "aov", "wilcox.test", "kruskal.test"),
+                            missing_disp = "no") {
+  
+  cont_test <- match.arg(cont_test)
+  
+  d <- prep_fn(df_combined)
+  d <- d %>% filter(!is.na(.data[[group_col]]))
+  
+  # Fail loudly, not silently. If an arm collapses upstream (as it did when the
+  # Control definition required a form dated before the landmark), tbl_summary()
+  # errors and the table simply never appears, with nothing pointing at the
+  # cause. This turns that into a message naming the table and printing the
+  # group sizes.
+  grp_n <- table(droplevels(factor(d[[group_col]])))
+  if (nrow(d) == 0 || length(grp_n) < 2 || any(grp_n < 2)) {
+    message("SKIPPING TABLE -- an arm is empty or has < 2 patients: ",
+            if (!is.null(caption)) caption else group_col)
+    print(grp_n)
+    return(invisible(NULL))
+  }
+  
+  n_groups <- nlevels(droplevels(factor(d[[group_col]])))
+  if (cont_test == "auto") cont_test <- if (n_groups > 2) "aov" else "t.test"
+  
+  cont_lbl <- switch(cont_test,
+                     "t.test"       = "Welch two-sample t-test",
+                     "aov"          = "One-way ANOVA",
+                     "wilcox.test"  = "Wilcoxon rank-sum test",
+                     "kruskal.test" = "Kruskal-Wallis test")
+  
+  tbl <- d %>%
+    select(all_of(group_col), all_of(vars)) %>%
+    tbl_summary(
+      by = all_of(group_col),
+      label = labels,
+      statistic = list(
+        all_continuous()  ~ "{mean} ({sd})",
+        all_categorical() ~ "{n} ({p}%)"
+      ),
+      digits = list(all_continuous() ~ 1),
+      missing = missing_disp
+    ) %>%
+    add_p(
+      test = list(
+        all_continuous()  ~ cont_test,
+        all_categorical() ~ "gts_safe_cat_test"
+      ),
+      pvalue_fun = ~ style_pvalue(.x, digits = 3)
+    ) %>%
+    bold_labels() %>%
+    modify_header(all_stat_cols() ~ "**{level}**, N = {n}") %>%
+    modify_footnote(all_stat_cols() ~ "Mean (SD); n (%)") %>%
+    modify_footnote(p.value ~ paste0(
+      cont_lbl,
+      "; Pearson's Chi-squared test / Fisher's exact test (simulated p-value where tables exceed 2x2)"))
+  
+  if (!is.null(group_lbls)) {
+    for (lv in names(group_lbls)) {
+      tbl <- tbl %>% modify_header(
+        !!rlang::sym(paste0("stat_", which(levels(factor(d[[group_col]])) == lv))) :=
+          paste0("**", group_lbls[[lv]], "**, N = {n}")
+      )
+    }
+  }
+  
+  if (!is.null(caption)) tbl <- tbl %>% modify_caption(caption)
+  
+  tbl
+}
+
+# Every caption carries the exposure window so a table cannot be lifted into a
+# manuscript without it.
+cap <- function(txt) paste0("**", txt, "** *(arms defined by therapy in the ", EXPOSURE_LABEL, ")*")
+
+## Table 1: Rejection vs Rituxan vs Control (3-arm)
+tbl1_df <- bind_rows(
+  pat_rej_demo_table   %>% mutate(REJ_GROUP = "Rejection"),
+  pat_ritux_demo_table %>% mutate(REJ_GROUP = "Rituxan"),
+  pat_ctrl_demo_table  %>% mutate(REJ_GROUP = "Control")
+) %>%
+  mutate(REJ_GROUP = factor(REJ_GROUP, levels = c("Rejection", "Rituxan", "Control")))
+
+gts_table1 <- build_gts_table(
+  tbl1_df, "REJ_GROUP", cont_test = "auto",
+  caption = cap("Table 1. Baseline Characteristics: Rejection vs. Rituxan vs. Control")
+)
+print(
+  gts_table1
+)
+
+## Table 2: Combined vs Steroid (propensity matched)
+tbl2_df <- bind_rows(
+  pat_combined_demo_table_m_steroid %>% mutate(REJ_GROUP = "Combined"),
+  pat_steroid_demo_table_m          %>% mutate(REJ_GROUP = "Steroid")
+) %>%
+  mutate(REJ_GROUP = factor(REJ_GROUP, levels = c("Combined", "Steroid")))
+
+gts_table2 <- build_gts_table(
+  tbl2_df, "REJ_GROUP",
+  caption = cap("Table 2. Combined vs. Steroid (Propensity Matched)")
+)
+print(
+  gts_table2
+)
+
+## Table 3: Combined vs No Rejection (propensity matched)
+tbl3_df <- bind_rows(
+  pat_combined_demo_table_m_ctrl %>% mutate(REJ_GROUP = "Combined"),
+  pat_ctrl_demo_table_m          %>% mutate(REJ_GROUP = "Control")
+) %>%
+  mutate(REJ_GROUP = factor(REJ_GROUP, levels = c("Combined", "Control")))
+
+gts_table3 <- build_gts_table(
+  tbl3_df, "REJ_GROUP",
+  caption = cap("Table 3. Combined Therapy vs. No Rejection (Propensity Matched)")
+)
+print(
+  gts_table3
+)
+
+## Table 4: Combined vs Steroid (unmatched)
+tbl4_df <- bind_rows(
+  pat_combined_demo_table %>% mutate(REJ_GROUP = "Combined"),
+  pat_steroid_demo_table  %>% mutate(REJ_GROUP = "Steroid")
+) %>%
+  mutate(REJ_GROUP = factor(REJ_GROUP, levels = c("Combined", "Steroid")))
+
+gts_table4 <- build_gts_table(
+  tbl4_df, "REJ_GROUP",
+  caption = cap("Table 4. Combined vs. Steroid (Unmatched)")
+)
+print(
+  gts_table4
+)
+
+## Table 5: Combined vs No Rejection (unmatched)
+tbl5_df <- bind_rows(
+  pat_combined_demo_table %>% mutate(REJ_GROUP = "Combined"),
+  pat_ctrl_demo_table     %>% mutate(REJ_GROUP = "Control")
+) %>%
+  mutate(REJ_GROUP = factor(REJ_GROUP, levels = c("Combined", "Control")))
+
+gts_table5 <- build_gts_table(
+  tbl5_df, "REJ_GROUP",
+  caption = cap("Table 5. Combined Therapy vs. No Rejection (Unmatched)")
+)
+print(
+  gts_table5
+)
+
+## Table 6: Steroid + Combined pooled vs No Rejection (unmatched).
+## Steroid and Combined are disjoint by construction (both are drawn from the
+## monotherapy subset of the landmark assignment), so distinct() is a
+## defensive guard rather than something expected to remove rows.
+tbl6_df <- bind_rows(
+  pat_steroid_demo_table  %>% mutate(REJ_GROUP = "Any Therapy"),
+  pat_combined_demo_table %>% mutate(REJ_GROUP = "Any Therapy"),
+  pat_ctrl_demo_table     %>% mutate(REJ_GROUP = "Control")
+) %>%
+  distinct(TRR_ID_CODE, .keep_all = TRUE) %>%
+  mutate(REJ_GROUP = factor(REJ_GROUP, levels = c("Any Therapy", "Control")))
+
+gts_table6 <- build_gts_table(
+  tbl6_df, "REJ_GROUP",
+  caption = cap("Table 6. Any Anti-Rejection Therapy (Steroid + Combined) vs. No Rejection (Unmatched)")
+)
+print(
+  gts_table6
+)
+
+## Table 7: all four arms at once. This no longer needs the survival section
+## to have run -- ARM is attached in section 13.
+tbl7_df <- pat_all_demo_table %>%
+  filter(ARM %in% c("Control", "Steroids", "Combined", "Dual Therapy")) %>%
+  mutate(REJ_GROUP = factor(as.character(ARM),
+                            levels = c("Control", "Steroids", "Combined", "Dual Therapy")))
+
+gts_table7 <- build_gts_table(
+  tbl7_df, "REJ_GROUP", cont_test = "auto",
+  caption = cap("Table 7. Recipient Characteristics by Anti-Rejection Therapy Arm")
+)
+print(
+  gts_table7
+)
+
+# NOTES:
+# 1. Categorical p-values come from gts_safe_cat_test(), so the tables and the
+#    year-2 analyses apply an identical chi-square/Fisher rule.
+# 2. Continuous rows use t-test (2 arms) or ANOVA (3+). If MELD or cold
+#    ischemic time are skewed, set that variable individually, e.g.
+#    add_p(test = list(MELD_PELD_LAB_SCORE ~ "wilcox.test", ...)) -- and update
+#    the footnote string, which gtsummary prints verbatim.
+# 3. To export: as_flex_table() (Word), as_gt() (further gt customization), or
+#    as_kable_extra() (PDF via LaTeX).
+
+
+#===============================================================================
+# 16b. Deceased Donor Characteristic Tables (1D-7D)
+#-------------------------------------------------------------------------------
+# Same comparisons as Tables 1-7, donor-side rows. These reuse tbl1_df ...
+# tbl7_df directly, because pat_demo_base already carries the donor columns.
+#===============================================================================
+
+# Restricting to HAS_DECEASED_DON == 1 inside the prep function (rather than
+# in each caller) means the "N =" in each column header is the DECEASED-DONOR N
+# for that arm, not the arm's total N. Those differ by the living-donor
+# recipients, so quote a donor-table N only alongside donor-table results.
+#
+# Unknown-code handling: UNOS uses out-of-range sentinels for "unknown"
+# (HIST_DIABETES_DON == 998, "U" for Y/N/U history fields, "U"/"I"/"ND" for
+# serology). These map to NA rather than forming their own level, because a
+# level called "U" competes for percentage share with the real categories and
+# drags an expected cell count under 5, flipping the row to a simulated Fisher
+# test for no reason. missing = "ifany" then shows how many are unknown.
+prep_donor_gts_df <- function(df) {
+  donor_join_cols <- setdiff(names(df_deceased_don_fil2), "TRR_ID_CODE")
+  df %>%
+    select(-any_of(donor_join_cols)) %>%          # drop stale copies before joining
+    left_join(df_deceased_don_fil2, by = "TRR_ID_CODE") %>%
+    filter(!is.na(HAS_DECEASED_DON), HAS_DECEASED_DON == 1L) %>%
+    ensure_cols(c("AGE_DON", "GENDER_DON", "HGT_CM_DON", "WGT_KG_DON", "BMI_DON",
+                  "ETHCAT_DON", "HIST_HTN_DON", "HIST_DM_DON", "COD_DON",
+                  "CREAT_DON", "SGOT_DON", "SGPT_DON", "TBILI_DON", "HCV_DON",
+                  "DCD_DON", "LI_FIBROSIS", "LI_MACHINE_PERFUSION",
+                  "LI_MACHINE_PERFUSION_TY")) %>%
+    mutate(
+      across(any_of(c("AGE_DON", "HGT_CM_DON", "WGT_KG_DON", "BMI_DON",
+                      "CREAT_DON", "SGOT_DON", "SGPT_DON", "TBILI_DON")),
+             ~ suppressWarnings(as.numeric(.x))),
+      
+      DON_SEX_LBL = case_when(
+        GENDER_DON == "M" ~ "Male",
+        GENDER_DON == "F" ~ "Female",
+        TRUE ~ NA_character_
+      ),
+      
+      DON_RACE_LBL = case_when(
+        as.character(ETHCAT_DON) == "1" ~ "White",
+        as.character(ETHCAT_DON) == "2" ~ "Black/African American",
+        as.character(ETHCAT_DON) == "4" ~ "Hispanic/Latino",
+        as.character(ETHCAT_DON) == "5" ~ "Asian",
+        !is.na(ETHCAT_DON)              ~ "Other",
+        TRUE ~ NA_character_
+      ),
+      
+      DON_HTN_LBL = case_when(
+        HIST_HTN_DON == "Y" ~ "Yes",
+        HIST_HTN_DON == "N" ~ "No",
+        TRUE ~ NA_character_
+      ),
+      
+      # HIST_DIABETES_DON mirrors the recipient DIAB coding: 1 = No,
+      # 2-5 = Yes (by duration), 998 = Unknown.
+      DON_DM_LBL = case_when(
+        suppressWarnings(as.numeric(HIST_DM_DON)) %in% 2:5 ~ "Yes",
+        suppressWarnings(as.numeric(HIST_DM_DON)) == 1     ~ "No",
+        HIST_DM_DON == "Y" ~ "Yes",
+        HIST_DM_DON == "N" ~ "No",
+        TRUE ~ NA_character_
+      ),
+      
+      # COD_CAD_DON: 1 Anoxia, 2 Cerebrovascular/Stroke, 3 Head Trauma,
+      # 4 CNS Tumor, 999 Other.
+      DON_COD_LBL = case_when(
+        as.character(COD_DON) == "1"   ~ "Anoxia",
+        as.character(COD_DON) == "2"   ~ "Cerebrovascular/Stroke",
+        as.character(COD_DON) == "3"   ~ "Head trauma",
+        as.character(COD_DON) == "4"   ~ "CNS tumor",
+        as.character(COD_DON) == "999" ~ "Other",
+        !is.na(COD_DON)                ~ "Other",
+        TRUE ~ NA_character_
+      ),
+      DON_COD_CVA_LBL = case_when(
+        is.na(DON_COD_LBL) ~ NA_character_,
+        DON_COD_LBL == "Cerebrovascular/Stroke" ~ "Yes",
+        TRUE ~ "No"
+      ),
+      
+      DON_HCV_LBL = case_when(
+        HCV_DON == "P" ~ "Yes",
+        HCV_DON == "N" ~ "No",
+        TRUE ~ NA_character_
+      ),
+      
+      DON_DCD_LBL = case_when(
+        DCD_DON == "Y" ~ "Yes",
+        DCD_DON == "N" ~ "No",
+        TRUE ~ NA_character_
+      ),
+      
+      DON_PERFUSION_LBL = case_when(
+        LI_MACHINE_PERFUSION == "Y" ~ "Yes",
+        LI_MACHINE_PERFUSION == "N" ~ "No",
+        TRUE ~ NA_character_
+      ),
+      DON_PERFUSION_TY_LBL = case_when(
+        as.character(LI_MACHINE_PERFUSION_TY) == "1" ~ "Normothermic",
+        as.character(LI_MACHINE_PERFUSION_TY) == "2" ~ "Hypothermic",
+        TRUE ~ NA_character_
+      ),
+      DON_FIBROSIS_STAGE = factor(suppressWarnings(as.numeric(LI_FIBROSIS)), levels = 0:6),
+      DON_FIBROSIS_ANY_LBL = case_when(
+        suppressWarnings(as.numeric(LI_FIBROSIS)) == 0     ~ "No",
+        suppressWarnings(as.numeric(LI_FIBROSIS)) %in% 1:6 ~ "Yes",
+        TRUE ~ NA_character_
+      )
+    )
+}
+
+donor_vars_all <- c(
+  "AGE_DON", "DON_SEX_LBL", "HGT_CM_DON", "WGT_KG_DON", "BMI_DON",
+  "DON_RACE_LBL", "DON_HTN_LBL", "DON_DM_LBL", "DON_COD_CVA_LBL", "DON_COD_LBL",
+  "CREAT_DON", "SGOT_DON", "SGPT_DON", "TBILI_DON",
+  "DON_HCV_LBL", "DON_DCD_LBL", "DON_FIBROSIS_ANY_LBL", "DON_FIBROSIS_STAGE",
+  "DON_PERFUSION_LBL", "DON_PERFUSION_TY_LBL"
+)
+
+donor_labels_all <- list(
+  AGE_DON              ~ "Donor age, mean (SD), y",
+  DON_SEX_LBL          ~ "Donor sex, n (%)",
+  HGT_CM_DON           ~ "Height, mean (SD), cm",
+  WGT_KG_DON           ~ "Weight, mean (SD), kg",
+  BMI_DON              ~ "BMI, mean (SD), kg/m2",
+  DON_RACE_LBL         ~ "Race/ethnicity, n (%)",
+  DON_HTN_LBL          ~ "History of hypertension, n (%)",
+  DON_DM_LBL           ~ "History of diabetes, n (%)",
+  DON_COD_CVA_LBL      ~ "Cause of death: cerebrovascular/stroke, n (%)",
+  DON_COD_LBL          ~ "Cause of death, n (%)",
+  CREAT_DON            ~ "Serum creatinine, mean (SD), mg/dL",
+  SGOT_DON             ~ "AST (SGOT), mean (SD), U/L",
+  SGPT_DON             ~ "ALT (SGPT), mean (SD), U/L",
+  TBILI_DON            ~ "Total bilirubin, mean (SD), mg/dL",
+  DON_HCV_LBL          ~ "HCV+ status, n (%)",
+  DON_DCD_LBL          ~ "Donation after circulatory death, n (%)",
+  DON_FIBROSIS_ANY_LBL ~ "Any fibrosis on biopsy, n (%)",
+  DON_FIBROSIS_STAGE   ~ "Fibrosis stage, n (%)",
+  DON_PERFUSION_LBL    ~ "Machine perfusion used, n (%)",
+  DON_PERFUSION_TY_LBL ~ "Perfusion type, n (%)"
+)
+
+# Keep only rows whose underlying source column actually resolved in section 10.
+donor_row_requires <- c(
+  AGE_DON = "AGE_DON", DON_SEX_LBL = "GENDER_DON", HGT_CM_DON = "HGT_CM_DON",
+  WGT_KG_DON = "WGT_KG_DON", BMI_DON = "BMI_DON", DON_RACE_LBL = "ETHCAT_DON",
+  DON_HTN_LBL = "HIST_HTN_DON", DON_DM_LBL = "HIST_DM_DON",
+  DON_COD_CVA_LBL = "COD_DON", DON_COD_LBL = "COD_DON", CREAT_DON = "CREAT_DON",
+  SGOT_DON = "SGOT_DON", SGPT_DON = "SGPT_DON", TBILI_DON = "TBILI_DON",
+  DON_HCV_LBL = "HCV_DON", DON_DCD_LBL = "DCD_DON",
+  DON_FIBROSIS_ANY_LBL = "LI_FIBROSIS", DON_FIBROSIS_STAGE = "LI_FIBROSIS",
+  DON_PERFUSION_LBL = "LI_MACHINE_PERFUSION",
+  DON_PERFUSION_TY_LBL = "LI_MACHINE_PERFUSION_TY"
+)
+
+donor_vars <- donor_vars_all[
+  donor_row_requires[donor_vars_all] %in% names(donor_cols_found)
+]
+
+donor_labels <- donor_labels_all[
+  vapply(donor_labels_all, function(f) all.vars(f)[1] %in% donor_vars, logical(1))
+]
+
+message("Donor table rows included: ", paste(donor_vars, collapse = ", "))
+
+# Optional: drop the full cause-of-death breakdown, keeping only the binary
+# stroke row, to match the reference table exactly.
+# donor_vars <- setdiff(donor_vars, "DON_COD_LBL")
+# donor_labels <- donor_labels[vapply(donor_labels, function(f) all.vars(f)[1] != "DON_COD_LBL", logical(1))]
+
+build_donor_table <- function(df_combined, group_col = "REJ_GROUP", caption = NULL) {
+  build_gts_table(
+    df_combined, group_col,
+    caption      = caption,
+    vars         = donor_vars,
+    labels       = donor_labels,
+    prep_fn      = prep_donor_gts_df,
+    cont_test    = "auto",
+    missing_disp = "ifany"
+  )
+}
+
+gts_donor1 <- build_donor_table(tbl1_df, caption = cap("Table 1D. Deceased Donor Characteristics: Rejection vs. Rituxan vs. Control"))
+print(
+  gts_donor1
+)
+gts_donor2 <- build_donor_table(tbl2_df, caption = cap("Table 2D. Deceased Donor Characteristics: Combined vs. Steroid (Propensity Matched)"))
+print(
+  gts_donor2
+)
+gts_donor3 <- build_donor_table(tbl3_df, caption = cap("Table 3D. Deceased Donor Characteristics: Combined vs. No Rejection (Propensity Matched)"))
+print(
+  gts_donor3
+)
+gts_donor4 <- build_donor_table(tbl4_df, caption = cap("Table 4D. Deceased Donor Characteristics: Combined vs. Steroid (Unmatched)"))
+print(
+  gts_donor4
+)
+gts_donor5 <- build_donor_table(tbl5_df, caption = cap("Table 5D. Deceased Donor Characteristics: Combined vs. No Rejection (Unmatched)"))
+print(
+  gts_donor5
+)
+gts_donor6 <- build_donor_table(tbl6_df, caption = cap("Table 6D. Deceased Donor Characteristics: Any Anti-Rejection Therapy vs. No Rejection (Unmatched)"))
+print(
+  gts_donor6
+)
+gts_donor7 <- build_donor_table(tbl7_df, caption = cap("Table 7D. Deceased Donor Characteristics by Anti-Rejection Therapy Arm"))
+print(
+  gts_donor7
+)
+
+# Export example:
+# library(flextable); library(officer)
+# read_docx() |>
+#   body_add_flextable(as_flex_table(gts_donor1)) |>
+#   body_add_break() |>
+#   body_add_flextable(as_flex_table(gts_donor2)) |>
+#   print(target = "donor_tables.docx")
+
+# NOTES:
+# 1. VERIFY THE COLUMN NAMES FIRST. Run sort(names(df_deceased_don_fil)) and
+#    reconcile against donor_var_candidates. Any concept reported as "NOT
+#    found" at startup is silently absent from every donor table.
+# 2. Donor N != arm N. Living-donor recipients have no deceased-donor record
+#    and are excluded by prep_donor_gts_df(). Reconcile against the "Living
+#    Donor, n (%)" row of the matching recipient table.
+# 3. These arms were propensity-matched on RECIPIENT covariates only. Donor
+#    characteristics were never balanced, so a significant donor-side p-value
+#    in Table 2D/3D is a real finding about residual confounding, not a
+#    matching failure -- and it belongs in the adjusted models.
+# 4. Donor labs (AST, ALT, bilirubin, creatinine) are heavily right-skewed.
+#    Consider cont_test = "kruskal.test" with median (IQR) for those rows.
+
+
+#===============================================================================
+# 17. Frequency of combination anti-rejection therapy used WITH steroids
+#-------------------------------------------------------------------------------
+# Restricted to first events inside the exposure window, so this describes the
+# Dual Therapy arm as the models actually define it.
+#===============================================================================
+dual_therapy_array <- pat_rej_first %>%
+  filter(!is.na(REJ_TX_DAY), REJ_TX_DAY < LANDMARK_DAY) %>%
+  filter(STEROIDS_ANTIREJ == 1) %>%
+  filter(SIMULECT_ANTIREJ == 1 | THYMOGLOBULIN_ANTIREJ == 1 | RITUXAN_ANTIREJ == 1)
+
+med_cols <- c("THYMOGLOBULIN_ANTIREJ", "RITUXAN_ANTIREJ", "ATGAM_ANTIREJ", "SIMULECT_ANTIREJ")
+
+pivot_table <- dual_therapy_array %>%
+  summarise(across(all_of(med_cols), ~ sum(.x > 0, na.rm = TRUE))) %>%
+  pivot_longer(everything(), names_to = "Medication", values_to = "Frequency") %>%
+  arrange(desc(Frequency)) %>%
+  mutate(
+    Medication = str_remove(Medication, COL_TAIL),
+    Percent = Frequency / pmax(sum(Frequency), 1)
+  )
+
+print(
+  ggplot(pivot_table, aes(x = reorder(Medication, Frequency), y = Frequency)) +
+    geom_col(fill = "steelblue") +
+    geom_text(aes(label = paste0(Frequency, " (", percent(Percent, accuracy = 0.1), ")")),
+              hjust = -0.1, size = 3.5) +
+    coord_flip() +
+    labs(
+      title = "Frequency of Combination Anti-Rejection Rx with Steroids",
+      subtitle = paste0("First treatment episode within the ", EXPOSURE_LABEL,
+                        "; n = ", nrow(dual_therapy_array), " patients"),
+      x = "Secondary Medication", y = "Frequency"
+    ) +
+    theme_minimal() +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.15)))
+)
+
+
+#===============================================================================
+# 18. Survival Analysis -- Landmark Design
+#-------------------------------------------------------------------------------
+# IMMORTAL TIME BIAS.
+#
+# Defining group membership from anti-rejection treatment received during a
+# window, but starting the survival clock at TRANSPLANT, is immortal time bias:
+#
+#   * A patient who died on day 40 could not possibly have received a day-80
+#     rejection treatment. They are forced into Control by construction -- not
+#     because they avoided rejection, but because they died first.
+#   * Every treated patient is GUARANTEED to have survived to their treatment
+#     date. A naive KM curve credits that guaranteed survival to the treatment.
+#   * Treated arms therefore look structurally protected early on, and Control
+#     absorbs the early deaths.
+#
+# DESIGN: exposure over [0, LANDMARK_DAY); only patients still under
+# observation AT the landmark enter; the clock resets to start at the landmark.
+#
+# WHAT THE 90-DAY LANDMARK BUYS AND COSTS, versus 365:
+#   + Far fewer patients discarded (only deaths in the first 90 days are lost
+#     rather than the whole first year), so the estimand is much closer to
+#     overall post-transplant survival and the Control arm is far larger.
+#   + Longer post-landmark follow-up for the same administrative censoring.
+#   - Rejections treated after day 90 count as non-exposure. This is a
+#     treat-as-of-landmark analysis, and its Control arm is contaminated
+#     accordingly (section 7, Step 4).
+#
+# INTERPRETATION: time on the x-axis is DAYS SINCE THE LANDMARK. These are
+# conditional survival estimates -- survival given the patient reached day 90 --
+# and NOT the same estimand as a transplant-anchored plot. Label them as such.
+#===============================================================================
+
+# scale_x_continuous() REPLACES the scale survminer builds from
+# break.time.by, so the replacement must carry the same breaks explicitly or
+# the tick marks silently disappear.
+fix_origin <- function(p, break_by = NULL, max_time = NULL) {
+  x_scale <- if (!is.null(break_by) && !is.null(max_time)) {
+    ggplot2::scale_x_continuous(
+      expand = ggplot2::expansion(mult = c(0, 0.02)),
+      breaks = seq(0, max_time, by = break_by)
+    )
+  } else {
+    ggplot2::scale_x_continuous(expand = ggplot2::expansion(mult = c(0, 0.02)))
+  }
+  
+  p$plot <- suppressMessages(
+    p$plot + x_scale +
+      ggplot2::scale_y_continuous(expand = ggplot2::expansion(mult = c(0, 0.02)), limits = c(0, 1))
+  )
+  if (!is.null(p$table)) {
+    p$table <- suppressMessages(p$table + x_scale)
+  }
+  p
+}
+
+# --- Step 1: base survival frame ---
+df_survival <- df_liver_data_filtered |>
+  select(TRR_ID_CODE, TX_DATE, COMPOSITE_DEATH_DATE, RETXDATE, PTIME, PX_STAT, PX_STAT_DATE) |>
+  mutate(PTIME = suppressWarnings(as.numeric(PTIME))) |>
+  distinct(TRR_ID_CODE, .keep_all = TRUE) |>
+  mutate(event = ifelse(PX_STAT == "D", 1, 0))   # confirm "D" is the death code
+
+baseline_covs <- df_liver_data_filtered %>%
+  select(TRR_ID_CODE, AGE, GENDER, ETHCAT, MELD_PELD_LAB_SCORE, COLD_ISCH, DIAB) %>%
+  distinct(TRR_ID_CODE, .keep_all = TRUE) %>%
+  left_join(df_hla_calc %>% select(TRR_ID_CODE, MM_TOTAL), by = "TRR_ID_CODE") %>%
+  mutate(
+    DIAB_BIN = diab_bin(DIAB),
+    GENDER = factor(GENDER),
+    ETHCAT = factor(ETHCAT)
+  )
+
+# --- Step 2: build the landmark survival dataset ---
+# Three things happen together and all three are necessary:
+#   (a) arms assigned from exposure BEFORE the landmark,
+#   (b) patients not still under observation AT the landmark are DROPPED,
+#   (c) the clock is reset so t = 0 is the landmark.
+# Doing (a) without (b) and (c) is exactly the original bug.
+build_landmark_surv <- function(landmark_day, horizon_days) {
+  arms <- assign_arm_at_landmark(landmark_day)
+  
+  out <- df_survival %>%
+    inner_join(arms, by = "TRR_ID_CODE") %>%
+    filter(!is.na(PTIME), PTIME >= landmark_day) %>%     # (b)
+    mutate(
+      time_raw = PTIME - landmark_day,                   # (c)
+      event_lm = if_else(time_raw <= horizon_days, event, 0),
+      time_lm  = pmin(time_raw, horizon_days),
+      ARM = factor(as.character(ARM), levels = ARM_LEVELS)
+    )
+  
+  n_zero <- sum(out$time_lm == 0)
+  if (n_zero > 0) {
+    message("  note: ", n_zero, " patient(s) have exactly 0 days of post-landmark follow-up")
+  }
+  out
+}
+
+df_lm_short <- build_landmark_surv(LANDMARK_DAY, LM_HORIZON_SHORT)
+df_lm_long  <- build_landmark_surv(LANDMARK_DAY, LM_HORIZON_LONG)
+
+# --- Step 3: landmark attrition, at BOTH cut points ---
+# The second one is new and matters: the survival analysis is eligible at day
+# 90 but the YEAR-2 OUTCOME analysis requires survival to day 365. If mortality
+# between day 90 and day 365 differs by arm, the year-2 models condition on a
+# post-exposure variable and acquire a selection component. This table is how
+# to check that.
+attrition_at <- function(day, label) {
+  assign_arm_at_landmark(LANDMARK_DAY) %>%
+    left_join(df_survival %>% select(TRR_ID_CODE, PTIME), by = "TRR_ID_CODE") %>%
+    group_by(ARM) %>%
+    summarise(
+      n_assigned = n(),
+      n_observed = sum(!is.na(PTIME) & PTIME >= day),
+      n_lost     = n_assigned - n_observed,
+      pct_lost   = 100 * n_lost / n_assigned,
+      .groups = "drop"
+    ) %>%
+    mutate(Checkpoint = label, .before = 1)
+}
+
+landmark_attrition <- bind_rows(
+  attrition_at(LANDMARK_DAY,     paste0("Landmark (day ", round(LANDMARK_DAY), ")")),
+  attrition_at(YR2_ELIGIBLE_DAY, paste0("Year-2 eligibility (day ", round(YR2_ELIGIBLE_DAY), ")"))
+)
+
+print(
+  landmark_attrition %>%
+    gt(groupname_col = "Checkpoint") %>%
+    fmt_number(columns = pct_lost, decimals = 1) %>%
+    cols_label(
+      ARM        = "Arm",
+      n_assigned = "N assigned to arm",
+      n_observed = "N still observed",
+      n_lost     = "N excluded",
+      pct_lost   = "% excluded"
+    ) %>%
+    tab_header(title = "Attrition by Arm, at the Landmark and at Year-2 Eligibility") %>%
+    tab_options(table.font.size = 13, data_row.padding = px(4),
+                column_labels.font.weight = "bold", row_group.font.weight = "bold") %>%
+    tab_source_note(paste0(
+      "TOP BLOCK: patients excluded from the survival analysis because they were no longer under ",
+      "observation at day ", round(LANDMARK_DAY), ". A markedly higher exclusion rate in Control is the ",
+      "immortal time bias made explicit. BOTTOM BLOCK: the additional attrition required by the year-2 ",
+      "outcome analyses, which need survival to day ", round(YR2_ELIGIBLE_DAY), ". Because exposure is ",
+      "fixed at day ", round(LANDMARK_DAY), " but eligibility for the year-2 outcome is at day ",
+      round(YR2_ELIGIBLE_DAY), ", any BETWEEN-ARM difference in the bottom block means the year-2 models ",
+      "condition on a post-exposure variable, and their odds ratios carry a selection component. ",
+      "Differences here belong in the limitations."))
+)
+
+# --- Step 4: KM plotting helper ---
+# The log-rank p-value is computed here and passed to ggsurvplot as a
+# pre-formatted STRING rather than via pval = TRUE, because survminer
+# re-evaluates the model formula in the calling frame when asked to compute it
+# itself, which breaks when the data lives in a function-local variable.
+plot_landmark_km <- function(df, arms_keep, horizon, break_by, title) {
+  d <- df %>% filter(ARM %in% arms_keep) %>% mutate(ARM = droplevels(ARM))
+  
+  if (nlevels(d$ARM) < 2) {
+    message("skipping plot -- fewer than 2 non-empty arms: ", title)
+    return(invisible(NULL))
+  }
+  
+  fit <- survfit(Surv(time_lm, event_lm) ~ ARM, data = d)
+  
+  sd_test  <- survdiff(Surv(time_lm, event_lm) ~ ARM, data = d)
+  pv       <- 1 - pchisq(sd_test$chisq, length(sd_test$n) - 1)
+  pval_lbl <- if (pv < 0.001) "log-rank p < 0.001" else sprintf("log-rank p = %.3f", pv)
+  
+  p <- ggsurvplot(
+    fit, data = d, pval = pval_lbl, conf.int = TRUE, risk.table = TRUE,
+    break.time.by = break_by, legend.title = "Group", legend.labs = levels(d$ARM),
+    xlab = paste0("Days since landmark (", LM_LABEL, ")"),
+    ylab = "Survival Probability", title = title
+  )
+  fix_origin(p, break_by = break_by, max_time = horizon)
+}
+
+# Titles built from the constants so they can't claim "years 1-2" at a 90-day
+# landmark.
+km_title <- function(txt, horizon_end) {
+  paste0(txt, " (post-transplant days ", round(LANDMARK_DAY), "-", round(horizon_end), ")")
+}
+
+# --- Step 5: descriptive KM curves on the unmatched landmark cohort ---
+print(plot_landmark_km(
+  df_lm_short, c("Steroids", "Combined", "Control"), LM_HORIZON_SHORT, 90,
+  km_title("Conditional Survival, Landmark Unmatched", LM_SHORT_END)
+))
+
+print(plot_landmark_km(
+  df_lm_long, c("Steroids", "Combined", "Control"), LM_HORIZON_LONG, 180,
+  km_title("Conditional Survival, Landmark Unmatched", LM_LONG_END)
+))
+
+print(plot_landmark_km(
+  df_lm_long, c("Steroids", "Dual Therapy"), LM_HORIZON_LONG, 180,
+  km_title("Steroids vs Dual Therapy, Landmark Unmatched", LM_LONG_END)
+))
+
+print(plot_landmark_km(
+  df_lm_long, c("Dual Therapy", "Combined"), LM_HORIZON_LONG, 180,
+  km_title("Dual Therapy vs Combined, Landmark Unmatched", LM_LONG_END)
+))
+
+fit_lm_3arm_short <- survfit(Surv(time_lm, event_lm) ~ ARM,
+                             data = df_lm_short %>%
+                               filter(ARM %in% c("Steroids", "Combined", "Control")) %>%
+                               mutate(ARM = droplevels(ARM)))
+print(
+  summary(fit_lm_3arm_short, times = LM_HORIZON_SHORT)
+)
+
+fit_lm_3arm_long <- survfit(Surv(time_lm, event_lm) ~ ARM,
+                            data = df_lm_long %>%
+                              filter(ARM %in% c("Steroids", "Combined", "Control")) %>%
+                              mutate(ARM = droplevels(ARM)))
+print(
+  summary(fit_lm_3arm_long, times = LM_HORIZON_LONG)
+)
+
+# --- Step 6: propensity matching WITHIN the landmark cohort ---
+# Redone here rather than reusing the section-14 matches, which were fit on
+# the full cohort: applying the landmark restriction afterwards would break
+# matched pairs non-randomly (the patient who died at day 60 is dropped, their
+# match is not), reintroducing the imbalance matching existed to remove.
+#
+# Tables 2 and 3 therefore describe the FULL-COHORT matched sets, while this
+# section reports its own Ns and its own balance. Don't quote one table's N
+# alongside the other's hazard ratio.
+match_within_landmark <- function(df_lm, treat_arm, ctrl_arm, label, seed = 1234) {
+  
+  d <- df_lm %>%
+    filter(ARM %in% c(treat_arm, ctrl_arm)) %>%
+    mutate(treat = as.integer(ARM == treat_arm)) %>%
+    left_join(baseline_covs, by = "TRR_ID_CODE")
+  
+  md <- d %>% select(TRR_ID_CODE, treat, all_of(match_covariates), any_of(balance_only_covariates))
+  res <- run_match(md, label, seed = seed)
+  if (is.null(res)) return(NULL)
+  
+  list(
+    matchit     = res$matchit,
+    match_frame = res$match_frame,
+    data = d %>% filter(TRR_ID_CODE %in% res$matched_ids) %>% mutate(ARM = droplevels(ARM))
+  )
+}
+
+lm_match_steroid_combined <- match_within_landmark(
+  df_lm_long, treat_arm = "Combined", ctrl_arm = "Steroids",
+  label = "Landmark: Combined vs Steroid"
+)
+
+lm_match_combined_control <- match_within_landmark(
+  df_lm_long, treat_arm = "Combined", ctrl_arm = "Control",
+  label = "Landmark: Combined vs Control"
+)
+
+if (!is.null(lm_match_steroid_combined)) {
+  summary(lm_match_steroid_combined$matchit)
+  print(love.plot(lm_match_steroid_combined$matchit,
+                  binary = "std", stats = "mean.diffs", abs = TRUE,
+                  var.order = "unadjusted", thresholds = c(m = 0.1),
+                  title = "Landmark Cohort Balance: Combined vs Steroid",
+                  sample.names = c("Unmatched", "Matched"),
+                  addl = lm_match_steroid_combined$match_frame[balance_only_covariates]))
+}
+
+if (!is.null(lm_match_combined_control)) {
+  summary(lm_match_combined_control$matchit)
+  print(love.plot(lm_match_combined_control$matchit,
+                  binary = "std", stats = "mean.diffs", abs = TRUE,
+                  var.order = "unadjusted", thresholds = c(m = 0.1),
+                  title = "Landmark Cohort Balance: Combined vs Control",
+                  sample.names = c("Unmatched", "Matched"),
+                  addl = lm_match_combined_control$match_frame[balance_only_covariates]))
+}
+
+if (!is.null(lm_match_steroid_combined)) {
+  print(plot_landmark_km(
+    lm_match_steroid_combined$data, c("Steroids", "Combined"),
+    LM_HORIZON_LONG, 180, km_title("Combined vs Steroids, Landmark Propensity Matched", LM_LONG_END)
+  ))
+}
+
+if (!is.null(lm_match_combined_control)) {
+  print(plot_landmark_km(
+    lm_match_combined_control$data, c("Control", "Combined"),
+    LM_HORIZON_LONG, 180, km_title("Combined vs Control, Landmark Propensity Matched", LM_LONG_END)
+  ))
+}
+
+
+#===============================================================================
+# 18b. Timing of first anti-rejection treatment WITHIN the exposure window
+#-------------------------------------------------------------------------------
+# READ BEFORE INTERPRETING:
+#  1. Control has no bars -- it is defined by the ABSENCE of treatment before
+#     the landmark. The empty panel is intentional.
+#  2. The day-0 bar is IMPUTED, not observed (INPATIENT_RX_DAY). At a 90-day
+#     landmark this is a much larger share of the window than it was at 365,
+#     so the fill colour separating imputed from dated events is now load-
+#     bearing rather than decorative. If most of an arm is grey, that arm is
+#     really "treated during the index admission" and its position on the
+#     x-axis carries no information.
+#  3. Outpatient x-values are FOL_DATE_DAYS_DELTA, the date of the VISIT at
+#     which the drug was recorded -- an upper bound on the true treatment day.
+#===============================================================================
+
+tx_timing <- pat_rej_first %>%
+  filter(!is.na(REJ_TX_DAY), REJ_TX_DAY >= 0, REJ_TX_DAY < LANDMARK_DAY) %>%
+  select(TRR_ID_CODE, source, REJ_TX_DAY) %>%
+  # When RITUXAN_AS_OWN_ARM is FALSE the lookup deliberately holds a patient
+  # twice (Combined and the Rituxan subset), so this join is intentionally
+  # many-to-many. dplyr >= 1.1 warns about that; the warning is expected.
+  inner_join(timing_arm_lookup %>% select(TRR_ID_CODE, TIMING_ARM),
+             by = "TRR_ID_CODE") %>%
+  mutate(
+    SRC_LBL = if_else(source == 1L,
+                      "Index admission (day imputed to 0)",
+                      "Outpatient follow-up visit"),
+    TIMING_ARM = factor(as.character(TIMING_ARM), levels = TIMING_LEVELS)
+  )
+
+# Control's N comes from the arm lookup (patients assigned to it), not from
+# tx_timing, which has no Control rows at all.
+n_control_lm <- sum(timing_arm_lookup$TIMING_ARM == "Control")
+
+timing_n <- tx_timing %>%
+  count(TIMING_ARM, .drop = FALSE, name = "n_treated") %>%
+  mutate(
+    lbl = if_else(
+      TIMING_ARM == "Control",
+      paste0("n = ", n_control_lm, " assigned\n0 treated (arm definition)"),
+      paste0("n = ", n_treated, " treated")
+    )
+  )
+
+# --- Plot A: faceted histogram, split by timing source ---
+# scales = "free_y" because Steroids typically dwarfs the other arms; bar
+# heights are therefore NOT comparable across panels. Use Plot B or C for
+# cross-arm comparison.
+p_timing_facet <- ggplot(tx_timing, aes(x = REJ_TX_DAY, fill = SRC_LBL)) +
+  geom_histogram(binwidth = TIMING_BINWIDTH, boundary = 0,
+                 colour = "white", linewidth = 0.2) +
+  geom_text(data = timing_n, aes(x = Inf, y = Inf, label = lbl),
+            inherit.aes = FALSE, hjust = 1.05, vjust = 1.3, size = 3) +
+  facet_wrap(~ TIMING_ARM, ncol = 2, drop = FALSE, scales = "free_y") +
+  scale_x_continuous(breaks = seq(0, LANDMARK_DAY, by = TIMING_BREAK_BY),
+                     limits = c(0, LANDMARK_DAY),
+                     expand = expansion(mult = c(0, 0.02))) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  scale_fill_manual(values = c("Index admission (day imputed to 0)" = "grey60",
+                               "Outpatient follow-up visit" = "steelblue")) +
+  labs(
+    title = "Timing of First Anti-Rejection Therapy, by Arm",
+    subtitle = paste0("Exposure window: ", EXPOSURE_LABEL, "; ",
+                      TIMING_BINWIDTH, "-day bins"),
+    x = "Days since transplant", y = "Patients", fill = "Timing source",
+    caption = "Y axes are independent per panel. Day-0 bar is imputed, not observed."
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom", strip.text = element_text(face = "bold"))
+
+# In this cohort every exposure event is an index-admission record imputed to
+# day 0, so all three figures below collapse to a single bar / a step function
+# at 0. Guarded rather than deleted so they come back automatically if a future
+# extract carries dated pre-landmark outpatient events.
+TIMING_DEGENERATE <- n_distinct(tx_timing$REJ_TX_DAY[!is.na(tx_timing$REJ_TX_DAY)]) <= 2
+if (TIMING_DEGENERATE) {
+  message("18b: all exposure events fall on a single imputed day (index admission); ",
+          "timing figures skipped. The exposure is 'therapy during the index admission', ",
+          "NOT 'therapy within ", LANDMARK_DAY, " days' -- describe it that way.")
+}
+
+if (!TIMING_DEGENERATE) print(p_timing_facet)
+
+# --- Plot B: overlaid distributions, day 0 dropped ---
+# Density rather than counts so arms of very different size are comparable.
+# Excluding day 0 removes the imputed point mass that would otherwise dominate
+# every curve identically.
+tx_timing_dated <- tx_timing %>% filter(REJ_TX_DAY > 0)
+
+if (nrow(tx_timing_dated) > 0) {
+  print(
+    ggplot(tx_timing_dated, aes(x = REJ_TX_DAY, colour = TIMING_ARM)) +
+      geom_freqpoly(aes(y = after_stat(density)),
+                    binwidth = TIMING_BINWIDTH, boundary = 0, linewidth = 0.8) +
+      scale_x_continuous(breaks = seq(0, LANDMARK_DAY, by = TIMING_BREAK_BY),
+                         limits = c(0, LANDMARK_DAY)) +
+      scale_colour_brewer(palette = "Dark2", drop = TRUE) +
+      labs(
+        title = "First Anti-Rejection Therapy: Distribution of Treatment Day",
+        subtitle = "Index-admission (day-0 imputed) events excluded; density-scaled for cross-arm comparison",
+        x = "Days since transplant", y = "Density", colour = "Arm"
+      ) +
+      theme_minimal() + theme(legend.position = "bottom")
+  )
+}
+
+# --- Plot C: cumulative proportion treated ---
+# Least sensitive to bin width and to visit-date clustering.
+if (!TIMING_DEGENERATE) print(
+  ggplot(tx_timing, aes(x = REJ_TX_DAY, colour = TIMING_ARM)) +
+    stat_ecdf(geom = "step", linewidth = 0.8, na.rm = TRUE) +
+    scale_x_continuous(breaks = seq(0, LANDMARK_DAY, by = TIMING_BREAK_BY),
+                       limits = c(0, LANDMARK_DAY)) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1)) +
+    scale_colour_brewer(palette = "Dark2", drop = TRUE) +
+    labs(
+      title = "Cumulative Proportion of Each Treated Arm Already Treated, by Day",
+      subtitle = "Denominator is the arm's treated patients, not the full cohort",
+      x = "Days since transplant", y = "Cumulative % of arm treated", colour = "Arm"
+    ) +
+    theme_minimal() + theme(legend.position = "bottom")
+)
+
+# --- Summary table ---
+# The cumulative-percentage cutpoints are DERIVED from LANDMARK_DAY. The old
+# hard-coded 30/90/180 columns would all read 100% at a 90-day landmark.
+TIMING_PCT_MARKS <- c(7, 14, 30, 60, 90, 180)
+TIMING_PCT_MARKS <- TIMING_PCT_MARKS[TIMING_PCT_MARKS <= LANDMARK_DAY]
+if (!length(TIMING_PCT_MARKS)) TIMING_PCT_MARKS <- round(LANDMARK_DAY / 2)
+
+pct_marks_tbl <- lapply(TIMING_PCT_MARKS, function(d) {
+  tx_timing %>%
+    group_by(TIMING_ARM, .drop = FALSE) %>%
+    summarise(pct = 100 * mean(REJ_TX_DAY <= d, na.rm = TRUE), .groups = "drop") %>%
+    mutate(col = paste0("pct_by_d", d))
+}) %>%
+  bind_rows() %>%
+  pivot_wider(names_from = col, values_from = pct)
+
+# Median/IQR on DATED events only -- including the imputed zeros would drag the
+# median toward 0 by an amount that depends entirely on each arm's inpatient
+# share, which is exactly the quantity that differs between arms.
+timing_summary <- tx_timing %>%
+  group_by(TIMING_ARM, .drop = FALSE) %>%
+  summarise(
+    n_treated   = n(),
+    n_inpatient = sum(source == 1L, na.rm = TRUE),
+    n_dated     = sum(REJ_TX_DAY > 0, na.rm = TRUE),
+    median_day  = median(REJ_TX_DAY[REJ_TX_DAY > 0], na.rm = TRUE),
+    q1_day      = quantile(REJ_TX_DAY[REJ_TX_DAY > 0], 0.25, na.rm = TRUE),
+    q3_day      = quantile(REJ_TX_DAY[REJ_TX_DAY > 0], 0.75, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(pct_marks_tbl, by = "TIMING_ARM") %>%
+  mutate(
+    pct_inpatient = 100 * n_inpatient / pmax(n_treated, 1),
+    across(where(is.numeric), ~ if_else(is.nan(.x), NA_real_, .x))
+  )
+
+print(
+  timing_summary %>%
+    mutate(
+      `Median (IQR), d` = if_else(
+        is.na(median_day), NA_character_,
+        sprintf("%.0f (%.0f\u2013%.0f)", median_day, q1_day, q3_day)
+      )
+    ) %>%
+    select(TIMING_ARM, n_treated, n_inpatient, pct_inpatient, n_dated,
+           `Median (IQR), d`, starts_with("pct_by_d")) %>%
+    gt() %>%
+    fmt_number(columns = c(pct_inpatient, starts_with("pct_by_d")), decimals = 1) %>%
+    sub_missing(missing_text = "\u2014") %>%
+    cols_label(
+      TIMING_ARM    = "Arm",
+      n_treated     = "N treated",
+      n_inpatient   = "N index admission",
+      pct_inpatient = "% index admission",
+      n_dated       = "N with observed date"
+    ) %>%
+    tab_header(
+      title = "Timing of First Anti-Rejection Therapy Within the Exposure Window",
+      subtitle = paste0("Exposure window: ", EXPOSURE_LABEL)
+    ) %>%
+    tab_options(table.font.size = 13, data_row.padding = px(4),
+                column_labels.font.weight = "bold") %>%
+    tab_source_note(paste0(
+      "Control is untreated by definition and has no timing content; its N appears in the faceted figure. ",
+      "Median and IQR use only events with an observed follow-up date, because index-admission therapy is ",
+      "recorded without a date and imputed to day 0 (INPATIENT_RX_DAY); including it would bias the median ",
+      "downward in proportion to each arm's inpatient share. '% index admission' is the column to read first ",
+      "at a ", round(LANDMARK_DAY), "-day landmark: an arm that is mostly index-admission therapy is ",
+      "distinguished from the others as much by treatment SETTING as by drug, and the propensity match does ",
+      "not balance on setting. The cumulative percentages DO include the imputed day-0 events and are ",
+      "therefore upper bounds on how early each arm was treated."))
+)
+
+
+#===============================================================================
+# 18c. Timing of anti-rejection treatment AFTER the landmark
+#-------------------------------------------------------------------------------
+# Generalized to an arbitrary post-landmark window, because at a 90-day
+# landmark there are now three different windows worth looking at and they
+# answer different questions:
+#
+#   GAP     day 90-365  : treatment that is neither exposure nor outcome. This
+#                         is the picture of the contamination reported in
+#                         section 7 -- how much, and when.
+#   YEAR 1 POST-LM day 90-455 : the year immediately following exposure.
+#   OUTCOME day 365-730 : the window the year-2 odds ratios are actually about.
+#
+# READ BEFORE INTERPRETING:
+#  1. ARMS ARE FIXED AT THE LANDMARK and are NOT reassigned by post-landmark
+#     treatment. For Control, a bar is a FIRST-EVER treatment; for the treated
+#     arms it is RE-treatment. Do not read a between-arm height difference as
+#     the same event happening more often.
+#  2. UNOS follow-up is dense early and annual later, so the raw histogram
+#     partly reproduces the VISIT SCHEDULE. The visit-normalised rate figure
+#     is the one to interpret.
+#  3. No imputed day-0 spike here -- every event carries a real follow-up date.
+#===============================================================================
+
+MIN_VISITS_PER_BIN <- 20   # bins thinner than this give unstable rates
+
+postlm_timing_report <- function(start_day, end_day, window_label,
+                                 binwidth = 30, break_by = 60) {
+  
+  span <- end_day - start_day
+  if (span <= 0) {
+    message("skipping timing report -- empty window: ", window_label)
+    return(invisible(NULL))
+  }
+  
+  # Eligibility: still under observation at the START of the window. Without
+  # this, an arm with more early deaths looks less treated purely because its
+  # members were gone.
+  eligible_ids <- df_liver_data_filtered %>%
+    filter(!is.na(PTIME), PTIME >= start_day) %>%
+    pull(TRR_ID_CODE) %>% unique()
+  
+  arm_w <- timing_arm_lookup %>% filter(TRR_ID_CODE %in% eligible_ids)
+  
+  # Built from df_immuno_fol_read, not df_immuno_fol -- the latter was filtered
+  # to < 1 year in section 4.
+  #
+  # The defensive select(-any_of(...)) before the join guards the
+  # TX_DATE.x/TX_DATE.y collision if a future extract of
+  # liver_immuno_followup.csv ever carries its own TX_DATE.
+  visits <- df_immuno_fol_read %>%
+    filter(TRR_ID_CODE %in% arm_w$TRR_ID_CODE) %>%
+    select(-any_of(c("TX_DATE", "DISCHARGE_DATE"))) %>%
+    left_join(df_liver_data_filtered %>% select(TRR_ID_CODE, TX_DATE), by = "TRR_ID_CODE") %>%
+    filter(!is.na(TX_DATE)) %>%
+    mutate(
+      PX_STAT_DATE_FOL = as.Date(PX_STAT_DATE_FOL),
+      TX_DATE          = as.Date(TX_DATE),
+      FOL_DATE_DAYS_DELTA = time_length(interval(TX_DATE, PX_STAT_DATE_FOL), "days")
+    ) %>%
+    filter(FOL_DATE_DAYS_DELTA >= start_day, FOL_DATE_DAYS_DELTA <= end_day) %>%
+    mutate(
+      TREATED_VISIT = if_any(all_of(COLS_TO_CHECK), ~ !is.na(.x) & .x == 1),
+      DAY_IN_WINDOW = FOL_DATE_DAYS_DELTA - start_day
+    ) %>%
+    # intentionally many-to-many when RITUXAN_AS_OWN_ARM is FALSE (see 18b)
+    inner_join(arm_w %>% select(TRR_ID_CODE, TIMING_ARM),
+               by = "TRR_ID_CODE") %>%
+    mutate(TIMING_ARM = factor(as.character(TIMING_ARM), levels = TIMING_LEVELS))
+  
+  # First treated visit per patient in the window: the histogram is "patients
+  # newly treated by day X", not "treatment episodes".
+  first_tx <- visits %>%
+    filter(TREATED_VISIT) %>%
+    group_by(TIMING_ARM, TRR_ID_CODE) %>%
+    slice_min(order_by = DAY_IN_WINDOW, n = 1, with_ties = FALSE) %>%
+    ungroup()
+  
+  # Denominators and the ascertainment check. '% seen' is the number to look
+  # at first: an arm followed up less often will appear less treated
+  # regardless of its true rejection rate.
+  denom <- arm_w %>%
+    count(TIMING_ARM, .drop = FALSE, name = "n_arm") %>%
+    left_join(
+      visits %>% group_by(TIMING_ARM, .drop = FALSE) %>%
+        summarise(n_seen = n_distinct(TRR_ID_CODE), n_visits = n(), .groups = "drop"),
+      by = "TIMING_ARM"
+    ) %>%
+    left_join(first_tx %>% count(TIMING_ARM, .drop = FALSE, name = "n_treated"),
+              by = "TIMING_ARM") %>%
+    mutate(across(c(n_seen, n_visits, n_treated), ~ coalesce(.x, 0L)),
+           pct_seen    = 100 * n_seen / pmax(n_arm, 1),
+           pct_treated = 100 * n_treated / pmax(n_arm, 1))
+  
+  message("\n[", window_label, "] days ", round(start_day), "-", round(end_day))
+  print(denom %>% select(TIMING_ARM, n_arm, n_seen, pct_seen, n_treated, pct_treated))
+  
+  if (nrow(first_tx) == 0) {
+    message("  no treated visits in this window -- plots skipped")
+    return(invisible(denom))
+  }
+  
+  # --- Plot A: raw histogram (shows the visit-schedule artifact) ---
+  print(
+    ggplot(first_tx, aes(x = DAY_IN_WINDOW)) +
+      geom_histogram(binwidth = binwidth, boundary = 0,
+                     fill = "steelblue", colour = "white", linewidth = 0.2) +
+      geom_text(data = denom,
+                aes(x = Inf, y = Inf,
+                    label = sprintf("n = %d in arm\n%d treated (%.1f%%)",
+                                    n_arm, n_treated, pct_treated)),
+                inherit.aes = FALSE, hjust = 1.05, vjust = 1.3, size = 3) +
+      facet_wrap(~ TIMING_ARM, ncol = 2, drop = FALSE, scales = "free_y") +
+      scale_x_continuous(breaks = seq(0, span, by = break_by), limits = c(0, span),
+                         expand = expansion(mult = c(0, 0.02))) +
+      scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+      labs(
+        title = paste0("Anti-Rejection Therapy Timing: ", window_label),
+        subtitle = paste0("Post-transplant days ", round(start_day), "-", round(end_day),
+                          "; arms fixed at ", LM_LABEL, "; ", binwidth, "-day bins"),
+        x = paste0("Days since day ", round(start_day), " post-transplant"),
+        y = "Patients newly treated",
+        caption = "Y axes independent per panel. Shape is driven partly by the visit schedule -- see the rate figure."
+      ) +
+      theme_minimal() + theme(strip.text = element_text(face = "bold"))
+  )
+  
+  # --- Plot B: treatment RATE per visit, schedule divided out ---
+  # treated visits / all visits within each bin. A bin with 400 visits and 4
+  # treatments is a 1% rate whether or not it happens to be the month everyone
+  # is seen.
+  rate <- visits %>%
+    mutate(bin = floor(DAY_IN_WINDOW / binwidth) * binwidth) %>%
+    group_by(TIMING_ARM, bin, .drop = FALSE) %>%
+    summarise(n_visits = n(),
+              n_treated_visits = sum(TREATED_VISIT, na.rm = TRUE),
+              .groups = "drop") %>%
+    filter(n_visits >= MIN_VISITS_PER_BIN) %>%
+    mutate(rate = n_treated_visits / n_visits)
+  
+  if (nrow(rate) > 0) {
+    print(
+      ggplot(rate, aes(x = bin + binwidth / 2, y = rate, colour = TIMING_ARM)) +
+        geom_line(linewidth = 0.8) +
+        geom_point(aes(size = n_visits), alpha = 0.7) +
+        scale_x_continuous(breaks = seq(0, span, by = break_by), limits = c(0, span)) +
+        scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+        scale_colour_brewer(palette = "Dark2", drop = TRUE) +
+        scale_size_continuous(range = c(1, 4)) +
+        labs(
+          title = paste0("Proportion of Visits at Which Therapy Was Given: ", window_label),
+          subtitle = paste0(binwidth, "-day bins; bins with < ", MIN_VISITS_PER_BIN, " visits omitted"),
+          x = paste0("Days since day ", round(start_day), " post-transplant"),
+          y = "Treated visits / all visits", colour = "Arm at landmark", size = "Visits in bin"
+        ) +
+        theme_minimal() + theme(legend.position = "bottom")
+    )
+  }
+  
+  # --- Plot C: naive cumulative incidence over the FULL arm ---
+  # Denominator is every eligible patient in the arm, NOT just those treated,
+  # so curves plateau at each arm's overall treatment rate and are directly
+  # comparable. (stat_ecdf would rescale each arm to 100% and hide exactly the
+  # difference of interest.)
+  #
+  # NAIVE: patients who die or lose the graft mid-window stay in the
+  # denominator forever, so this UNDERSTATES cumulative incidence, and does so
+  # most in the arm with the most deaths. Aalen-Johansen is the rigorous
+  # version if this figure goes in a manuscript.
+  cum <- first_tx %>%
+    arrange(TIMING_ARM, DAY_IN_WINDOW) %>%
+    group_by(TIMING_ARM) %>%
+    mutate(cum_n = row_number()) %>%
+    ungroup() %>%
+    left_join(denom %>% select(TIMING_ARM, n_arm), by = "TIMING_ARM") %>%
+    mutate(cum_pct = cum_n / pmax(n_arm, 1)) %>%
+    select(TIMING_ARM, DAY_IN_WINDOW, cum_pct)
+  
+  # Anchor each curve at (0, 0) and carry it to the horizon so the steps render
+  # across the full window instead of stopping at the last event.
+  cum <- bind_rows(
+    denom %>% transmute(TIMING_ARM, DAY_IN_WINDOW = 0, cum_pct = 0),
+    cum,
+    cum %>% group_by(TIMING_ARM) %>%
+      slice_max(DAY_IN_WINDOW, n = 1, with_ties = FALSE) %>%
+      mutate(DAY_IN_WINDOW = span) %>% ungroup()
+  ) %>%
+    arrange(TIMING_ARM, DAY_IN_WINDOW)
+  
+  print(
+    ggplot(cum, aes(x = DAY_IN_WINDOW, y = cum_pct, colour = TIMING_ARM)) +
+      geom_step(linewidth = 0.8) +
+      scale_x_continuous(breaks = seq(0, span, by = break_by), limits = c(0, span)) +
+      scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+      scale_colour_brewer(palette = "Dark2", drop = TRUE) +
+      labs(
+        title = paste0("Cumulative Proportion of Each Arm Treated: ", window_label),
+        subtitle = "Denominator is the full eligible arm; no competing-risk adjustment",
+        x = paste0("Days since day ", round(start_day), " post-transplant"),
+        y = "Cumulative % of arm treated", colour = "Arm at landmark"
+      ) +
+      theme_minimal() + theme(legend.position = "bottom")
+  )
+  
+  # --- Summary table ---
+  summ <- denom %>%
+    left_join(
+      first_tx %>% group_by(TIMING_ARM, .drop = FALSE) %>%
+        summarise(median_day = median(DAY_IN_WINDOW, na.rm = TRUE),
+                  q1_day = quantile(DAY_IN_WINDOW, 0.25, na.rm = TRUE),
+                  q3_day = quantile(DAY_IN_WINDOW, 0.75, na.rm = TRUE),
+                  .groups = "drop"),
+      by = "TIMING_ARM"
+    ) %>%
+    mutate(
+      visits_per_pt_seen = if_else(n_seen > 0, n_visits / n_seen, NA_real_),
+      across(where(is.numeric), ~ if_else(is.nan(.x), NA_real_, .x))
+    )
+  
+  print(
+    summ %>%
+      mutate(`Median (IQR) day` = if_else(
+        is.na(median_day), NA_character_,
+        sprintf("%.0f (%.0f\u2013%.0f)", median_day, q1_day, q3_day))) %>%
+      select(TIMING_ARM, n_arm, n_seen, pct_seen, visits_per_pt_seen,
+             n_treated, pct_treated, `Median (IQR) day`) %>%
+      gt() %>%
+      fmt_number(columns = c(pct_seen, pct_treated, visits_per_pt_seen), decimals = 1) %>%
+      sub_missing(missing_text = "\u2014") %>%
+      cols_label(
+        TIMING_ARM         = "Arm at landmark",
+        n_arm              = "N eligible",
+        n_seen             = "N with any visit",
+        pct_seen           = "% seen",
+        visits_per_pt_seen = "Visits per patient seen",
+        n_treated          = "N treated",
+        pct_treated        = "% treated",
+        `Median (IQR) day` = "Median (IQR) day in window"
+      ) %>%
+      tab_header(
+        title = paste0("Anti-Rejection Therapy: ", window_label),
+        subtitle = paste0("Post-transplant days ", round(start_day), "-", round(end_day))
+      ) %>%
+      tab_options(table.font.size = 13, data_row.padding = px(4),
+                  column_labels.font.weight = "bold") %>%
+      tab_source_note(paste0(
+        "Arms are fixed at ", LM_LABEL, " and are NOT reassigned by treatment in this window; for Control ",
+        "a treatment here is a first-ever course, for the treated arms it is re-treatment. Restricted to ",
+        "patients still under observation at day ", round(start_day), ". '% seen' is the ascertainment ",
+        "check: a patient with no visit is counted as untreated rather than unknown, so an arm followed up ",
+        "less often will appear less treated regardless of its true rejection rate. Median and IQR are ",
+        "computed among treated patients only. Cumulative incidence is naive with respect to death and ",
+        "graft failure during the window."))
+  )
+  
+  invisible(summ)
+}
+
+# --- The three windows ---
+# GAP is the one specific to the 90-day landmark: every treated patient in a
+# Control panel here is a patient the exposure definition calls untreated.
+postlm_gap_summary <- if (HAS_GAP) {
+  postlm_timing_report(GAP_START, GAP_END,
+                       "Gap window (post-exposure, pre-outcome)",
+                       binwidth = 14, break_by = 60)
+} else NULL
+
+postlm_immediate_summary <- postlm_timing_report(
+  LANDMARK_DAY, LM_SHORT_END,
+  "Year following the landmark",
+  binwidth = 30, break_by = 60
+)
+
+postlm_outcome_summary <- postlm_timing_report(
+  YR2_START, YR2_END,
+  "Year-2 outcome window",
+  binwidth = 30, break_by = 60
+)
+
+
+#===============================================================================
+# 19. Hazard Ratios: Landmark Cox Models
+#-------------------------------------------------------------------------------
+# The reference arm is an explicit ARGUMENT rather than an emergent property of
+# factor level ordering, and the realised direction is echoed back in the
+# output -- reading conf.int[1, ] and assuming it matches the requested label
+# is how "Combined vs Control" could otherwise end up reporting Control vs
+# Combined.
+#===============================================================================
+run_coxph_lm <- function(data, ref_arm, label) {
+  # Skip rather than error if an arm is absent: with a mis-set LANDMARK_DAY the
+  # requested reference level may not exist, and relevel()'s message does not
+  # say which model or why.
+  lv <- levels(droplevels(factor(data$ARM)))
+  if (!(ref_arm %in% lv) || length(lv) < 2) {
+    message("skipping Cox model -- arm missing from the data: ", label,
+            "  (levels present: ", paste(lv, collapse = ", "), ")")
+    return(NULL)
+  }
+  d <- data %>% mutate(ARM = relevel(droplevels(ARM), ref = ref_arm))
+  
+  fit <- coxph(Surv(time_lm, event_lm) ~ ARM, data = d)
+  s   <- summary(fit)
+  
+  zph  <- tryCatch(cox.zph(fit), error = function(e) NULL)
+  ph_p <- if (!is.null(zph)) zph$table[1, "p"] else NA_real_
+  
+  tibble(
+    Comparison = label,
+    Direction  = paste0(rownames(s$conf.int)[1], "  (ref = ", ref_arm, ")"),
+    n          = fit$n,
+    events     = fit$nevent,
+    HR         = s$conf.int[1, "exp(coef)"],
+    CI_lower   = s$conf.int[1, "lower .95"],
+    CI_upper   = s$conf.int[1, "upper .95"],
+    p_value    = s$coefficients[1, "Pr(>|z|)"],
+    ph_test_p  = ph_p
+  )
+}
+
+hr_results_lm <- bind_rows(
+  if (!is.null(lm_match_steroid_combined))
+    run_coxph_lm(lm_match_steroid_combined$data, ref_arm = "Steroids", label = "Combined vs Steroids"),
+  if (!is.null(lm_match_combined_control))
+    run_coxph_lm(lm_match_combined_control$data, ref_arm = "Control", label = "Combined vs Control"),
+  run_coxph_lm(df_lm_long %>% filter(ARM %in% c("Steroids", "Dual Therapy")),
+               ref_arm = "Steroids", label = "Dual Therapy vs Steroids (unmatched)")
+)
+
+print(
+  hr_results_lm
+)
+
+# Overall 3-arm model on the unmatched landmark cohort.
+df_lm_3arm <- df_lm_long %>%
+  filter(ARM %in% c("Steroids", "Combined", "Control")) %>%
+  mutate(ARM = relevel(droplevels(ARM), ref = "Control"))
+
+fit_lm_3arm <- coxph(Surv(time_lm, event_lm) ~ ARM, data = df_lm_3arm)
+print(
+  summary(fit_lm_3arm)
+)
+print(
+  cox.zph(fit_lm_3arm)
+)
+
+hr_table_lm <- hr_results_lm %>%
+  mutate(
+    `HR (95% CI)` = sprintf("%.2f (%.2f\u2013%.2f)", HR, CI_lower, CI_upper),
+    `P value` = case_when(p_value < 0.001 ~ "<0.001", TRUE ~ sprintf("%.3f", p_value)),
+    `PH test P` = case_when(
+      is.na(ph_test_p) ~ NA_character_,
+      ph_test_p < 0.001 ~ "<0.001",
+      TRUE ~ sprintf("%.3f", ph_test_p)
+    )
+  ) %>%
+  select(Comparison, Direction, n, events, `HR (95% CI)`, `P value`, `PH test P`)
+
+print(
+  hr_table_lm %>%
+    gt() %>%
+    cols_label(
+      Comparison = "Comparison", Direction = "Model direction", n = "N", events = "Deaths",
+      `HR (95% CI)` = "Hazard Ratio (95% CI)", `P value` = "P value", `PH test P` = "PH Assumption P"
+    ) %>%
+    tab_header(
+      title    = "Hazard Ratios for Mortality (Landmark Cox Models)",
+      subtitle = paste0("Landmark at ", LM_LABEL,
+                        "; follow-up from the landmark to post-transplant day ", round(LM_LONG_END))
+    ) %>%
+    tab_options(table.font.size = 13, data_row.padding = px(4), column_labels.font.weight = "bold") %>%
+    tab_source_note(paste0(
+      "LANDMARK DESIGN: exposure defined over the ", EXPOSURE_LABEL, "; only patients still under ",
+      "observation at day ", round(LANDMARK_DAY), " are included; the survival clock starts AT the landmark. ",
+      "This removes the immortal time bias present in transplant-anchored analyses of a post-baseline ",
+      "exposure. Hazard ratios are for CONDITIONAL survival (given survival to day ", round(LANDMARK_DAY),
+      "), not overall post-transplant survival. IMPORTANT: because the landmark precedes the end of the ",
+      "first year, the Control arm means 'not treated within ", round(LANDMARK_DAY), " days', not 'never ",
+      "treated' -- patients first treated later in year 1 are included in Control, which attenuates these ",
+      "hazard ratios toward the null. Matched comparisons use 1:1 nearest-neighbour propensity matching ",
+      "performed WITHIN the landmark cohort (caliper 0.2 SD of the propensity logit; age, gender, ethnicity, ",
+      "MELD, diabetes, cold ischemic time). HLA mismatch was not matched on because it is missing for ",
+      "roughly 60% of the cohort; balance on it is reported descriptively in the Love plots. PH Assumption P ",
+      "from cox.zph()."))
+)
+
+# --- Forest plots ---
+print(
+  ggforest(fit_lm_3arm, data = df_lm_3arm)
+)
+
+if (!is.null(lm_match_combined_control)) {
+  d_fp <- lm_match_combined_control$data %>% mutate(ARM = relevel(droplevels(ARM), ref = "Control"))
+  ggforest(coxph(Surv(time_lm, event_lm) ~ ARM, data = d_fp), data = d_fp)
+}
+
+
+#===============================================================================
+# 20. Covariate-Adjusted Landmark Hazard Ratios
+#===============================================================================
+adj_formula_suffix <- " + AGE + GENDER + MELD_PELD_LAB_SCORE + COLD_ISCH + DIAB_BIN"
+
+run_coxph_lm_adj <- function(data, ref_arm, label) {
+  # Skip rather than error if an arm is absent: with a mis-set LANDMARK_DAY the
+  # requested reference level may not exist, and relevel()'s message does not
+  # say which model or why.
+  lv <- levels(droplevels(factor(data$ARM)))
+  if (!(ref_arm %in% lv) || length(lv) < 2) {
+    message("skipping Cox model -- arm missing from the data: ", label,
+            "  (levels present: ", paste(lv, collapse = ", "), ")")
+    return(NULL)
+  }
+  d <- data %>% mutate(ARM = relevel(droplevels(ARM), ref = ref_arm))
+  
+  # matched frames already carry baseline covariates; unmatched ones may not
+  if (!"DIAB_BIN" %in% names(d)) {
+    d <- d %>% left_join(baseline_covs, by = "TRR_ID_CODE")
+  }
+  
+  fit <- coxph(as.formula(paste0("Surv(time_lm, event_lm) ~ ARM", adj_formula_suffix)), data = d)
+  s <- summary(fit)
+  
+  tibble(
+    Comparison = label,
+    Direction  = paste0(rownames(s$conf.int)[1], "  (ref = ", ref_arm, ")"),
+    n          = fit$n,
+    events     = fit$nevent,
+    HR         = s$conf.int[1, "exp(coef)"],
+    CI_lower   = s$conf.int[1, "lower .95"],
+    CI_upper   = s$conf.int[1, "upper .95"],
+    p_value    = s$coefficients[1, "Pr(>|z|)"]
+  )
+}
+
+hr_adj_results_lm <- bind_rows(
+  if (!is.null(lm_match_steroid_combined))
+    run_coxph_lm_adj(lm_match_steroid_combined$data, "Steroids", "Combined vs Steroids (adjusted)"),
+  if (!is.null(lm_match_combined_control))
+    run_coxph_lm_adj(lm_match_combined_control$data, "Control", "Combined vs Control (adjusted)")
+)
+
+print(
+  hr_adj_results_lm
+)
+
+hr_adj_table_lm <- hr_adj_results_lm %>%
+  mutate(
+    `HR (95% CI)` = sprintf("%.2f (%.2f\u2013%.2f)", HR, CI_lower, CI_upper),
+    `P value` = case_when(p_value < 0.001 ~ "<0.001", TRUE ~ sprintf("%.3f", p_value))
+  ) %>%
+  select(Comparison, Direction, n, events, `HR (95% CI)`, `P value`)
+
+print(
+  hr_adj_table_lm %>%
+    gt() %>%
+    cols_label(
+      Comparison = "Comparison", Direction = "Model direction", n = "N", events = "Deaths",
+      `HR (95% CI)` = "Adjusted Hazard Ratio (95% CI)", `P value` = "P value"
+    ) %>%
+    tab_header(title = "Covariate-Adjusted Landmark Hazard Ratios",
+               subtitle = paste0("Landmark at ", LM_LABEL)) %>%
+    tab_options(table.font.size = 13, data_row.padding = px(4), column_labels.font.weight = "bold") %>%
+    tab_source_note(paste0(
+      "Same landmark propensity-matched cohorts as the unadjusted table, with the Cox model additionally ",
+      "adjusted for recipient age, gender, MELD score, cold ischemic time, and diabetes status. Because ",
+      "several of these covariates were also used in the matching, this is adjustment layered on top of ",
+      "matching -- residual imbalance after matching (per the Love plots) is the reason for including it."))
+)
+
+
+#===============================================================================
+# 21. Sensitivity Analysis: Time-Varying Exposure Cox Model
+#-------------------------------------------------------------------------------
+# The landmark design removes immortal time bias by DISCARDING everyone who
+# died before the landmark, and it forces treatment after the landmark to count
+# as non-exposure. The time-varying (Mantel-Byar) approach removes the same
+# bias without doing either: every patient starts untreated at transplant and
+# switches state on the day they are first treated, whenever that is.
+#
+# THIS MODEL IS MORE IMPORTANT AT A 90-DAY LANDMARK THAN IT WAS AT 365. It is
+# the analysis that does NOT throw the day 90-365 treatments into the Control
+# arm, so comparing it against the landmark HRs directly bounds how much the
+# gap contamination is costing.
+#
+# Counting-process (start, stop] format, so each patient may occupy more than
+# one row. No cluster/robust variance is needed: the segments from a single
+# patient are non-overlapping in time and the partial likelihood handles them.
+#===============================================================================
+arm_all_time <- assign_arm_at_landmark(Inf)   # exposure over all available follow-up
+
+tv_base <- df_survival %>%
+  filter(!is.na(PTIME), PTIME > 0) %>%
+  select(TRR_ID_CODE, PTIME, event) %>%
+  left_join(pat_rej_first %>% select(TRR_ID_CODE, REJ_TX_DAY), by = "TRR_ID_CODE") %>%
+  left_join(arm_all_time, by = "TRR_ID_CODE") %>%
+  filter(!is.na(ARM))
+
+# Segment 1: untreated person-time, from day 0 until first treatment (or until
+# end of follow-up for patients never treated).
+tv_seg_untreated <- tv_base %>%
+  mutate(
+    tstart = 0,
+    tstop = case_when(
+      is.na(REJ_TX_DAY)   ~ PTIME,        # never treated
+      REJ_TX_DAY <= 0     ~ NA_real_,     # treated at baseline: no untreated time
+      REJ_TX_DAY >= PTIME ~ PTIME,        # treatment recorded at/after last follow-up
+      TRUE                ~ REJ_TX_DAY
+    ),
+    ev = case_when(
+      is.na(REJ_TX_DAY)   ~ as.numeric(event),
+      REJ_TX_DAY <= 0     ~ NA_real_,
+      REJ_TX_DAY >= PTIME ~ as.numeric(event),
+      TRUE                ~ 0             # censored at the moment of switching
+    ),
+    RX_STATE = "None"
+  ) %>%
+  filter(!is.na(tstop), tstop > tstart)
+
+# Segment 2: treated person-time, from first treatment to end of follow-up.
+tv_seg_treated <- tv_base %>%
+  filter(!is.na(REJ_TX_DAY), REJ_TX_DAY < PTIME) %>%
+  mutate(
+    tstart = pmax(REJ_TX_DAY, 0),
+    tstop  = PTIME,
+    ev     = as.numeric(event),
+    RX_STATE = as.character(ARM)
+  ) %>%
+  filter(tstop > tstart)
+
+tv_data <- bind_rows(tv_seg_untreated, tv_seg_treated) %>%
+  select(TRR_ID_CODE, tstart, tstop, ev, RX_STATE) %>%
+  mutate(RX_STATE = factor(RX_STATE,
+                           levels = c("None", "Steroids", "Combined", "Dual Therapy", "Other Rejection"))) %>%
+  arrange(TRR_ID_CODE, tstart)
+
+stopifnot(all(tv_data$tstop > tv_data$tstart))
+message("Time-varying dataset: ", nrow(tv_data), " rows for ",
+        n_distinct(tv_data$TRR_ID_CODE), " patients; ", sum(tv_data$ev), " deaths")
+print(
+  table(tv_data$RX_STATE, tv_data$ev)
+)
+
+# Administrative censoring at a chosen horizon, measured from TRANSPLANT.
+truncate_tv <- function(tv, horizon) {
+  tv %>%
+    filter(tstart < horizon) %>%
+    mutate(ev = if_else(tstop > horizon, 0, ev), tstop = pmin(tstop, horizon)) %>%
+    filter(tstop > tstart)
+}
+
+tv_trunc <- truncate_tv(tv_data, TV_HORIZON)
+
+fit_tv <- coxph(Surv(tstart, tstop, ev) ~ RX_STATE, data = tv_trunc)
+print(
+  summary(fit_tv)
+)
+print(
+  cox.zph(fit_tv)
+)
+
+tv_hr_table <- summary(fit_tv)$conf.int %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("term") %>%
+  transmute(
+    Comparison = paste0(str_remove(term, "^RX_STATE"), " vs untreated person-time"),
+    `HR (95% CI)` = sprintf("%.2f (%.2f\u2013%.2f)", `exp(coef)`, `lower .95`, `upper .95`),
+    `P value` = {
+      p <- summary(fit_tv)$coefficients[, "Pr(>|z|)"]
+      if_else(p < 0.001, "<0.001", sprintf("%.3f", p))
+    }
+  )
+
+print(
+  tv_hr_table %>%
+    gt() %>%
+    tab_header(
+      title = paste0("Time-Varying Exposure Cox Model, Mortality to Day ", round(TV_HORIZON)),
+      subtitle = "Sensitivity analysis -- no patients excluded, no exposure window"
+    ) %>%
+    tab_options(table.font.size = 13, data_row.padding = px(4), column_labels.font.weight = "bold") %>%
+    tab_source_note(paste0(
+      "Anti-rejection therapy modelled as a time-dependent covariate: every patient contributes untreated ",
+      "person-time from transplant until their first anti-rejection treatment, then treated person-time ",
+      "thereafter. Unlike the landmark analysis this discards no patients AND imposes no exposure window, so ",
+      "treatment given after day ", round(LANDMARK_DAY), " is counted as treatment rather than folded into ",
+      "the Control arm. Comparing these hazard ratios against the landmark table therefore bounds how much ",
+      "the landmark's Control contamination is costing: if they diverge materially, report both. Follow-up ",
+      "administratively censored at day ", round(TV_HORIZON), " post-transplant. Treatment timing for ",
+      "therapy given during the index admission is approximated (see INPATIENT_RX_DAY)."))
+)
+
+# --- Optional: quantify the bias by reproducing the naive analysis ---
+# Fits the ORIGINAL, BIASED transplant-anchored model alongside the corrected
+# ones. The point is not to report it but to show how far the estimate moves
+# once the immortal time is removed. Do not use this HR for anything else.
+SHOW_NAIVE_COMPARISON <- FALSE
+
+if (SHOW_NAIVE_COMPARISON) {
+  df_naive <- df_survival %>%
+    inner_join(arm_all_time, by = "TRR_ID_CODE") %>%
+    filter(!is.na(PTIME)) %>%
+    mutate(
+      event_h = if_else(PTIME <= TV_HORIZON, event, 0),
+      time_h  = pmin(PTIME, TV_HORIZON),
+      ARM = relevel(factor(as.character(ARM)), ref = "Control")
+    ) %>%
+    filter(ARM %in% c("Control", "Steroids", "Combined")) %>%
+    mutate(ARM = droplevels(ARM))
+  
+  fit_naive <- coxph(Surv(time_h, event_h) ~ ARM, data = df_naive)
+  
+  message("\n--- BIASED (transplant-anchored) vs CORRECTED ---")
+  message("Biased HRs (immortal time present, DO NOT REPORT):")
+  print(round(summary(fit_naive)$conf.int[, c(1, 3, 4)], 3))
+  message("Landmark HRs (corrected, exposure window imposed):")
+  print(round(summary(fit_lm_3arm)$conf.int[, c(1, 3, 4)], 3))
+  message("Time-varying HRs (corrected, no exclusions, no exposure window):")
+  print(round(summary(fit_tv)$conf.int[, c(1, 3, 4)], 3))
+}
+
+
+#===============================================================================
+# 21b. DISCHARGE-ANCHORED DESIGN
+#-------------------------------------------------------------------------------
+# WHY THIS SECTION EXISTS, AND WHY IT MAY BE THE BETTER PRIMARY ANALYSIS.
+#
+# The section 18b timing table showed that EVERY exposed patient in this cohort
+# was treated during the index admission -- there is not a single dated
+# outpatient anti-rejection event before the landmark. The exposure is
+# therefore fully determined at discharge, and it is more accurately described
+# as "anti-rejection therapy during the index admission" than as "therapy
+# within the first N days". Any landmark between roughly day 30 and day 365
+# produces IDENTICAL arms.
+#
+# That changes what the landmark is buying. A landmark exists to remove
+# immortal time, but an exposure that is complete at discharge generates almost
+# none: the only guaranteed survival a treated patient carries is survival to
+# their own discharge. Anchoring at discharge removes exactly that, and nothing
+# more -- so it does NOT pay the landmark's price of discarding every death in
+# the first LANDMARK_DAY days.
+#
+# The other gain is conceptual. Under the landmark design, the 975 patients
+# first treated between day 90 and day 365 are "gap contamination" sitting
+# inside the Control arm and attenuating every contrast. Under the discharge
+# anchor they are not contamination at all -- they are an OUTCOME
+# (post-discharge rejection), analysed as such below.
+#
+# WHAT IT COSTS:
+#   - Patients with no discharge record (LOS unknown) cannot be anchored and
+#     are dropped. Reported below.
+#   - Patients who died before discharge are excluded, which is correct: they
+#     could not have completed the exposure.
+#   - The time origin now VARIES BY PATIENT. If LOS differs by arm (see the
+#     section 7 Step 7b table), the arms are followed over different calendar
+#     windows even though the clock starts at 0 for everyone. That is the main
+#     thing to check before preferring this design.
+#
+# Arms are unchanged from arm_at_landmark, so this and the landmark analysis
+# cannot disagree about who was exposed -- only about who is eligible and how
+# post-discharge treatment is classified.
+#===============================================================================
+
+# Include index-admission LOS as a matching covariate in this design. Defensible
+# both ways: LOS is a proxy for early severity (so matching on it removes
+# confounding), but it is also downstream of the exposure itself (so matching on
+# it can over-adjust). Run both and report the difference.
+DC_MATCH_ON_LOS <- FALSE
+
+los_lookup <- df_immuno_induc %>%
+  select(TRR_ID_CODE, DAYS_HOSP_SP_TX) %>%
+  distinct(TRR_ID_CODE, .keep_all = TRUE)
+
+df_discharge_anchor <- df_survival %>%
+  inner_join(arm_at_landmark, by = "TRR_ID_CODE") %>%
+  left_join(los_lookup, by = "TRR_ID_CODE") %>%
+  mutate(
+    ARM = factor(as.character(ARM), levels = ARM_LEVELS),
+    DC_DAY = DAYS_HOSP_SP_TX
+  )
+
+# --- Attrition into the discharge cohort ---
+dc_attrition <- df_discharge_anchor %>%
+  group_by(ARM) %>%
+  summarise(
+    n_assigned   = n(),
+    n_no_los     = sum(is.na(DC_DAY)),
+    n_no_ptime   = sum(!is.na(DC_DAY) & is.na(PTIME)),
+    n_died_predc = sum(!is.na(DC_DAY) & !is.na(PTIME) & PTIME < DC_DAY),
+    n_eligible   = sum(!is.na(DC_DAY) & !is.na(PTIME) & PTIME >= DC_DAY),
+    pct_lost     = 100 * (n_assigned - n_eligible) / pmax(n_assigned, 1),
+    .groups = "drop"
+  )
+
+print(
+  dc_attrition %>%
+    gt() %>%
+    fmt_number(columns = pct_lost, decimals = 1) %>%
+    cols_label(
+      ARM          = "Arm",
+      n_assigned   = "N assigned",
+      n_no_los     = "No discharge record",
+      n_no_ptime   = "No follow-up time",
+      n_died_predc = "Died before discharge",
+      n_eligible   = "N eligible",
+      pct_lost     = "% lost"
+    ) %>%
+    tab_header(
+      title = "Attrition into the Discharge-Anchored Cohort",
+      subtitle = "Compare against the landmark attrition table in section 18"
+    ) %>%
+    tab_options(table.font.size = 13, data_row.padding = px(4),
+                column_labels.font.weight = "bold") %>%
+    tab_source_note(paste0(
+      "Patients with no index-admission record have no discharge date and cannot be anchored; they are ",
+      "lost to this design but retained by the landmark design, so the two cohorts are not nested and ",
+      "their Ns are not interchangeable. Deaths before discharge are correctly excluded -- those patients ",
+      "could not have completed the exposure. Contrast the '% lost' column here against the landmark ",
+      "table: the landmark discards every death in the first ", round(LANDMARK_DAY), " days, this design ",
+      "discards only deaths during the admission itself."))
+)
+
+df_dc <- df_discharge_anchor %>%
+  filter(!is.na(DC_DAY), !is.na(PTIME), PTIME >= DC_DAY)
+
+message("\nDischarge-anchored cohort: ", nrow(df_dc), " patients of ",
+        nrow(df_discharge_anchor), " assigned to an arm",
+        sprintf(" (%.1f%%)", 100 * nrow(df_dc) / max(nrow(df_discharge_anchor), 1)))
+
+build_dc_surv <- function(horizon_days) {
+  df_dc %>%
+    mutate(
+      time_raw = PTIME - DC_DAY,                       # clock starts at discharge
+      event_dc = if_else(time_raw <= horizon_days, event, 0),
+      time_dc  = pmin(time_raw, horizon_days)
+    )
+}
+
+df_dc_short <- build_dc_surv(DC_HORIZON_SHORT)
+df_dc_long  <- build_dc_surv(DC_HORIZON_LONG)
+
+# --- KM helper, discharge clock ---
+plot_dc_km <- function(df, arms_keep, horizon, break_by, title) {
+  d <- df %>% filter(ARM %in% arms_keep) %>% mutate(ARM = droplevels(ARM))
+  if (nlevels(d$ARM) < 2) {
+    message("skipping plot -- fewer than 2 non-empty arms: ", title)
+    return(invisible(NULL))
+  }
+  fit <- survfit(Surv(time_dc, event_dc) ~ ARM, data = d)
+  sd_test  <- survdiff(Surv(time_dc, event_dc) ~ ARM, data = d)
+  pv       <- 1 - pchisq(sd_test$chisq, length(sd_test$n) - 1)
+  pval_lbl <- if (pv < 0.001) "log-rank p < 0.001" else sprintf("log-rank p = %.3f", pv)
+  
+  p <- ggsurvplot(
+    fit, data = d, pval = pval_lbl, conf.int = TRUE, risk.table = TRUE,
+    break.time.by = break_by, legend.title = "Group", legend.labs = levels(d$ARM),
+    xlab = "Days since discharge from the index admission",
+    ylab = "Survival Probability", title = title
+  )
+  fix_origin(p, break_by = break_by, max_time = horizon)
+}
+
+print(plot_dc_km(
+  df_dc_short, c("Steroids", "Combined", "Control"), DC_HORIZON_SHORT, 90,
+  "Survival from Discharge, 1 Year (Unmatched)"
+))
+
+print(plot_dc_km(
+  df_dc_long, c("Steroids", "Combined", "Control"), DC_HORIZON_LONG, 180,
+  "Survival from Discharge, 2 Years (Unmatched)"
+))
+
+print(plot_dc_km(
+  df_dc_long, c("Steroids", "Dual Therapy"), DC_HORIZON_LONG, 180,
+  "Steroids vs Dual Therapy, from Discharge (Unmatched)"
+))
+
+# --- Cox models on the discharge clock ---
+run_coxph_dc <- function(data, ref_arm, label, adjusted = FALSE) {
+  lv <- levels(droplevels(factor(data$ARM)))
+  if (!(ref_arm %in% lv) || length(lv) < 2) {
+    message("skipping Cox model -- arm missing from the data: ", label,
+            "  (levels present: ", paste(lv, collapse = ", "), ")")
+    return(NULL)
+  }
+  d <- data %>% mutate(ARM = relevel(droplevels(ARM), ref = ref_arm))
+  if (!"DIAB_BIN" %in% names(d)) d <- d %>% left_join(baseline_covs, by = "TRR_ID_CODE")
+  
+  rhs <- if (adjusted) paste0("ARM", adj_formula_suffix) else "ARM"
+  fit <- coxph(as.formula(paste0("Surv(time_dc, event_dc) ~ ", rhs)), data = d)
+  s   <- summary(fit)
+  
+  zph  <- tryCatch(cox.zph(fit), error = function(e) NULL)
+  ph_p <- if (!is.null(zph)) zph$table[1, "p"] else NA_real_
+  
+  tibble(
+    Comparison = label,
+    Direction  = paste0(rownames(s$conf.int)[1], "  (ref = ", ref_arm, ")"),
+    n          = fit$n,
+    events     = fit$nevent,
+    HR         = s$conf.int[1, "exp(coef)"],
+    CI_lower   = s$conf.int[1, "lower .95"],
+    CI_upper   = s$conf.int[1, "upper .95"],
+    p_value    = s$coefficients[1, "Pr(>|z|)"],
+    ph_test_p  = ph_p
+  )
+}
+
+df_dc_3arm <- df_dc_long %>%
+  filter(ARM %in% c("Steroids", "Combined", "Control")) %>%
+  mutate(ARM = relevel(droplevels(ARM), ref = "Control"))
+
+fit_dc_3arm <- coxph(Surv(time_dc, event_dc) ~ ARM, data = df_dc_3arm)
+print(summary(fit_dc_3arm))
+print(cox.zph(fit_dc_3arm))
+
+# --- Propensity matching within the discharge cohort ---
+# Matched here rather than reused from section 14 or 18, for the same reason
+# given there: the eligibility rule differs, and applying it to an
+# already-matched set breaks pairs non-randomly.
+dc_match_covariates <- if (DC_MATCH_ON_LOS) c(match_covariates, "DAYS_HOSP_SP_TX") else match_covariates
+dc_match_formula    <- as.formula(paste("treat ~", paste(dc_match_covariates, collapse = " + ")))
+
+match_within_dc <- function(df_in, treat_arm, ctrl_arm, label, seed = 1234) {
+  d <- df_in %>%
+    filter(ARM %in% c(treat_arm, ctrl_arm)) %>%
+    mutate(treat = as.integer(ARM == treat_arm)) %>%
+    select(-any_of(setdiff(names(baseline_covs), "TRR_ID_CODE"))) %>%
+    left_join(baseline_covs, by = "TRR_ID_CODE")
+  
+  md <- d %>% select(TRR_ID_CODE, treat, all_of(dc_match_covariates))
+  
+  n_before <- nrow(md)
+  md <- md %>% drop_na(all_of(dc_match_covariates)) %>%
+    mutate(across(where(is.factor), droplevels))
+  message("\n[", label, "] complete-case: ", n_before, " -> ", nrow(md),
+          " (lost ", n_before - nrow(md), ")")
+  
+  if (length(unique(md$treat)) < 2 || min(table(md$treat)) < 5) {
+    message("skipping match -- too few complete cases in one arm: ", label)
+    return(NULL)
+  }
+  
+  set.seed(seed)
+  m <- matchit(dc_match_formula, data = md, method = "nearest", distance = "logit",
+               ratio = 1, caliper = 0.2, std.caliper = TRUE)
+  message("[", label, "] treated units unmatched by caliper: ",
+          sum(m$treat == 1 & is.na(m$subclass)))
+  
+  matched_ids <- match.data(m)$TRR_ID_CODE
+  list(matchit = m,
+       match_frame = md,
+       data = d %>% filter(TRR_ID_CODE %in% matched_ids) %>% mutate(ARM = droplevels(ARM)))
+}
+
+dc_match_combined_steroid <- match_within_dc(
+  df_dc_long, "Combined", "Steroids", "Discharge: Combined vs Steroid")
+dc_match_combined_control <- match_within_dc(
+  df_dc_long, "Combined", "Control", "Discharge: Combined vs Control")
+dc_match_steroid_control  <- match_within_dc(
+  df_dc_long, "Steroids", "Control", "Discharge: Steroid vs Control")
+
+for (m in list(dc_match_combined_steroid, dc_match_combined_control, dc_match_steroid_control)) {
+  if (!is.null(m)) {
+    print(love.plot(m$matchit, binary = "std", stats = "mean.diffs", abs = TRUE,
+                    var.order = "unadjusted", thresholds = c(m = 0.1),
+                    sample.names = c("Unmatched", "Matched"),
+                    title = "Discharge Cohort Balance"))
+  }
+}
+
+if (!is.null(dc_match_combined_steroid)) {
+  print(plot_dc_km(dc_match_combined_steroid$data, c("Steroids", "Combined"),
+                   DC_HORIZON_LONG, 180,
+                   "Combined vs Steroids, from Discharge (Propensity Matched)"))
+}
+if (!is.null(dc_match_combined_control)) {
+  print(plot_dc_km(dc_match_combined_control$data, c("Control", "Combined"),
+                   DC_HORIZON_LONG, 180,
+                   "Combined vs Control, from Discharge (Propensity Matched)"))
+}
+if (!is.null(dc_match_steroid_control)) {
+  print(plot_dc_km(dc_match_steroid_control$data, c("Control", "Steroids"),
+                   DC_HORIZON_LONG, 180,
+                   "Steroids vs Control, from Discharge (Propensity Matched)"))
+}
+
+hr_results_dc <- bind_rows(
+  if (!is.null(dc_match_combined_steroid))
+    run_coxph_dc(dc_match_combined_steroid$data, "Steroids", "Combined vs Steroids (matched)"),
+  if (!is.null(dc_match_combined_control))
+    run_coxph_dc(dc_match_combined_control$data, "Control", "Combined vs Control (matched)"),
+  if (!is.null(dc_match_steroid_control))
+    run_coxph_dc(dc_match_steroid_control$data, "Control", "Steroids vs Control (matched)"),
+  if (!is.null(dc_match_combined_steroid))
+    run_coxph_dc(dc_match_combined_steroid$data, "Steroids", "Combined vs Steroids (matched, adjusted)", adjusted = TRUE),
+  if (!is.null(dc_match_combined_control))
+    run_coxph_dc(dc_match_combined_control$data, "Control", "Combined vs Control (matched, adjusted)", adjusted = TRUE),
+  if (!is.null(dc_match_steroid_control))
+    run_coxph_dc(dc_match_steroid_control$data, "Control", "Steroids vs Control (matched, adjusted)", adjusted = TRUE)
+)
+
+print(hr_results_dc)
+
+print(
+  hr_results_dc %>%
+    mutate(
+      `HR (95% CI)` = sprintf("%.2f (%.2f\u2013%.2f)", HR, CI_lower, CI_upper),
+      `P value` = case_when(p_value < 0.001 ~ "<0.001", TRUE ~ sprintf("%.3f", p_value)),
+      `PH test P` = case_when(is.na(ph_test_p) ~ NA_character_,
+                              ph_test_p < 0.001 ~ "<0.001",
+                              TRUE ~ sprintf("%.3f", ph_test_p))
+    ) %>%
+    select(Comparison, Direction, n, events, `HR (95% CI)`, `P value`, `PH test P`) %>%
+    gt() %>%
+    cols_label(Comparison = "Comparison", Direction = "Model direction",
+               n = "N", events = "Deaths", `HR (95% CI)` = "Hazard Ratio (95% CI)",
+               `P value` = "P value", `PH test P` = "PH Assumption P") %>%
+    tab_header(
+      title = "Hazard Ratios for Mortality, Discharge-Anchored",
+      subtitle = paste0("Time origin = discharge from the index admission; follow-up to ",
+                        round(DC_HORIZON_LONG), " days post-discharge")
+    ) %>%
+    tab_options(table.font.size = 13, data_row.padding = px(4),
+                column_labels.font.weight = "bold") %>%
+    tab_source_note(paste0(
+      "DISCHARGE-ANCHORED DESIGN. Exposure is anti-rejection therapy given during the index admission, ",
+      "which in this cohort is the ENTIRE exposed population -- no dated outpatient rejection events occur ",
+      "before the landmark. Because the exposure is complete at discharge, anchoring there removes all the ",
+      "immortal time the design can generate, without discarding deaths in the first ", round(LANDMARK_DAY),
+      " days as the landmark analysis does. Unlike the landmark design, the Control arm here is not ",
+      "contaminated by patients first treated later: post-discharge therapy is modelled as an OUTCOME ",
+      "below, not folded into the exposure definition. CAVEAT: the time origin varies by patient, so if ",
+      "length of stay differs by arm (section 7, Step 7b) the arms are followed over different calendar ",
+      "windows. Matching covariates ",
+      if (DC_MATCH_ON_LOS) "INCLUDE length of stay." else
+        "exclude length of stay; set DC_MATCH_ON_LOS <- TRUE to include it."))
+)
+
+#-------------------------------------------------------------------------------
+# 21b.2  Post-discharge anti-rejection therapy AS AN OUTCOME
+#-------------------------------------------------------------------------------
+# Under the landmark design these events were "gap contamination" inside the
+# Control arm. Here they are the thing being measured: time from discharge to
+# first anti-rejection therapy recorded at any follow-up visit.
+#
+# Built from ALL follow-up (df_immuno_fol_read), not the year-1 frame, so
+# events after day 365 count. Uses every treated visit, not just the patient's
+# first-ever event, because an inpatient-treated patient's later outpatient
+# course is exactly what this outcome is about.
+#-------------------------------------------------------------------------------
+all_fol_rej_day <- df_immuno_fol_read %>%
+  filter(TRR_ID_CODE %in% df_dc$TRR_ID_CODE) %>%
+  select(-any_of(c("TX_DATE", "DISCHARGE_DATE"))) %>%
+  left_join(df_liver_data_filtered %>% select(TRR_ID_CODE, TX_DATE), by = "TRR_ID_CODE") %>%
+  filter(!is.na(TX_DATE)) %>%
+  mutate(
+    PX_STAT_DATE_FOL = as.Date(PX_STAT_DATE_FOL),
+    TX_DATE          = as.Date(TX_DATE),
+    FOL_DAY          = time_length(interval(TX_DATE, PX_STAT_DATE_FOL), "days"),
+    TREATED_VISIT    = if_any(all_of(COLS_TO_CHECK), ~ !is.na(.x) & .x == 1)
+  ) %>%
+  filter(TREATED_VISIT, !is.na(FOL_DAY)) %>%
+  group_by(TRR_ID_CODE) %>%
+  summarise(first_fol_rej_day = min(FOL_DAY), .groups = "drop")
+
+df_dc_rej <- df_dc %>%
+  left_join(all_fol_rej_day, by = "TRR_ID_CODE") %>%
+  mutate(
+    # only events strictly after discharge qualify
+    rej_day_post_dc = if_else(!is.na(first_fol_rej_day) & first_fol_rej_day > DC_DAY,
+                              first_fol_rej_day - DC_DAY, NA_real_),
+    fu_days_post_dc = PTIME - DC_DAY,
+    rej_event = if_else(!is.na(rej_day_post_dc) &
+                          rej_day_post_dc <= pmin(fu_days_post_dc, DC_HORIZON_LONG), 1L, 0L),
+    rej_time  = pmin(coalesce(rej_day_post_dc, Inf), fu_days_post_dc, DC_HORIZON_LONG)
+  ) %>%
+  filter(is.finite(rej_time), rej_time > 0)
+
+print(
+  df_dc_rej %>%
+    group_by(ARM, .drop = FALSE) %>%
+    summarise(n = n(), n_rej = sum(rej_event),
+              pct_rej = 100 * n_rej / pmax(n, 1),
+              median_fu = median(rej_time), .groups = "drop") %>%
+    gt() %>%
+    fmt_number(columns = c(pct_rej, median_fu), decimals = 1) %>%
+    cols_label(ARM = "Arm at discharge", n = "N", n_rej = "N re-treated",
+               pct_rej = "% re-treated", median_fu = "Median follow-up, d") %>%
+    tab_header(title = "Post-Discharge Anti-Rejection Therapy, by Index-Admission Exposure") %>%
+    tab_options(table.font.size = 13, data_row.padding = px(4),
+                column_labels.font.weight = "bold") %>%
+    tab_source_note(paste0(
+      "Time from discharge to the first anti-rejection therapy recorded at any follow-up visit, censored ",
+      "at last follow-up or ", round(DC_HORIZON_LONG), " days post-discharge. For Control this is a ",
+      "first-ever course; for the treated arms it is re-treatment, so the arms are not measuring the same ",
+      "event and a raw between-arm difference should not be read as a treatment effect. Ascertainment ",
+      "applies here too -- a patient with no follow-up visit is counted as untreated."))
+)
+
+fit_dc_rej <- survfit(Surv(rej_time, rej_event) ~ ARM,
+                      data = df_dc_rej %>%
+                        filter(ARM %in% c("Steroids", "Combined", "Control")) %>%
+                        mutate(ARM = droplevels(ARM)))
+
+print(
+  fix_origin(
+    ggsurvplot(fit_dc_rej, data = df_dc_rej, fun = "event", conf.int = TRUE,
+               risk.table = TRUE, break.time.by = 180,
+               xlab = "Days since discharge",
+               ylab = "Cumulative incidence of anti-rejection therapy",
+               title = "Post-Discharge Anti-Rejection Therapy (Naive Cumulative Incidence)"),
+    break_by = 180, max_time = DC_HORIZON_LONG)
+)
+
+cox_dc_rej <- coxph(Surv(rej_time, rej_event) ~ relevel(droplevels(ARM), ref = "Control"),
+                    data = df_dc_rej %>%
+                      filter(ARM %in% c("Steroids", "Combined", "Control")))
+print(summary(cox_dc_rej))
+
+#-------------------------------------------------------------------------------
+# 21b.3  Side-by-side: does the design choice change the answer?
+#-------------------------------------------------------------------------------
+# The arms are IDENTICAL across these three designs -- only eligibility and the
+# treatment of post-landmark therapy differ. So a material divergence is
+# informative about the design, not about the exposure.
+#-------------------------------------------------------------------------------
+design_comparison <- bind_rows(
+  hr_results_lm %>% mutate(Design = paste0("Landmark day ", round(LANDMARK_DAY))),
+  hr_results_dc %>% filter(!grepl("adjusted", Comparison)) %>%
+    mutate(Design = "Discharge-anchored")
+) %>%
+  select(Design, Comparison, n, events, HR, CI_lower, CI_upper, p_value)
+
+print(
+  design_comparison %>%
+    mutate(`HR (95% CI)` = sprintf("%.2f (%.2f\u2013%.2f)", HR, CI_lower, CI_upper),
+           `P value` = case_when(p_value < 0.001 ~ "<0.001", TRUE ~ sprintf("%.3f", p_value))) %>%
+    select(Design, Comparison, n, events, `HR (95% CI)`, `P value`) %>%
+    gt(groupname_col = "Design") %>%
+    tab_header(
+      title = "Same Arms, Different Time Origin",
+      subtitle = "Landmark vs discharge-anchored mortality hazard ratios"
+    ) %>%
+    tab_options(table.font.size = 13, data_row.padding = px(4),
+                column_labels.font.weight = "bold", row_group.font.weight = "bold") %>%
+    tab_source_note(paste0(
+      "Both designs use the SAME exposure arms (anti-rejection therapy during the index admission), so any ",
+      "difference is attributable to the time origin and eligibility rule, not to who was exposed. The ",
+      "landmark design conditions on survival to day ", round(LANDMARK_DAY),
+      " and folds post-landmark treatment into Control; the discharge design conditions only on surviving ",
+      "the admission and treats post-discharge therapy as an outcome. Where they agree, the finding is ",
+      "robust to the design choice. Where they diverge, report both and say why."))
+)
+
+
+#===============================================================================
+# 22. Year-2 Anti-Rejection Treatment, Stratified by Exposure Group
+#-------------------------------------------------------------------------------
+# REWIRED. This section used to build its arms from the section-6 full-year ID
+# vectors, which have no notion of a landmark. It now takes them from the same
+# assignment as everything else, so "Steroids" means the same set of patients
+# here as it does in the survival section.
+#
+# THE COLUMN WAS RENAMED FIRST_YEAR_GROUP -> EXPOSURE_GROUP. At a 90-day
+# landmark it is not a first-year group, and leaving the old name is how a
+# results paragraph ends up describing the wrong exposure.
+#
+# DESIGN CAVEAT, READ THIS: exposure is fixed at day 90 but eligibility here
+# requires surviving to day 365. If treatment affects mortality in between,
+# this conditions on a post-exposure variable and the odds ratios carry a
+# selection component. The bottom block of the attrition table in section 18
+# is the diagnostic; if the arms differ there, say so in the limitations.
+#===============================================================================
+
+yr2_arm_source <- if (USE_LANDMARK_ARMS_FOR_YR2) arm_at_landmark else legacy_arm_lookup
+
+yr2_arms_keep <- c("Control", "Steroids", "Combined",
+                   if (YR2_INCLUDE_DUAL) "Dual Therapy" else NULL)
+
+exposure_group_lookup <- yr2_arm_source %>%
+  filter(ARM %in% yr2_arms_keep) %>%
+  distinct(TRR_ID_CODE, .keep_all = TRUE) %>%
+  transmute(TRR_ID_CODE,
+            EXPOSURE_GROUP = factor(as.character(ARM), levels = yr2_arms_keep))
+
+message("\nYear-2 exposure groups (source: ",
+        if (USE_LANDMARK_ARMS_FOR_YR2) paste0("landmark ", LM_LABEL) else "legacy full-year vectors",
+        "):")
+print(table(exposure_group_lookup$EXPOSURE_GROUP))
+if (!YR2_INCLUDE_DUAL) {
+  message("  Dual Therapy patients excluded from the year-2 models: ",
+          sum(yr2_arm_source$ARM == "Dual Therapy"),
+          "  (set YR2_INCLUDE_DUAL <- TRUE to model them)")
+}
+
+# --- Step 1: eligibility -- still under observation at the outcome window ---
+yr2_eligible_ids <- df_liver_data_filtered %>%
+  filter(!is.na(PTIME), PTIME >= YR2_ELIGIBLE_DAY) %>%
+  pull(TRR_ID_CODE)
+
+# --- Step 2: outcome-window-only follow-up (not cumulative from transplant) ---
+df_immuno_fol_yr2 <- df_immuno_fol_read %>%
+  filter(TRR_ID_CODE %in% tx_ids_to_keep, TRR_ID_CODE %in% yr2_eligible_ids) %>%
+  select(-any_of(c("TX_DATE", "DISCHARGE_DATE"))) %>%
+  left_join(df_liver_data_filtered %>% select(TRR_ID_CODE, TX_DATE, DISCHARGE_DATE),
+            by = "TRR_ID_CODE") %>%
+  filter(!is.na(TX_DATE)) %>%
+  mutate(
+    PX_STAT_DATE_FOL = as.Date(PX_STAT_DATE_FOL),
+    TX_DATE = as.Date(TX_DATE),
+    FOL_DATE_DAYS_DELTA = time_length(interval(TX_DATE, PX_STAT_DATE_FOL), "days")
+  ) %>%
+  filter(FOL_DATE_DAYS_DELTA > YR2_START & FOL_DATE_DAYS_DELTA <= YR2_END) %>%
+  arrange(PX_STAT_DATE_FOL) %>%
+  mutate(NUM_ANTI_REJ_RXED_ROW = rowSums(across(all_of(COLS_TO_CHECK)) == 1, na.rm = TRUE))
+
+# --- Step 3: per-patient summary of outcome-window treatment ---
+df_yr2_patient_summary <- df_immuno_fol_yr2 %>%
+  group_by(TRR_ID_CODE) %>%
+  summarise(
+    across(all_of(COLS_TO_CHECK), ~ as.integer(any(.x == 1, na.rm = TRUE))),
+    NUM_FOLLOWUPS_YR2 = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    NUM_DRUGS_YR2    = rowSums(across(all_of(COLS_TO_CHECK))),
+    ANY_ANTI_REJ_YR2 = as.integer(NUM_DRUGS_YR2 >= 1)
+  )
+
+# --- Step 4: attach exposure group to the eligible cohort ---
+all_ids_by_group <- exposure_group_lookup %>%
+  filter(TRR_ID_CODE %in% yr2_eligible_ids)
+
+df_yr2_by_group <- all_ids_by_group %>%
+  left_join(df_yr2_patient_summary, by = "TRR_ID_CODE") %>%
+  mutate(
+    HAS_YR2_FOLLOWUP = !is.na(NUM_FOLLOWUPS_YR2),
+    ANY_ANTI_REJ_YR2 = coalesce(ANY_ANTI_REJ_YR2, 0L),
+    across(all_of(COLS_TO_CHECK), ~ coalesce(.x, 0L))
+  )
+# NOTE: patients with HAS_YR2_FOLLOWUP == FALSE have no recorded visit in the
+# outcome window at all. They are coded ANY_ANTI_REJ_YR2 = 0, which assumes
+# "no visit" means "no rejection", not "unknown". The N_with_yr2_followup
+# column below is what makes that assumption auditable.
+
+# --- Step 5: group-level summary ---
+year2_group_summary <- df_yr2_by_group %>%
+  group_by(EXPOSURE_GROUP, .drop = FALSE) %>%
+  summarise(
+    N                   = n(),
+    N_with_yr2_followup = sum(HAS_YR2_FOLLOWUP),
+    Pct_with_followup   = 100 * N_with_yr2_followup / pmax(N, 1),
+    N_rejected_yr2      = sum(ANY_ANTI_REJ_YR2),
+    Pct_rejected_yr2    = 100 * N_rejected_yr2 / pmax(N, 1),
+    .groups = "drop"
+  )
+
+print(
+  year2_group_summary %>%
+    gt() %>%
+    fmt_number(columns = c(Pct_with_followup, Pct_rejected_yr2), decimals = 1) %>%
+    cols_label(
+      EXPOSURE_GROUP      = paste0("Group as of ", LM_LABEL),
+      N                   = "N (eligible cohort)",
+      N_with_yr2_followup = "N with outcome-window follow-up",
+      Pct_with_followup   = "% followed up",
+      N_rejected_yr2      = "N treated in outcome window",
+      Pct_rejected_yr2    = "% treated"
+    ) %>%
+    tab_header(title = "Anti-Rejection Treatment During the Outcome Window, by Exposure Group",
+               subtitle = paste0("Exposure: ", EXPOSURE_LABEL,
+                                 "; outcome: post-transplant days ", round(YR2_START), "-", round(YR2_END))) %>%
+    tab_options(table.font.size = 13, data_row.padding = px(4), column_labels.font.weight = "bold") %>%
+    tab_source_note(paste0(
+      "Eligible cohort restricted to patients still under observation at day ", round(YR2_ELIGIBLE_DAY),
+      ". Exposure groups are fixed at day ", round(LANDMARK_DAY), " and are NOT reassigned by treatment in ",
+      "between: patients first treated in the day ", round(GAP_START), "-", round(GAP_END), " gap remain in ",
+      "Control, which attenuates every contrast below. Compare '% followed up' across arms before reading ",
+      "'% treated' -- a patient with no recorded visit is counted as untreated rather than unknown."))
+)
+
+tab_yr2 <- table(df_yr2_by_group$EXPOSURE_GROUP, df_yr2_by_group$ANY_ANTI_REJ_YR2)
+print(
+  tab_yr2
+)
+print(
+  safe_chisq_or_fisher(tab_yr2)
+)
+
+# --- Step 6: which drugs were used in the outcome window, by exposure group ---
+drug_freq_by_group_yr2 <- df_yr2_by_group %>%
+  select(EXPOSURE_GROUP, all_of(COLS_TO_CHECK)) %>%
+  group_by(EXPOSURE_GROUP, .drop = FALSE) %>%
+  summarise(N = n(), across(all_of(COLS_TO_CHECK), sum), .groups = "drop") %>%
+  pivot_longer(-c(EXPOSURE_GROUP, N), names_to = "Drug", values_to = "Frequency") %>%
+  mutate(Drug = str_remove(Drug, COL_TAIL), Freq_Per_Patient = Frequency / pmax(N, 1)) %>%
+  arrange(EXPOSURE_GROUP, desc(Freq_Per_Patient))
+
+print(
+  drug_freq_by_group_yr2 %>%
+    filter(Frequency > 0) %>%
+    select(EXPOSURE_GROUP, Drug, N, Frequency, Freq_Per_Patient) %>%
+    kable(
+      caption = "Outcome-Window Anti-Rejection Drug Use per Patient, by Exposure Group",
+      col.names = c("Exposure Group", "Drug", "Group N", "Patients Treated", "Rate per Patient"),
+      digits = 3
+    ) %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+)
+
+# coord_cartesian() zooms without dropping data, unlike scale_y_continuous(limits=),
+# which would silently discard any bar above the ceiling.
+yr2_bar_ceiling <- max(0.03, 1.1 * max(drug_freq_by_group_yr2$Freq_Per_Patient, na.rm = TRUE))
+
+print(
+  drug_freq_by_group_yr2 %>%
+    filter(Frequency > 0) %>%
+    ggplot(aes(x = reorder(Drug, -Freq_Per_Patient), y = Freq_Per_Patient, fill = EXPOSURE_GROUP)) +
+    geom_col(position = "dodge") +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+    coord_cartesian(ylim = c(0, yr2_bar_ceiling)) +
+    labs(
+      title = "Outcome-Window Anti-Rejection Drug Use per Patient, by Exposure Group",
+      subtitle = paste0("Groups fixed at ", LM_LABEL),
+      x = "Drug", y = "Fraction of Group Treated", fill = "Exposure Group"
+    ) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+)
+
+# --- Step 7: patient-level detail ---
+print(
+  df_yr2_by_group %>%
+    select(TRR_ID_CODE, EXPOSURE_GROUP, HAS_YR2_FOLLOWUP, ANY_ANTI_REJ_YR2,
+           NUM_DRUGS_YR2, all_of(COLS_TO_CHECK)) %>%
+    arrange(EXPOSURE_GROUP, desc(ANY_ANTI_REJ_YR2)) %>%
+    head(20)
+)
+
+
+#===============================================================================
+# 23. Statistical Analysis: Outcome-Window Anti-Rejection Treatment
+#===============================================================================
+covariates_yr2 <- df_liver_data_filtered %>%
+  select(TRR_ID_CODE, AGE, GENDER, MELD_PELD_LAB_SCORE, COLD_ISCH, DIAB) %>%
+  mutate(DIAB_BIN = diab_bin(DIAB), GENDER = factor(GENDER)) %>%
+  distinct(TRR_ID_CODE, .keep_all = TRUE) %>%
+  left_join(df_hla_calc %>% select(TRR_ID_CODE, MM_TOTAL), by = "TRR_ID_CODE")
+
+df_yr2_model <- df_yr2_by_group %>%
+  left_join(covariates_yr2, by = "TRR_ID_CODE") %>%
+  mutate(EXPOSURE_GROUP = relevel(droplevels(EXPOSURE_GROUP), ref = "Control"))
+
+stopifnot(nrow(df_yr2_model) == nrow(df_yr2_by_group))
+
+# Adjustment covariate set, defined ONCE so the rejection and graft-failure
+# models cannot drift apart.
+#
+# HLA mismatch (MM_TOTAL) is deliberately excluded, for the same reason it was
+# removed from the propensity matching: missing for ~60% of the cohort, and
+# glm() is complete-case. Including it silently fitted every "Adjusted" model
+# on roughly 40% of the cohort while the neighbouring "Unadjusted" model used
+# all of it, so the two were never estimated on the same patients and the
+# difference between them could not be attributed to the adjustment.
+yr2_adj_covs <- "AGE + GENDER + MELD_PELD_LAB_SCORE + COLD_ISCH + DIAB_BIN"
+
+# N is carried into the output tables because COLD_ISCH and DIAB still have
+# some missingness, so adjusted and unadjusted models may STILL be fitted on
+# slightly different samples. Reporting it makes any gap visible.
+tidy_glm_or <- function(fit) {
+  co <- summary(fit)$coefficients
+  ci <- suppressMessages(confint.default(fit))  # Wald CIs
+  
+  tibble(
+    term     = rownames(co),
+    N        = stats::nobs(fit),
+    OR       = exp(co[, "Estimate"]),
+    CI_lower = exp(ci[, 1]),
+    CI_upper = exp(ci[, 2]),
+    p_value  = co[, "Pr(>|z|)"]
+  ) %>%
+    filter(term != "(Intercept)")
+}
+
+# Generic extractor: labels comparisons from the term name and the reference
+# level rather than a hard-coded case_when, so adding Dual Therapy as a fourth
+# arm needs no further edits.
+or_from <- function(fit, ref_lbl, model_lbl, keep_terms = NULL) {
+  out <- tidy_glm_or(fit) %>%
+    filter(str_detect(term, "^EXPOSURE_GROUP")) %>%
+    mutate(Level = str_remove(term, "^EXPOSURE_GROUP"))
+  if (!is.null(keep_terms)) out <- out %>% filter(Level %in% keep_terms)
+  out %>%
+    mutate(Comparison = paste0(Level, " vs ", ref_lbl), Model = model_lbl) %>%
+    select(Comparison, Model, N, OR, CI_lower, CI_upper, p_value)
+}
+
+fit_glm_pair <- function(model_df, outcome, ref_lvl) {
+  d <- model_df %>% mutate(EXPOSURE_GROUP = relevel(droplevels(EXPOSURE_GROUP), ref = ref_lvl))
+  list(
+    unadj = glm(as.formula(paste(outcome, "~ EXPOSURE_GROUP")), data = d, family = binomial),
+    adj   = glm(as.formula(paste(outcome, "~ EXPOSURE_GROUP +", yr2_adj_covs)),
+                data = d, family = binomial),
+    data  = d
+  )
+}
+
+# --- Control-referenced models ---
+fits_ctrl_ref <- fit_glm_pair(df_yr2_model, "ANY_ANTI_REJ_YR2", "Control")
+print(
+  summary(fits_ctrl_ref$unadj)
+)
+print(
+  summary(fits_ctrl_ref$adj)
+)
+
+fit_null <- glm(ANY_ANTI_REJ_YR2 ~ 1, data = fits_ctrl_ref$data, family = binomial)
+print(
+  anova(fit_null, fits_ctrl_ref$unadj, test = "LRT")
+)
+
+# --- Steroid-referenced models (for the Combined vs Steroids contrast) ---
+fits_ster_ref <- fit_glm_pair(df_yr2_model, "ANY_ANTI_REJ_YR2", "Steroids")
+
+non_ctrl_levels <- setdiff(levels(droplevels(df_yr2_model$EXPOSURE_GROUP)), c("Control", "Steroids"))
+
+or_results_yr2 <- bind_rows(
+  or_from(fits_ctrl_ref$unadj, "Control",  "Unadjusted"),
+  or_from(fits_ctrl_ref$adj,   "Control",  "Adjusted"),
+  or_from(fits_ster_ref$unadj, "Steroids", "Unadjusted", keep_terms = non_ctrl_levels),
+  or_from(fits_ster_ref$adj,   "Steroids", "Adjusted",   keep_terms = non_ctrl_levels)
+)
+
+print(
+  or_results_yr2
+)
+
+render_or_table <- function(res, title, outcome_phrase, primary = TRUE) {
+  if (is.null(res) || nrow(res) == 0) {
+    message("no results to render for: ", title)
+    return(invisible(NULL))
+  }
+  res %>%
+    mutate(
+      `OR (95% CI)` = sprintf("%.2f (%.2f\u2013%.2f)", OR, CI_lower, CI_upper),
+      `P value` = case_when(p_value < 0.001 ~ "<0.001", TRUE ~ sprintf("%.3f", p_value))
+    ) %>%
+    select(Comparison, Model, N, `OR (95% CI)`, `P value`) %>%
+    arrange(Comparison, Model) %>%
+    gt(groupname_col = "Comparison") %>%
+    cols_label(Model = "Model", N = "N in model",
+               `OR (95% CI)` = "Odds Ratio (95% CI)", `P value` = "P value") %>%
+    tab_header(title = title,
+               subtitle = paste0("Exposure: ", EXPOSURE_LABEL,
+                                 "; outcome: post-transplant days ",
+                                 round(YR2_START), "-", round(YR2_END))) %>%
+    tab_options(table.font.size = 13, data_row.padding = px(4),
+                column_labels.font.weight = "bold", row_group.font.weight = "bold") %>%
+    tab_source_note(paste0(
+      if (primary) "PRIMARY ANALYSIS (covariate-adjusted, full eligible cohort). " else "",
+      "OR > 1 indicates higher odds of ", outcome_phrase, " relative to the comparison group. Adjusted ",
+      "model controls for recipient age, gender, MELD score, cold ischemic time, and diabetes status. ",
+      "HLA mismatch is NOT included: missing for roughly 60% of the cohort, and because fitting is ",
+      "complete-case, including it would restrict the adjusted models to a minority of patients selected ",
+      "on HLA-typing availability. N is reported per model so any remaining difference in analysed sample ",
+      "between rows is visible. EXPOSURE IS FIXED AT DAY ", round(LANDMARK_DAY), ": the Control arm means ",
+      "'not treated in the first ", round(LANDMARK_DAY), " days', and includes patients first treated ",
+      "during the day ", round(GAP_START), "-", round(GAP_END), " gap. Eligibility requires survival to ",
+      "day ", round(YR2_ELIGIBLE_DAY), ", which is AFTER the exposure window, so these estimates ",
+      "condition on a post-exposure variable; see the attrition table for whether that differs by arm."))
+}
+
+print(
+  render_or_table(
+    or_results_yr2,
+    "Odds of Anti-Rejection Treatment in the Outcome Window, by Exposure Group",
+    "being treated for rejection in the outcome window"
+  )
+)
+
+# --- Model diagnostics ---
+print(
+  summary(fits_ctrl_ref$adj)$coefficients
+)
+print(
+  fits_ctrl_ref$adj$converged
+)
+
+fit_adj_no_group <- glm(
+  as.formula(paste("ANY_ANTI_REJ_YR2 ~", yr2_adj_covs)),
+  data = fits_ctrl_ref$data, family = binomial
+)
+print(
+  anova(fit_adj_no_group, fits_ctrl_ref$adj, test = "LRT")
+)
+
+
+#===============================================================================
+# 24. Outcome-Window Graft Failure, by Exposure Group
+#===============================================================================
+df_graft_time <- df_liver_data_filtered %>%
+  select(TRR_ID_CODE, TX_DATE, GRF_FAIL_DATE, PX_STAT_DATE) %>%
+  mutate(
+    TX_DATE       = as.Date(TX_DATE),
+    GRF_FAIL_DATE = as.Date(GRF_FAIL_DATE),
+    PX_STAT_DATE  = as.Date(PX_STAT_DATE),
+    GRF_FAIL_EVENT = as.integer(!is.na(GRF_FAIL_DATE)),
+    GRF_TIME_DAYS  = if_else(
+      GRF_FAIL_EVENT == 1,
+      as.numeric(GRF_FAIL_DATE - TX_DATE),
+      as.numeric(PX_STAT_DATE  - TX_DATE)   # censored at last known status date
+    )
+  ) %>%
+  distinct(TRR_ID_CODE, .keep_all = TRUE)
+
+print(
+  summary(df_graft_time$GRF_TIME_DAYS)
+)
+print(
+  sum(is.na(df_graft_time$GRF_TIME_DAYS))
+)
+print(
+  table(df_graft_time$GRF_FAIL_EVENT, useNA = "ifany")
+)
+
+# Graft-failure eligibility uses its own clock: the graft had to be functioning
+# at the start of the outcome window.
+grf_eligible_ids <- df_graft_time %>%
+  filter(!is.na(GRF_TIME_DAYS), GRF_TIME_DAYS >= YR2_ELIGIBLE_DAY) %>%
+  pull(TRR_ID_CODE)
+
+df_graft_yr2 <- df_graft_time %>%
+  filter(TRR_ID_CODE %in% grf_eligible_ids) %>%
+  mutate(ANY_GRF_FAIL_YR2 = if_else(GRF_FAIL_EVENT == 1 & GRF_TIME_DAYS <= YR2_END, 1L, 0L))
+
+df_graft_yr2_by_group <- exposure_group_lookup %>%
+  filter(TRR_ID_CODE %in% grf_eligible_ids) %>%
+  left_join(df_graft_yr2 %>% select(TRR_ID_CODE, ANY_GRF_FAIL_YR2, GRF_TIME_DAYS),
+            by = "TRR_ID_CODE")
+
+year2_grf_group_summary <- df_graft_yr2_by_group %>%
+  group_by(EXPOSURE_GROUP, .drop = FALSE) %>%
+  summarise(
+    N                = n(),
+    N_grf_fail_yr2   = sum(ANY_GRF_FAIL_YR2, na.rm = TRUE),
+    Pct_grf_fail_yr2 = 100 * N_grf_fail_yr2 / pmax(N, 1),
+    .groups = "drop"
+  )
+
+print(
+  year2_grf_group_summary %>%
+    gt() %>%
+    fmt_number(columns = Pct_grf_fail_yr2, decimals = 1) %>%
+    cols_label(
+      EXPOSURE_GROUP   = paste0("Group as of ", LM_LABEL),
+      N                = "N (eligible cohort)",
+      N_grf_fail_yr2   = "N graft failures",
+      Pct_grf_fail_yr2 = "% graft failure"
+    ) %>%
+    tab_header(title = "Graft Failure During the Outcome Window, by Exposure Group",
+               subtitle = paste0("Post-transplant days ", round(YR2_START), "-", round(YR2_END))) %>%
+    tab_options(table.font.size = 13, data_row.padding = px(4), column_labels.font.weight = "bold") %>%
+    tab_source_note(paste0(
+      "Eligible cohort restricted to patients whose graft was known functioning through day ",
+      round(YR2_ELIGIBLE_DAY), " (GRF_TIME_DAYS >= ", round(YR2_ELIGIBLE_DAY), "). Note this is a DIFFERENT ",
+      "eligibility rule from the treatment outcome above, which uses PTIME, so the two denominators differ ",
+      "and their Ns should not be quoted interchangeably."))
+)
+
+tab_grf_yr2 <- table(df_graft_yr2_by_group$EXPOSURE_GROUP, df_graft_yr2_by_group$ANY_GRF_FAIL_YR2)
+print(
+  tab_grf_yr2
+)
+print(
+  safe_chisq_or_fisher(tab_grf_yr2)
+)
+
+
+#===============================================================================
+# 25. Statistical Analysis: Outcome-Window Graft Failure
+#===============================================================================
+df_grf_yr2_model <- df_graft_yr2_by_group %>%
+  left_join(covariates_yr2, by = "TRR_ID_CODE") %>%
+  mutate(EXPOSURE_GROUP = relevel(droplevels(EXPOSURE_GROUP), ref = "Control"))
+
+stopifnot(nrow(df_graft_yr2_by_group) == nrow(df_grf_yr2_model))
+
+fits_grf_ctrl_ref <- fit_glm_pair(df_grf_yr2_model, "ANY_GRF_FAIL_YR2", "Control")
+print(
+  summary(fits_grf_ctrl_ref$unadj)
+)
+print(
+  summary(fits_grf_ctrl_ref$adj)
+)
+
+fit_grf_null <- glm(ANY_GRF_FAIL_YR2 ~ 1, data = fits_grf_ctrl_ref$data, family = binomial)
+print(
+  anova(fit_grf_null, fits_grf_ctrl_ref$unadj, test = "LRT")
+)
+
+fits_grf_ster_ref <- fit_glm_pair(df_grf_yr2_model, "ANY_GRF_FAIL_YR2", "Steroids")
+
+or_grf_results_yr2 <- bind_rows(
+  or_from(fits_grf_ctrl_ref$unadj, "Control",  "Unadjusted"),
+  or_from(fits_grf_ctrl_ref$adj,   "Control",  "Adjusted"),
+  or_from(fits_grf_ster_ref$unadj, "Steroids", "Unadjusted", keep_terms = non_ctrl_levels),
+  or_from(fits_grf_ster_ref$adj,   "Steroids", "Adjusted",   keep_terms = non_ctrl_levels)
+)
+
+print(
+  or_grf_results_yr2
+)
+
+print(
+  render_or_table(
+    or_grf_results_yr2,
+    "Odds of Graft Failure in the Outcome Window, by Exposure Group",
+    "graft failure in the outcome window"
+  )
+)
+
+# --- Model diagnostics ---
+print(
+  summary(fits_grf_ctrl_ref$adj)$coefficients   # check for very large |estimate|/SE (separation)
+)
+
+fit_grf_adj_no_group <- glm(
+  as.formula(paste("ANY_GRF_FAIL_YR2 ~", yr2_adj_covs)),
+  data = fits_grf_ctrl_ref$data, family = binomial
+)
+print(
+  anova(fit_grf_adj_no_group, fits_grf_ctrl_ref$adj, test = "LRT")
+)
+
+
+#===============================================================================
+# 26. Outcome-Window Results: Propensity-Matched Sensitivity Analysis
+#-------------------------------------------------------------------------------
+# Sections 23 and 25 are the PRIMARY analysis: covariate-adjusted logistic
+# regression on the full eligible cohort. This section repeats both outcomes on
+# propensity-matched arms so the two approaches to confounding control can be
+# compared.
+#
+# WHY MATCH HERE RATHER THAN REUSE THE SECTION-14 / SECTION-18 MATCHES:
+#   - Section 14 matched on the full cohort.
+#   - Section 18 matched within the SURVIVAL landmark cohort (PTIME >= 90).
+#   Neither is the outcome cohort, which is defined by a different eligibility
+#   rule (PTIME >= 365 for treatment; GRF_TIME_DAYS >= 365 for graft failure)
+#   applied to a different denominator. Applying a downstream restriction to an
+#   already-matched set breaks pairs non-randomly and reintroduces the
+#   imbalance matching removed, so each outcome is matched on its OWN eligible
+#   cohort with pairs intact.
+#
+# ESTIMAND NOTE: matching is pairwise, so unlike the pooled regression above,
+# each comparison is its own 1:1 matched cohort. "Combined vs Control" and
+# "Steroids vs Control" do NOT share a control set and their Ns are not
+# additive.
+#===============================================================================
+
+# ETHCAT is the only match covariate not already carried in the model frames.
+ethcat_yr2 <- df_liver_data_filtered %>%
+  select(TRR_ID_CODE, ETHCAT) %>%
+  distinct(TRR_ID_CODE, .keep_all = TRUE) %>%
+  mutate(ETHCAT = factor(ETHCAT))
+
+match_yr2_outcome <- function(model_df, outcome, treat_grp, ctrl_grp, label, seed = 1234) {
+  
+  d <- model_df %>%
+    filter(EXPOSURE_GROUP %in% c(treat_grp, ctrl_grp)) %>%
+    mutate(EXPOSURE_GROUP = droplevels(EXPOSURE_GROUP)) %>%
+    left_join(ethcat_yr2, by = "TRR_ID_CODE") %>%
+    mutate(treat = as.integer(EXPOSURE_GROUP == treat_grp))
+  
+  md  <- d %>% select(TRR_ID_CODE, treat, all_of(match_covariates))
+  res <- run_match(md, label, seed = seed)
+  if (is.null(res)) return(NULL)
+  
+  dm <- d %>%
+    filter(TRR_ID_CODE %in% res$matched_ids) %>%
+    mutate(EXPOSURE_GROUP = relevel(droplevels(EXPOSURE_GROUP), ref = ctrl_grp))
+  
+  # Guard against a zero-event arm, which makes the OR non-estimable.
+  ev <- tapply(dm[[outcome]], dm$EXPOSURE_GROUP, sum, na.rm = TRUE)
+  if (any(ev == 0)) {
+    message("skipping models -- an arm has zero events after matching: ", label,
+            " (events by arm: ", paste(names(ev), ev, sep = "=", collapse = ", "), ")")
+    return(NULL)
+  }
+  
+  f_unadj <- glm(as.formula(paste(outcome, "~ EXPOSURE_GROUP")), data = dm, family = binomial)
+  f_adj   <- glm(as.formula(paste(outcome, "~ EXPOSURE_GROUP +", yr2_adj_covs)),
+                 data = dm, family = binomial)
+  
+  bind_rows(
+    or_from(f_unadj, ctrl_grp, "Unadjusted"),
+    or_from(f_adj,   ctrl_grp, "Adjusted")
+  ) %>%
+    mutate(Comparison = label)
+}
+
+render_yr2_matched_table <- function(res, title, outcome_phrase) {
+  if (is.null(res) || nrow(res) == 0) {
+    message("no matched results to render for: ", title)
+    return(invisible(NULL))
+  }
+  res %>%
+    mutate(
+      `OR (95% CI)` = sprintf("%.2f (%.2f\u2013%.2f)", OR, CI_lower, CI_upper),
+      `P value` = case_when(p_value < 0.001 ~ "<0.001", TRUE ~ sprintf("%.3f", p_value))
+    ) %>%
+    select(Comparison, Model, N, `OR (95% CI)`, `P value`) %>%
+    arrange(Comparison, Model) %>%
+    gt(groupname_col = "Comparison") %>%
+    cols_label(Model = "Model", N = "N in matched model",
+               `OR (95% CI)` = "Odds Ratio (95% CI)", `P value` = "P value") %>%
+    tab_header(title = title, subtitle = "Sensitivity analysis: 1:1 propensity-matched arms") %>%
+    tab_options(table.font.size = 13, data_row.padding = px(4),
+                column_labels.font.weight = "bold", row_group.font.weight = "bold") %>%
+    tab_source_note(paste0(
+      "OR > 1 indicates higher odds of ", outcome_phrase, " relative to the comparison group. ",
+      "SENSITIVITY ANALYSIS: each comparison is a separate 1:1 nearest-neighbour propensity match ",
+      "(caliper 0.2 SD of the propensity logit; age, gender, ethnicity, MELD, diabetes, cold ischemic ",
+      "time; HLA mismatch excluded for missingness), performed on that outcome's own eligible cohort with ",
+      "pairs intact. The 'Adjusted' model additionally fits the same covariates on the matched set. ",
+      "Because each comparison has its own matched control set, Ns are not additive across comparisons. ",
+      "Exposure groups are fixed at ", LM_LABEL, ". Compare against the full-cohort adjusted regression, ",
+      "which is the primary analysis."))
+}
+
+yr2_match_pairs <- list(
+  list(treat = "Steroids", ctrl = "Control",  label = "Steroids vs Control"),
+  list(treat = "Combined", ctrl = "Control",  label = "Combined vs Control"),
+  list(treat = "Combined", ctrl = "Steroids", label = "Combined vs Steroids")
+)
+if (YR2_INCLUDE_DUAL) {
+  yr2_match_pairs <- c(yr2_match_pairs, list(
+    list(treat = "Dual Therapy", ctrl = "Control",  label = "Dual Therapy vs Control"),
+    list(treat = "Dual Therapy", ctrl = "Steroids", label = "Dual Therapy vs Steroids")
+  ))
+}
+
+matched_or_rej_yr2 <- bind_rows(lapply(yr2_match_pairs, function(p) {
+  match_yr2_outcome(df_yr2_model, "ANY_ANTI_REJ_YR2", p$treat, p$ctrl, p$label)
+}))
+
+print(
+  matched_or_rej_yr2
+)
+
+print(
+  render_yr2_matched_table(
+    matched_or_rej_yr2,
+    "Odds of Anti-Rejection Treatment in the Outcome Window (Propensity-Matched Sensitivity Analysis)",
+    "being treated for rejection in the outcome window"
+  )
+)
+
+matched_or_grf_yr2 <- bind_rows(lapply(yr2_match_pairs, function(p) {
+  match_yr2_outcome(df_grf_yr2_model, "ANY_GRF_FAIL_YR2", p$treat, p$ctrl, p$label)
+}))
+
+print(
+  matched_or_grf_yr2
+)
+
+print(
+  render_yr2_matched_table(
+    matched_or_grf_yr2,
+    "Odds of Graft Failure in the Outcome Window (Propensity-Matched Sensitivity Analysis)",
+    "graft failure in the outcome window"
+  )
+)
+
+
+#===============================================================================
+# 27. Run checklist
+#-------------------------------------------------------------------------------
+# Printed last so the numbers that decide whether this design holds up are in
+# one place at the bottom of the console rather than scattered through the run.
+#===============================================================================
+message("\n\n================ RUN CHECKLIST (landmark = ", LANDMARK_DAY, " days) ================")
+message("1. Assessment rule in use: ", ASSESSMENT_RULE, ". Control arm size by rule:")
+print(ctrl_by_rule)
+message("   -> 'strict' requires a form DATED before the landmark and is wrong for UNOS,")
+message("      whose forms report on the interval since the previous form. It is listed")
+message("      only to document how far it collapses the Control arm.")
+message("   -> Of the Controls in use, ", length(ctrl_discharge_only),
+        " rest on a discharge record alone, with no follow-up form.")
+message("2. Gap contamination: ", nrow(gap_contamination), " of ", length(control_at_lm),
+        sprintf(" Controls (%.1f%%) were treated in day %g-%g.",
+                100 * nrow(gap_contamination) / max(length(control_at_lm), 1),
+                GAP_START, GAP_END))
+message("   -> Every treated-vs-Control estimate is attenuated by this. Compare against")
+message("      the time-varying model (section 21), which does not fold them into Control.")
+message("3. Dual Therapy arm: n = ", n_dual_lm,
+        if (!YR2_INCLUDE_DUAL) "  (currently EXCLUDED from year-2 models)" else "  (included)")
+message("4. Index-admission share by arm: see the '% index admission' column in section 18b.")
+message("   -> A high value means that arm is defined as much by treatment SETTING as by drug,")
+message("      and the propensity match does not balance on setting.")
+message("5. Year-2 selection: see the bottom block of the attrition table in section 18.")
+message("   -> Exposure is at day ", LANDMARK_DAY, " but year-2 eligibility is at day ",
+        round(YR2_ELIGIBLE_DAY), "; between-arm differences there mean the")
+message("      year-2 odds ratios condition on a post-exposure variable.")
+message("6. Ascertainment: compare '% followed up' across arms in the section 22 table")
+message("      before reading any '% treated' difference as clinical.")
+message("7. Exposure timing: see section 18b. In this cohort ALL exposure events are")
+message("      index-admission records, so the exposure is 'therapy during the index")
+message("      admission', not 'therapy within ", LANDMARK_DAY, " days'. Describe it that way.")
+message("8. Length of stay by arm: see section 7 Step 7b. LOS is entangled with the")
+message("      exposure and is the time origin in the discharge-anchored design (21b).")
+message("9. Design robustness: see the side-by-side table at the end of section 21b.")
+message("      Same arms, two time origins -- agreement there is the strongest check")
+message("      available that the result is not an artefact of the landmark.")
+message("=========================================================================")#===============================================================================
+# UNOS Liver Transplant Anti-Rejection Therapy Analysis
 #
 # Parses UNOS liver transplant patients into rejection-therapy groups
 # (no rejection / steroid monotherapy / combined therapy / dual therapy) over
