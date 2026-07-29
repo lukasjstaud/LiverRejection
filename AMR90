@@ -2841,10 +2841,10 @@ lm_match_steroid_control <- match_within_landmark(
 if (!is.null(lm_match_steroid_control)) {
   summary(lm_match_steroid_control$matchit)
   keep(love.plot(lm_match_steroid_control$matchit,
-                  binary = "std", stats = "mean.diffs", abs = TRUE,
-                  var.order = "unadjusted", thresholds = c(m = 0.1),
-                  title = "Landmark Cohort Balance: Steroid vs Control",
-                  sample.names = c("Unmatched", "Matched"),
+                 binary = "std", stats = "mean.diffs", abs = TRUE,
+                 var.order = "unadjusted", thresholds = c(m = 0.1),
+                 title = "Landmark Cohort Balance: Steroid vs Control",
+                 sample.names = c("Unmatched", "Matched"),
                  addl = lm_match_steroid_control$match_frame[balance_only_covariates]),
        "balance_landmark_steroid_vs_control")
 }
@@ -2852,10 +2852,10 @@ if (!is.null(lm_match_steroid_control)) {
 if (!is.null(lm_match_steroid_combined)) {
   summary(lm_match_steroid_combined$matchit)
   keep(love.plot(lm_match_steroid_combined$matchit,
-                  binary = "std", stats = "mean.diffs", abs = TRUE,
-                  var.order = "unadjusted", thresholds = c(m = 0.1),
-                  title = "Landmark Cohort Balance: Combined vs Steroid",
-                  sample.names = c("Unmatched", "Matched"),
+                 binary = "std", stats = "mean.diffs", abs = TRUE,
+                 var.order = "unadjusted", thresholds = c(m = 0.1),
+                 title = "Landmark Cohort Balance: Combined vs Steroid",
+                 sample.names = c("Unmatched", "Matched"),
                  addl = lm_match_steroid_combined$match_frame[balance_only_covariates]),
        "balance_landmark_combined_vs_steroid")
 }
@@ -2863,10 +2863,10 @@ if (!is.null(lm_match_steroid_combined)) {
 if (!is.null(lm_match_combined_control)) {
   summary(lm_match_combined_control$matchit)
   keep(love.plot(lm_match_combined_control$matchit,
-                  binary = "std", stats = "mean.diffs", abs = TRUE,
-                  var.order = "unadjusted", thresholds = c(m = 0.1),
-                  title = "Landmark Cohort Balance: Combined vs Control",
-                  sample.names = c("Unmatched", "Matched"),
+                 binary = "std", stats = "mean.diffs", abs = TRUE,
+                 var.order = "unadjusted", thresholds = c(m = 0.1),
+                 title = "Landmark Cohort Balance: Combined vs Control",
+                 sample.names = c("Unmatched", "Matched"),
                  addl = lm_match_combined_control$match_frame[balance_only_covariates]),
        "balance_landmark_combined_vs_control")
 }
@@ -3216,7 +3216,7 @@ postlm_timing_report <- function(start_day, end_day, window_label, slug,
         caption = "Y axes independent per panel. Shape is driven partly by the visit schedule -- see the rate figure."
       ) +
       theme_minimal() + theme(strip.text = element_text(face = "bold")),
-      paste0(slug, "_hist")
+    paste0(slug, "_hist")
   )
   
   # --- Plot B: treatment RATE per visit, schedule divided out ---
