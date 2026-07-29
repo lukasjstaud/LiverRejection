@@ -103,8 +103,10 @@ invisible(lapply(required_pkgs, function(pkg) {
 # Anti-rejection therapy given in [0, LANDMARK_DAY) defines the arm.
 LANDMARK_DAY <- 90
 
-# --- Outcome window (unchanged: "analyze outcomes after 1 year") ---
-YR2_START        <- 365.25   # outcome window opens
+# --- Outcome window ---
+# The active analysis window is post-landmark (day 90) through day 730.5;
+# it is not the conventional second post-transplant year (days 365-730).
+YR2_START        <- 90   # outcome window opens
 YR2_END          <- 730.5    # outcome window closes
 YR2_ELIGIBLE_DAY <- 365.25   # must still be under observation here to have an outcome
 
@@ -249,7 +251,7 @@ message("  Survival window : landmark to day ", round(LM_LONG_END), " post-trans
 #===============================================================================
 OUTPUT_DIR  <- "~/Local Documents/AOT/Analysis/Output/AMR"   # <- SET THIS
 SAVE_OUTPUT <- TRUE
-FIG_W <- 9; FIG_H <- 6; FIG_DPI <- 300
+FIG_W <- 9; FIG_H <- 6; FIG_H_SURV <- 8; FIG_DPI <- 300
 DF_PNG_MAX_ROWS <- 100   # plain data frames longer than this go to CSV instead
 
 out_path <- normalizePath(path.expand(OUTPUT_DIR), mustWork = FALSE)
@@ -281,12 +283,12 @@ keep <- function(x, name) {
       # NOT ggsave: a ggsurvplot is a list (curve + risk table), so ggsave
       # writes only the last-drawn ggplot and silently drops the risk table.
       f <- .out_file(name, "png", "figures")
-      png(f, width = FIG_W, height = FIG_H, units = "in", res = FIG_DPI)
+      png(f, width = FIG_W, height = FIG_H_SURV, units = "in", res = FIG_DPI)
       print(x); dev.off()
       
     } else if (inherits(x, "gg") || inherits(x, "ggplot")) {
       ggsave(.out_file(name, "png", "figures"), plot = x,
-             width = FIG_W, height = FIG_H, dpi = FIG_DPI)
+             width = FIG_W, height = FIG_H, dpi = FIG_DPI, bg = "white")
       
     } else if (inherits(x, "gt_tbl")) {
       gt::gtsave(x, .out_file(name, "png", "tables"))
@@ -2624,8 +2626,8 @@ keep(
     ggsurvplot(fit_dc_rej, data = df_dc_rej, fun = "event", conf.int = TRUE,
                risk.table = TRUE, break.time.by = 180,
                xlab = "Days since discharge",
-               ylab = "Cumulative incidence of anti-rejection therapy",
-               title = "Post-Discharge Anti-Rejection Therapy (Naive Cumulative Incidence)"),
+               ylab = "Kaplan–Meier-estimated probability of anti-rejection therapy",
+               title = "Post-Discharge Anti-Rejection Therapy (Kaplan–Meier Event Probability)"),
     break_by = 180, max_time = DC_HORIZON_LONG)
   , "cuminc_postdischarge_rejection")
 
@@ -3102,7 +3104,7 @@ keep(
 #                         is the picture of the contamination reported in
 #                         section 7 -- how much, and when.
 #   YEAR 1 POST-LM day 90-455 : the year immediately following exposure.
-#   OUTCOME day 365-730 : the window the year-2 odds ratios are actually about.
+#   OUTCOME day 90-730 : the window the outcome odds ratios are actually about.
 #
 # READ BEFORE INTERPRETING:
 #  1. ARMS ARE FIXED AT THE LANDMARK and are NOT reassigned by post-landmark
@@ -3367,7 +3369,8 @@ postlm_immediate_summary <- postlm_timing_report(
   slug = "year_after_landmark", binwidth = 30, break_by = 60)
 
 postlm_outcome_summary <- postlm_timing_report(
-  YR2_START, YR2_END, "Year-2 outcome window",
+  YR2_START, YR2_END,
+  paste0("Outcome window (post-transplant days ", round(YR2_START), "-", round(YR2_END), ")"),
   slug = "year2_outcome_window", binwidth = 30, break_by = 60)
 
 
