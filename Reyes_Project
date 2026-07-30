@@ -1,7 +1,15 @@
 #===============================================================================
 # PROJECT REYES -- UNIFIED PIPELINE
-# Objective: Assess whether KDPI and LDRI affect outcomes in KALT (<365 days)
-#            vs. liver-transplant-alone (LTA) patients who developed ESRD.
+# Objective: Assess whether KDPI and LDRI affect outcomes in KALT (kidney after
+#            liver transplant, ANY interval) vs. true liver-transplant-alone
+#            (LTA) patients who developed ESRD.
+#
+#            KALT is ONE category: the <1-year and >=1-year timing strata are
+#            both KALT, and "LTA" means never received a kidney. The exposure
+#            is defined in exactly one place -- KALT_MAX_DAYS ([K1], Sec 1.3).
+#            Because a >=1-year recipient is unexposed for a median 4.0 years
+#            first, every survival clock anchored at liver transplant treats
+#            the exposure as TIME-VARYING; see [K2].
 #
 # This file MERGES:
 #   (1) the cohort-construction / Table 1-3 script, and
@@ -39,7 +47,13 @@
 #
 # [C4] LITYP reference coding is contradictory in the old script -- the comment
 #      says "LITYP == 1 is Whole" but the code treats 0 as whole and 1:21 as
-#      split. This is now a single named constant, LITYP_WHOLE_CODES. SET IT.
+#      split. This is now a single named constant, LITYP_WHOLE_CODES.
+#      RESOLVED: the old CODE was right and the old COMMENT was wrong. Verified
+#      against star-file-data-dictionary.xlsx (LIVER_DATA -> format
+#      ALL_LISPLITTYPE): 0 = Whole Liver, 1-21 = partial/split variants,
+#      **OTHER** = Unknown. Empirically 0 covers 92.6% of non-missing LITYP,
+#      which is what an adult LT registry should look like. Do NOT "fix" this
+#      back toward the old comment. Section 9 now asserts it at run time.
 #
 # [C5] as.Date(ifelse(...)) in the survival endpoint builders stripped the Date
 #      class. Replaced with class-preserving indexing.
@@ -64,6 +78,30 @@ invisible(lapply(pkgs, library, character.only = TRUE))
 
 options(dplyr.summarise.inform = FALSE)
 
+# BATCH-RUN GRAPHICS DEVICE. Affects non-interactive runs ONLY -- in RStudio
+# this is a no-op and the normal plot pane is untouched.
+#
+# This script calls print() on ~18 figures as it goes. Interactively those go to
+# the RStudio device. Under Rscript there is no device open, so R falls back to
+# pdf(), which (a) writes a junk Rplots.pdf into the working directory and (b)
+# cannot encode the UTF-8 math glyphs used in several factor levels -- it emits
+# "in 'mbcsToSbcs': >= substituted for >=" for every label containing >= or <=
+# (KALT (>=1 y), LDRI <= 1.1, >=10 years), roughly 15 warnings per run.
+#
+# THOSE WARNINGS ARE ABOUT Rplots.pdf, NOT ABOUT THE EXPORTED FIGURES, and this
+# distinction cost a wrong diagnosis once already. The exported PNGs are written
+# by save_km()'s png() and by ggsave()'s ragg backend, both of which render the
+# glyphs correctly and emit nothing. Do NOT "fix" this by rewriting the factor
+# levels to ASCII -- that degrades every figure and CSV to solve a problem that
+# only ever existed in a file nobody reads. Verified by rendering both paths and
+# inspecting the output.
+#
+# Routing incidental print() output to a null PNG device kills both problems:
+# no stray Rplots.pdf, and no false warnings masking real ones.
+if (!interactive()) {
+  options(device = function(...) grDevices::png(nullfile()))
+}
+
 
 #===============================================================================
 # SECTION 1. CONFIGURATION -- every tunable lives here, nowhere else
@@ -85,7 +123,93 @@ wl_start_date <- as.Date("2017-08-10")   # post-2017 waitlist reweighting
 wl_end_date   <- as.Date("2025-04-03")
 STUDY_END     <- as.Date("2026-04-03")   # administrative censoring date
 
+# [F9] LIVER-TRANSPLANT ERA FLOOR. Until now the only date window in this
+# pipeline was on the KIDNEY listing (wl_start_date/wl_end_date); the liver
+# transplant itself was unrestricted, so the cohort contained liver transplants
+# from 1988 onward -- a 38-year span -- and OLT-to-kidney intervals up to 37
+# years. That is not "kidney after liver transplantation" in any clinically
+# coherent sense, and it loaded the late-kidney group with patients whose liver
+# transplant predates modern immunosuppression, allocation and MELD-era practice.
+#
+# The floor is a CALENDAR era restriction anchored at the end of the kidney
+# listing window, parallel to how wl_start_date/wl_end_date bound the kidney
+# side. It is not a per-patient cap on the OLT-to-kidney interval -- that would
+# make eligibility depend on the kidney listing date, which is downstream of the
+# exposure, and would be a different (and harder to justify) design.
+#
+# No upper bound is needed: liver transplants cannot postdate STUDY_END.
+#
+# EFFECT, for reference: a 20-year floor (2005-04-03) drops 645 of 5,072
+# patients -- 296 never-transplanted and 349 late-kidney recipients, and ZERO
+# KALT patients. The KALT arm is structurally immune, since a patient listed for
+# a kidney in 2017 or later whose kidney arrived within a year of their liver
+# transplant must have been transplanted around 2016 or later anyway. So this
+# filter acts almost entirely on the comparison arms, and it removes exactly the
+# long-interval patients that make the pooled "LTA" label incoherent.
+LT_LOOKBACK_YEARS <- 20
+lt_start_date     <- wl_end_date - years(LT_LOOKBACK_YEARS)   # 2005-04-03
+
 #--- 1.3 Analytic switches ----------------------------------------------------
+
+# [K1] WHAT COUNTS AS "KALT" -- the exposure definition for the whole pipeline.
+#
+# Maximum liver-TX-to-kidney-TX interval, in days, for a kidney transplant to
+# count as KALT. Every `Group` assignment in this file derives from this
+# constant via is_kalt() (Section 2), so it is the ONE place the exposure is
+# defined.
+#
+#   Inf = CURRENT SETTING. KALT means "kidney after liver transplant at ANY
+#         interval". KALT_STATUS_CALC 1 (<365 d) and 2 (>=365 d) are ONE
+#         category, and the comparator arm `LTA` is therefore TRUE LTA --
+#         patients who were listed for a kidney and never received one.
+#   365 = previous behaviour. Only <365-day recipients were KALT, and the
+#         "LTA" arm pooled the 2,140 never-transplanted patients with the 1,467
+#         >=1-year recipients -- i.e. "LTA" was false for 41% of that arm.
+#
+# WHY THIS CHANGED. The pooled comparator was incoherent: it was labelled
+# "liver transplant alone" while containing patients who did receive a kidney,
+# and their post-kidney survival was credited to the untransplanted arm. Merging
+# on the exposure side instead of the comparator side makes both arms mean what
+# they say.
+#
+# [K2] THE TRAP THIS SETTING OPENS, AND HOW THE PIPELINE AVOIDS IT.
+# Widening KALT to any interval is ONLY safe because the time-to-event analyses
+# treat the exposure as TIME-VARYING.
+#
+# ALL FIGURES BELOW WERE RECOMPUTED FROM THIS PIPELINE'S OWN OUTPUT (cohort
+# n = 4,347: 2,140 LTA / 740 KALT <1 y / 1,467 KALT >=1 y). Earlier drafts of
+# this block carried numbers from a superseded cohort build (2,476 / 1,850,
+# median 2,276 d); those were stale and are gone. If you change
+# LT_LOOKBACK_YEARS, the eligibility filters, or KALT_MAX_DAYS, RE-DERIVE these
+# rather than trusting them -- that is exactly how the previous set went wrong.
+#
+# A >=1-year recipient waits a median 1,467 days (4.0 years, IQR 1.5-9.0) for
+# their kidney; 67.5% of their post-liver-TX follow-up precedes it, and 0 of
+# their 213 deaths occur before it -- necessarily, since you must be alive to be
+# transplanted. Labelling them KALT from time zero on a liver-TX clock injects
+# ~8,385 event-free person-years into the KALT arm and manufactures a
+# 14.5-point 5-year survival advantage (78.4% vs 92.9%, p<0.001) out of what the
+# old <365-day definition showed as a null (85.6% vs 87.5%, p=0.19).
+#
+# Measured directly in the matched cohort (Section 21b/34), the same artifact
+# moves the patient-survival HR from 0.29 (0.24-0.37) under a fixed label to
+# 0.71 (0.49-1.03) for KALT <1 y and 0.81 (0.58-1.14) for KALT >=1 y once the
+# clock is handled correctly -- i.e. from a spectacular "71% mortality
+# reduction" to two estimates whose confidence intervals both cross 1.
+#
+# So: `Group` is a BASELINE STRATUM (who is in which arm), never a statement
+# that the patient held that status from day 0. Anything that puts KALT on a
+# survival clock anchored at liver transplant MUST let patients enter the
+# exposed state on their actual kidney-TX date. Section 24's Table 4 does this
+# with TABLE4_LATE_TX_TIME_VARYING, and Section 21b.5 is the pair-stratified
+# time-varying Cox.
+#
+# THE ONE SANCTIONED EXCEPTION is Figures 7-9, which ARE fixed-label KM curves
+# on the liver-TX clock -- because Section 21 first restricts that analysis to
+# KALT <1 y vs true LTA ([K3]), where the unexposed window is a median 250 days
+# rather than 4 years. Do not add a fixed-label KM on the liver-TX clock for the
+# MERGED KALT arm; that is the construction [K2] exists to forbid.
+KALT_MAX_DAYS <- Inf
 
 # TRUE  = old behaviour: cohort membership requires a non-missing KDPI, which
 #         means everyone in the cohort received a deceased-donor kidney and the
@@ -95,7 +219,22 @@ RESTRICT_COHORT_TO_KDPI <- FALSE
 
 # Which kidney donor types may enter the cohort. "C" = deceased, "L" = living.
 # Old script effectively allowed only "C". LD-KALT patients are real KALT
-# patients, so both are kept by default.
+# patients, so both are kept.
+#
+# [F10] Living donors ARE included in the cohort. They have no KDPI, so they
+# cannot be placed in a kidney-quality tier and are absent from anything that
+# tiers on KDPI (Table 2, the KDPI-stratified curves, Section 29's columns) --
+# but they have their own dedicated LD-KALT column in Table 3, and excluding
+# them from the cohort outright would discard real kidney-after-liver patients
+# to tidy up a reconciliation. Where a specific table needs them gone, it says
+# so at that table: Section 25's Table 5 excludes them explicitly ([F5]),
+# because its whole axis is kidney quality.
+#
+# The DONOR-TYPE RESTRICTION IS APPLIED AT THE PATIENT LEVEL in Section 6.2, not
+# the row level. With both types admitted that exclusion currently matches 0
+# patients, so it is a no-op on today's data -- but it is the correct structure
+# rather than a decorative one, and Section 6.2 explains the failure mode it
+# prevents. Narrowing this list to "C" would make it load-bearing immediately.
 KIDNEY_DON_TY_KEEP <- c("C", "L")
 
 # Population shown in Table 2 (deceased-donor kidney characteristics by KDPI
@@ -109,6 +248,20 @@ KIDNEY_DON_TY_KEEP <- c("C", "L")
 #            Broader donor-characteristics picture, but its tier n will then
 #            exceed Table 3's KALT-only tier n by exactly the LTA count in
 #            each tier (see Section 11 [4] reconciliation).
+#
+# [K1] THE TWO SETTINGS NOW COINCIDE. Under KALT_MAX_DAYS = Inf every
+# deceased-donor kidney recipient in the cohort IS a KALT recipient, so "KALT"
+# and "all" select the same rows and Section 11 [4]'s "LTA only" column is
+# empty by construction. The switch is kept because it becomes load-bearing
+# again the moment KALT_MAX_DAYS is narrowed.
+#
+# CONSEQUENCE FOR THE REFERENCE-MANUSCRIPT CHECK: the 107/624/71 deceased and
+# 313 LD-KALT tier counts quoted above were computed under the OLD <365-day
+# definition. Widening KALT to any interval adds the >=1-year recipients to
+# every tier, so Tables 2 and 3 will NO LONGER reproduce those numbers, and
+# Section 12's cross-checks will report the difference. That is the intended
+# effect of the definition change, not a regression -- set KALT_MAX_DAYS <- 365
+# to reproduce the reference Ns.
 TABLE2_POPULATION <- "KALT"
 
 # Source of the "developed ESRD" date used for years_to_esrd.
@@ -140,26 +293,51 @@ TABLE4_INTERVAL_LABELS <- c("Waitlist/dialysis", "0-1 month", "1-6 months",
                             "6-12 months", "1-2 years", "2-3 years",
                             "3-4 years", "4-5 years", ">5 years")
 
-# Whether an LTA patient who eventually receives a LATE kidney transplant
-# (KALT_STATUS_CALC == 2, i.e. kidney TX >=365 days after liver TX) gets their
-# own post-transplant time-varying switch, the same way KALT patients do.
-#   FALSE (default) = late-TX LTA patients are coded as "waitlist/dialysis"
-#                     for their ENTIRE follow-up in the time-varying model.
-#                     This keeps Table 4 internally consistent with Group as
-#                     used everywhere ELSE in this pipeline (Group is a fixed
-#                     label, not time-varying), and is what makes the block 3
-#                     summary row ("LTA relative to KALT") a simple two-group
-#                     comparison rather than something that would contradict a
-#                     time-varying definition used two rows above it.
-#   TRUE  = late-TX LTA patients also switch state at THEIR OWN kidney TX
-#           date, using the same interval cutpoints as KALT. More
-#           physiologically complete (nobody who ever gets transplanted stays
-#           labeled "waitlist" forever), but changes what "remaining on
-#           waiting list/dialysis" means for the block-3 summary HR -- it
-#           would then mean "never transplanted, at any point during
-#           follow-up" rather than "classified as LTA," which no longer
-#           lines up with Group directly.
-TABLE4_LATE_TX_TIME_VARYING <- FALSE
+# Whether a >=1-year kidney recipient (KALT_STATUS_CALC == 2) gets their own
+# post-transplant time-varying switch, the same way <1-year recipients do.
+#   FALSE = >=1-year recipients are coded as "waitlist/dialysis" for their
+#           ENTIRE follow-up in the time-varying model. Internally consistent
+#           with Group as a fixed label, but it puts real post-transplant
+#           person-time into the reference state.
+#   TRUE  = >=1-year recipients also switch state at THEIR OWN kidney TX date,
+#           using the same interval cutpoints as <1-year recipients. Nobody who
+#           is ever transplanted stays labeled "waitlist" forever.
+#
+# [F6] Set to TRUE, and under KALT_MAX_DAYS = Inf this is now MANDATORY rather
+# than preferable. Both timing strata are one KALT arm ([K1]), so the >=1-year
+# recipients are inside the exposure -- and the ONLY thing standing between that
+# merge and a fabricated result is that their exposure starts when their kidney
+# does.
+#
+# The magnitude, recomputed from this pipeline's own output: median
+# liver-TX-to-kidney-TX delay among those 1,467 patients is 1,467 days (4.0
+# years, IQR 1.5-9.0), 67.5% of their post-liver-TX follow-up precedes their
+# kidney transplant, and 0 of their 213 deaths occur before it -- necessarily,
+# since you must be alive to be transplanted. Fixed-labelling them KALT from
+# time zero injects ~8,385 event-free person-years into the KALT arm and turns
+# what the old <365-day definition showed as a null (85.6% vs 87.5% at 5 years,
+# log-rank p=0.19) into a manufactured 14.5-point advantage (78.4% vs 92.9%,
+# p<0.001). Setting this FALSE while KALT_MAX_DAYS is Inf reproduces exactly
+# that artifact; Section 24.1 refuses the combination rather than fitting it.
+#
+# Making the switch time-varying instead puts each late recipient's pre-kidney
+# years in the reference state, where they belong, and answers the same
+# question without the artifact. It also fixes Table 4's power problem: the
+# post-transplant intervals go from 4-19 events each (several below
+# TABLE4_MIN_EVENTS_PER_INTERVAL, forcing adaptive merges) to 25-85 events
+# each, so all nine intervals are estimable at full granularity.
+#
+# CONSEQUENCE TO KEEP IN MIND: Block 2's reference state means "not yet
+# transplanted at this instant," while Block 3's fixed-Group contrast means
+# "never received a kidney at all." Under KALT_MAX_DAYS = Inf these are much
+# closer than they used to be -- Block 3's "LTA" arm is now true LTA rather than
+# a mixture -- but they are still not identical, because Block 2's reference
+# additionally holds every KALT patient's own pre-transplant person-time.
+# Section 24.6's footnote says so explicitly. Section 29's S29_LATE_TX_HANDLING inherits this
+# setting and becomes "switch" automatically, which is the intended pairing --
+# its Panel A/Panel B split already documents the same fixed-vs-time-varying
+# distinction.
+TABLE4_LATE_TX_TIME_VARYING <- TRUE
 
 #--- 1.3d Table 7 -- multivariable KALT survival model -------------------------
 # Recipient HCV: HCV_SEROSTATUS (liver_data). Donor HCV: HCV_ANTIBODY_DON
@@ -229,8 +407,15 @@ TABLE7_NASH_CODES                <- c(4214, 4221)
 TABLE4_MIN_EVENTS_PER_INTERVAL <- 5
 
 # OPTN LITYP codes that represent a WHOLE liver (the LDRI reference level).
-# ***VERIFY THIS AGAINST YOUR DATA DICTIONARY.*** The old script's comment and
-# its code disagreed. Section 10 prints the observed distribution.
+# VERIFIED against star-file-data-dictionary.xlsx, LIVER_DATA -> LITYP
+# ("RECIPIENT LIVER PARTIAL/SPLIT TYPE", format ALL_LISPLITTYPE):
+#   0     = Whole Liver
+#   1-21  = partial/split (lobes, lateral segments, trisegments, in-situ/bench)
+#   OTHER = Unknown
+# The old script's comment claimed 1 = Whole; that comment was wrong, its code
+# was right. Section 10 prints the observed distribution and Section 9 asserts
+# the mapping at run time -- a wrong value here shifts EVERY LDRI by
+# exp(0.422) = 1.53x, and LDRI is the exposure.
 LITYP_WHOLE_CODES <- c(0)
 
 # KDPI storage scale. "auto" inspects the data; override with "fraction"
@@ -270,6 +455,12 @@ KM_XLIM_SUPP1 <- c(0, 1825)   # 5 years -- Section 22.6, matches SUPP1_TIMES
 # panel and get clipped. See km_pad_risk_table() in Section 2.6. Increase if
 # your n at risk reaches 5 digits.
 KM_TABLE_PAD_PT <- 20
+
+# The same padding as a ready-made margin, for figures assembled by hand rather
+# than by ggsurvplot() -- currently Section 31.5's Aalen-Johansen panel, which
+# ggsurvplot cannot draw. Defined here so it cannot drift from the value above.
+KM_FIG_MARGIN <- ggplot2::margin(t = 5.5, r = KM_TABLE_PAD_PT,
+                                 b = 5.5, l = KM_TABLE_PAD_PT, unit = "pt")
 
 
 #===============================================================================
@@ -324,6 +515,22 @@ sas_to_array <- function(file_path, verbose = FALSE, cols = NULL) {
 is_blank_flag <- function(x) {
   chr <- trimws(as.character(x))
   is.na(x) | chr == "" | chr == "."
+}
+
+#--- 2.2b KALT exposure test ---------------------------------------------------
+# THE SINGLE DEFINITION OF THE EXPOSURE. Both places that build `Group`
+# (Section 10 for the main cohort, Section 29.2 for the waitlist-era cohort)
+# call this, so the two can never drift apart and KALT_MAX_DAYS ([K1],
+# Section 1.3) is the only knob.
+#
+# Takes the interval in days rather than KALT_STATUS_CALC so that any cutoff
+# works, not just the 365-day boundary the status codes happen to encode.
+# NA (never transplanted) is FALSE, not NA -- a patient with no kidney is
+# definitively not KALT, and returning NA here would silently propagate an
+# unusable third level into `Group`.
+is_kalt <- function(days_liver_to_kidney_tx, max_days = KALT_MAX_DAYS) {
+  d <- suppressWarnings(as.numeric(days_liver_to_kidney_tx))
+  !is.na(d) & d >= 0 & d < max_days
 }
 
 #--- 2.3 KDPI scaling ---------------------------------------------------------
@@ -734,24 +941,87 @@ print(summary(suppressWarnings(as.numeric(df_kidpan_raw$WARM_ISCH_TM_DON))))
 SIM_TX_COLS_LIVER  <- c("TXHRT", "TXINT", "TXKID", "TXLNG", "TXPAN")
 SIM_TX_COLS_KIDNEY <- c("TXHRT", "TXINT", "TXLNG", "TXPAN")   # kidney allowed
 
-df_liver_eligible <- df_liver_raw |>
+df_liver_eligible_pre_era <- df_liver_raw |>
   filter(suppressWarnings(as.numeric(NUM_PREV_TX)) == 0) |>          # no prior TX of any organ
   filter(if_all(all_of(SIM_TX_COLS_LIVER), is_blank_flag)) |>        # no simultaneous TX
   filter(trimws(as.character(DON_TY)) == "C")                        # deceased liver donor only
 
+# [F9] Liver-transplant era floor (Section 1.2). The !is.na(TX_DATE) test is
+# stated explicitly rather than left to the NA-drops-in-filter side effect of the
+# date comparison: until now, "this patient actually received a liver" rested
+# entirely on DON_TY == "C" being populated only for transplanted rows, with
+# nothing asserting it. It holds in this SAF release (0 of 194,382 eligible rows
+# have a missing TX_DATE), but it is now checked rather than assumed -- a
+# never-transplanted row reaching the cohort would silently enter the LTA arm
+# with no liver transplant date.
+df_liver_eligible <- df_liver_eligible_pre_era |>
+  filter(!is.na(TX_DATE), TX_DATE >= lt_start_date)
+
 cat("\nLiver rows: raw =", nrow(df_liver_raw),
-    "| after exclusion criteria =", nrow(df_liver_eligible), "\n")
+    "| after exclusion criteria =", nrow(df_liver_eligible_pre_era),
+    "| after ", LT_LOOKBACK_YEARS, "y era floor (", format(lt_start_date), ") = ",
+    nrow(df_liver_eligible), "\n", sep = "")
+cat("  dropped by the era floor: ",
+    nrow(df_liver_eligible_pre_era) - nrow(df_liver_eligible), " row(s); ",
+    sum(is.na(df_liver_eligible_pre_era$TX_DATE)),
+    " of those for a MISSING liver TX date (expected: 0)\n", sep = "")
+cat("  liver TX date range retained: ",
+    format(min_date(df_liver_eligible$TX_DATE)), " to ",
+    format(max_date(df_liver_eligible$TX_DATE)), "\n", sep = "")
 stopifnot(nrow(df_liver_eligible) > 0)
 
 #--- 6.2 Kidney side: age + listing window ------------------------------------
 df_kidpan_raw$INIT_AGE <- suppressWarnings(as.numeric(df_kidpan_raw$INIT_AGE))
 
-df_kidpan_eligible <- df_kidpan_raw |>
+df_kidpan_eligible_pre_donty <- df_kidpan_raw |>
   filter(INIT_AGE >= age_min, INIT_AGE <= age_max) |>
   filter(INIT_DATE >= wl_start_date, INIT_DATE <= wl_end_date) |>
-  filter(if_all(all_of(SIM_TX_COLS_KIDNEY), is_blank_flag)) |>
-  filter(is.na(DON_TY) | trimws(as.character(DON_TY)) == "" |
-           trimws(as.character(DON_TY)) %in% KIDNEY_DON_TY_KEEP)     # [C2]
+  filter(if_all(all_of(SIM_TX_COLS_KIDNEY), is_blank_flag))
+
+# [F10] The donor-type restriction is applied at the PATIENT level, not the row
+# level. With KIDNEY_DON_TY_KEEP = c("C", "L") this currently excludes 0 patients
+# -- every DON_TY value present in the eligible window is "", "C" or "L", and the
+# undocumented "F" code (86 rows file-wide) does not survive the age/date/
+# simultaneous-transplant filters above. So this is a no-op on today's data. It is
+# written this way anyway, because the row-level version it replaces is WRONG in a
+# way that only shows up when the list is narrowed:
+#
+#   The row-level filter kept any row whose DON_TY was blank -- correctly, since a
+#   never-transplanted registration has no donor type and those patients ARE the
+#   LTA arm. But patients have multiple registrations. Exclude a donor type at row
+#   level and a recipient of that type who also has a plain listing row keeps the
+#   blank row, loses their transplant row, and then sails through de-duplication
+#   (7.3) as a patient with no TX_DATE at all -- silently RECLASSIFIED as
+#   never-transplanted and pooled into the LTA reference rather than excluded.
+#
+# The scale, if living donors were ever excluded: 6,285 patients in this window
+# have a living-donor transplant row plus another row that a row-level filter
+# would keep, 5,957 of them via a blank row. That would have contaminated the
+# reference arm with thousands of kidney recipients. Hence: any patient with a
+# kidney transplant from a donor type NOT in KIDNEY_DON_TY_KEEP is removed
+# entirely, decided once, here.
+kid_don_ty_chr  <- trimws(as.character(df_kidpan_eligible_pre_donty$DON_TY))
+pts_excl_don_ty <- df_kidpan_eligible_pre_donty$PT_CODE[
+  !is.na(kid_don_ty_chr) & kid_don_ty_chr != "" &
+    !kid_don_ty_chr %in% KIDNEY_DON_TY_KEEP]
+pts_excl_don_ty <- unique(pts_excl_don_ty)
+
+df_kidpan_eligible <- df_kidpan_eligible_pre_donty |>
+  filter(!PT_CODE %in% pts_excl_don_ty)                              # [C2] [F10]
+
+cat("\n[F10] Kidney donor types admitted: ", paste(KIDNEY_DON_TY_KEEP, collapse = ", "),
+    "\n  patients excluded for a disallowed donor type: ", length(pts_excl_don_ty),
+    "\n  (excluded at PATIENT level, so none can reappear as never-transplanted)\n",
+    sep = "")
+cat("  donor types remaining in the eligible frame:\n")
+print(table(trimws(as.character(df_kidpan_eligible$DON_TY)), useNA = "ifany"))
+
+# Assertion, not decoration: if a disallowed non-blank donor type survives here,
+# the patient-level exclusion above did not do its job and the LTA arm is
+# contaminated with kidney recipients.
+stopifnot(all(
+  trimws(as.character(df_kidpan_eligible$DON_TY)) %in% c("", NA, KIDNEY_DON_TY_KEEP)
+))
 
 # [C1] The KDPI filter is DELIBERATELY not here. Toggle it only to reproduce
 #      the old, structurally-broken LTA arm.
@@ -870,8 +1140,10 @@ df_liver_kidney <- df_liver_dedup |>
     KALT_STATUS = recode(
       as.character(KALT_STATUS_CALC),
       "0" = "Kidney listed, no kidney TX",
-      "1" = "KALT (<365 days)",
-      "2" = "Kidney TX >=365 days after liver TX",
+      # [K1] Both of these are KALT under KALT_MAX_DAYS = Inf; the labels
+      # describe the TIMING stratum, not two different exposure groups.
+      "1" = "KALT, kidney <365 days after liver TX",
+      "2" = "KALT, kidney >=365 days after liver TX",
       "3" = "Kidney TX before liver TX"
     )
   )
@@ -922,6 +1194,10 @@ df_ldri_scored <- df_ldri_complete |>
     dcd_component = if_else(toupper(trimws(as.character(NON_HRT_DON))) == "Y", 0.411, 0),
     
     # [C4] Partial/split. Reference set = LITYP_WHOLE_CODES (Section 1).
+    # The !is.na branch also catches out-of-dictionary codes (e.g. 998, the
+    # Unknown bucket), scoring them as split. The guard below reports them.
+    # The NA branch is unreachable -- df_ldri_complete already dropped NA and
+    # blank LITYP -- and is kept only so the mapping is total.
     split_component = case_when(
       LITYP %in% LITYP_WHOLE_CODES ~ 0,
       !is.na(LITYP)                ~ 0.422,
@@ -942,6 +1218,26 @@ df_ldri_scored <- df_ldri_complete |>
     LDRI = exp(age_component + cod_component + race_component + dcd_component +
                  split_component + height_component + share_component + cit_component)
   )
+
+#--- 9b [C4] Guard the LITYP whole-liver mapping -------------------------------
+# LITYP_WHOLE_CODES is the single highest-leverage constant in the LDRI block:
+# get it wrong and every affected LDRI moves by exp(0.422) = 1.53x, silently,
+# in the exposure itself. These checks make that failure loud.
+stopifnot(any(df_ldri_scored$LITYP %in% LITYP_WHOLE_CODES))
+
+pct_whole <- mean(df_ldri_scored$split_component == 0)
+cat(sprintf("\nLITYP: %.1f%% whole liver, %.1f%% partial/split (expect ~90%% whole).\n",
+            100 * pct_whole, 100 * (1 - pct_whole)))
+if (pct_whole < 0.5) {
+  warning("Only ", sprintf("%.1f%%", 100 * pct_whole), " whole livers -- ",
+          "LITYP_WHOLE_CODES (Section 1) is probably inverted.")
+}
+
+unknown_lityp <- setdiff(unique(df_ldri_scored$LITYP), 0:21)
+if (length(unknown_lityp)) {
+  warning("LITYP codes outside the 0-21 dictionary range, scored as split: ",
+          paste(sort(unknown_lityp), collapse = ", "))
+}
 
 df_ldri_final <- df_ldri_scored |>
   group_by(PT_CODE) |>
@@ -981,9 +1277,51 @@ df_esrd_cohort <- df_liver_kidney |>
   filter(KALT_STATUS_CALC != 3) |>         # drop kidney-before-liver
   mutate(
     #--- Grouping ------------------------------------------------------------
-    Group = factor(if_else(KALT_STATUS_CALC == 1, "KALT", "LTA"),
+    # [F7] TWO grouping variables, and it matters which one an analysis uses.
+    #
+    # Group (binary) is the EXPOSURE: KALT vs LTA, defined by is_kalt() and
+    # therefore by KALT_MAX_DAYS ([K1], Section 1.3). With KALT_MAX_DAYS = Inf
+    # both timing strata are KALT, so:
+    #   - "KALT" = received a kidney after their liver transplant, ANY interval
+    #   - "LTA"  = TRUE liver-transplant-alone; listed for a kidney, never
+    #              received one. The arm now means what its name says.
+    #
+    # Group3 is Group with the KALT arm SPLIT BY TIMING. It is a
+    # sub-stratification of the exposure, not a competing definition of it:
+    #   LTA (no kidney)  ==  Group "LTA"
+    #   KALT (<1 y) + KALT (>=1 y)  ==  Group "KALT"
+    # so the two variables always agree and `count(Group, Group3)` is block
+    # diagonal. Section 11 [1] asserts this.
+    #
+    # Use Group3 for anything descriptive -- the two timing strata are not
+    # exchangeable (crude mortality 35.5% of the never-transplanted vs 10.0%
+    # of the <1-year and 14.5% of the >=1-year recipients, though see
+    # [K2] on why that raw contrast is not a treatment effect). Use Group where
+    # a two-arm contrast is structurally required: Section 21's matchit()
+    # treatment, and Section 24's Block 3 summary HR.
+    #
+    # [K2] NEITHER VARIABLE IS A TIME-VARYING STATE. A patient in the KALT arm
+    # was not KALT on the day of their liver transplant -- a >=1-year recipient
+    # spends a median 4.0 years unexposed first. Any survival clock anchored at
+    # liver transplant must therefore let patients ENTER the exposed state on
+    # their kidney-TX date (Section 21b's Simon-Makuch expansion, Section 24's
+    # time-varying Table 4, Section 21b.5's time-varying Cox). Stratifying a
+    # KM on
+    # this variable from t=0 fabricates a 14.5-point survival advantage; see
+    # [K2] in Section 1.3 for the full arithmetic.
+    #
+    # The >=1-year level is deliberately last so Group3's first level
+    # ("LTA (no kidney)") is the reference in any model.
+    Group3 = factor(case_when(
+      KALT_STATUS_CALC == 0 ~ "LTA (no kidney)",
+      KALT_STATUS_CALC == 1 ~ "KALT (<1 y)",
+      KALT_STATUS_CALC == 2 ~ "KALT (≥1 y)",
+      TRUE                  ~ NA_character_
+    ), levels = c("LTA (no kidney)", "KALT (<1 y)", "KALT (≥1 y)")),
+
+    Group = factor(if_else(is_kalt(days_liver_to_kidney_tx), "KALT", "LTA"),
                    levels = c("LTA", "KALT")),
-    
+
     #--- KDPI ----------------------------------------------------------------
     KDPI_num = kdpi_to_pct(KDPI),
     KDPI_cat = cut(KDPI_num, breaks = KDPI_BREAKS, labels = KDPI_LABELS,
@@ -1142,10 +1480,48 @@ print(df_esrd_cohort |> count(kidney_donor_type, donor_hcv_label, useNA = "alway
 
 cat("\n########## COHORT RECONCILIATION ##########\n")
 
-cat("\n[1] Group x KALT status -- confirms the LTA arm is populated.\n")
-print(df_esrd_cohort |> count(Group, KALT_STATUS_CALC, KALT_STATUS))
+cat("\n[1] Group x Group3 x KALT status -- confirms the arms are populated and\n")
+cat("    that Group3 is a clean sub-split of Group, not a rival definition.\n")
+print(df_esrd_cohort |> count(Group, Group3, KALT_STATUS_CALC, KALT_STATUS))
 # If KALT_STATUS_CALC == 0 has zero rows, never-transplanted candidates are
 # being excluded upstream and RESTRICT_COHORT_TO_KDPI is almost certainly TRUE.
+
+# [K1] HARD GUARD on the exposure definition. Group3's labels are written for
+# KALT_MAX_DAYS = Inf, where both timing strata belong to Group "KALT". If
+# KALT_MAX_DAYS is ever set back to 365, the ">=1 y" level moves into Group
+# "LTA" and the level NAME then contradicts the arm it sits in -- a silent
+# mislabel that would propagate into every figure legend and table caption.
+# Fail loudly instead.
+s11_xtab <- df_esrd_cohort |> count(Group, Group3) |> filter(n > 0)
+s11_bad  <- s11_xtab |>
+  filter((Group == "LTA"  & Group3 != "LTA (no kidney)") |
+         (Group == "KALT" & Group3 == "LTA (no kidney)"))
+if (nrow(s11_bad) > 0) {
+  print(s11_bad)
+  stop("[Sec 11] Group and Group3 disagree. Group3's level labels assume ",
+       "KALT_MAX_DAYS = Inf (currently ", KALT_MAX_DAYS, "). Relabel Group3 ",
+       "in Section 10 to match, or restore KALT_MAX_DAYS <- Inf.")
+}
+cat("  OK -- Group3 partitions Group exactly (KALT_MAX_DAYS = ",
+    KALT_MAX_DAYS, ").\n", sep = "")
+
+# [K2] Crude mortality by timing stratum. These are the numbers that make the
+# time-varying analyses non-negotiable, so they are printed where they cannot be
+# missed. The >=1-year stratum will look dramatically healthier than the
+# never-transplanted stratum. That gap is NOT a treatment effect: to appear in
+# that stratum at all a patient must survive a median 4.0 years post-liver-TX
+# without dying, so the comparison is conditioned on survival. Read it as a
+# description of who ends up where, never as evidence that a late kidney helps.
+cat("\n[1b] Crude mortality by timing stratum (see [K2] -- NOT a treatment effect):\n")
+print(df_esrd_cohort |>
+        left_join(df_liver_raw |>
+                    group_by(PT_CODE) |>
+                    summarise(died = any(!is.na(COMPOSITE_DEATH_DATE)),
+                              .groups = "drop"),
+                  by = "PT_CODE") |>
+        group_by(Group, Group3) |>
+        summarise(n = n(), died = sum(died, na.rm = TRUE),
+                  crude_pct = round(100 * died / n, 1), .groups = "drop"))
 
 cat("\n[2] Group x kidney donor type -- confirms LD patients are present.\n")
 print(df_esrd_cohort |> count(Group, kidney_donor_type))
@@ -1166,6 +1542,29 @@ recon_tiers <- bind_rows(
 print(recon_tiers, width = 200)
 # Table 2 column MUST equal Table 3 + LTA, row by row. It now does by
 # construction. If it ever does not, a join has started duplicating rows.
+#
+# [K1] Under KALT_MAX_DAYS = Inf the "LTA only" column must be ALL ZERO: an LTA
+# patient never received a kidney, so they cannot carry a KDPI. The identity
+# above therefore collapses to "Table 2 == Table 3", and a non-zero LTA cell
+# means a KDPI has been attached to a patient with no kidney transplant --
+# a join defect, not a classification choice. (When KALT_MAX_DAYS was 365 this
+# column legitimately held the late recipients' kidneys.)
+if (is.infinite(KALT_MAX_DAYS)) {
+  # The column is ABSENT, not zero, when no LTA patient has a KDPI -- pivot_wider
+  # never creates it because the "LTA only" branch contributes no rows at all.
+  # Treating absent as 0 is what makes this check actually run; keying on
+  # `%in% names()` would silently skip it in exactly the passing case.
+  s11_lta_kdpi <- if ("LTA only" %in% names(recon_tiers)) {
+    sum(recon_tiers[["LTA only"]], na.rm = TRUE)
+  } else 0L
+  if (s11_lta_kdpi > 0) {
+    warning("[Sec 11] ", s11_lta_kdpi, " patients are Group == 'LTA' yet have a ",
+            "non-missing KDPI. With KALT_MAX_DAYS = Inf that should be ",
+            "impossible -- check the kidney join in Section 8.")
+  } else {
+    cat("  OK -- no LTA patient carries a KDPI, as expected under KALT_MAX_DAYS = Inf.\n")
+  }
+}
 
 cat("\n[5] Row-count integrity through the pipeline.\n")
 print(tibble::tibble(
@@ -1188,6 +1587,12 @@ print(df_esrd_cohort |> filter(Group == "KALT") |> count(donor_type_cat))
 # These run every time and print to console. None of them alter the cohort;
 # they exist to catch the failure modes that produced disagreement with the
 # reference manuscript's KDPI-tier counts (107/624/71 deceased, 313 LD-KALT).
+#
+# [K1] THOSE TARGET COUNTS ARE NOW OUT OF DATE BY DESIGN. They were computed
+# when KALT meant "<365 days"; with KALT_MAX_DAYS = Inf the >=1-year recipients
+# join every tier, so these checks will report larger n and will NOT reconcile
+# to 107/624/71. Read them as drift detectors between THIS run's tables, not as
+# a match against the reference. Set KALT_MAX_DAYS <- 365 to compare directly.
 # The de-dup fix that resolves most of this lives in Section 7.3/7.4; what
 # follows checks for anything that fix would not catch.
 
@@ -1261,10 +1666,24 @@ print(tibble::tibble(
   )
 ))
 
-cat("\nLiving-donor kidney registrations surviving each pipeline stage\n",
-    "(a large drop between 'eligible' and 'dedup winner' means living-donor\n",
-    "rows are losing slice(1) to a deceased-donor or listing-only row for the\n",
-    "same patient):\n", sep = "")
+# [F10] What this diagnostic means depends on KIDNEY_DON_TY_KEEP:
+#   - "L" ADMITTED: it is a de-duplication check. A large drop between
+#     'eligible' and 'dedup winner' means living-donor rows are losing slice(1)
+#     to a deceased-donor or listing-only row for the same patient.
+#   - "L" EXCLUDED (the current setting): every stage after 'kidpan raw' SHOULD
+#     read 0, and a non-zero value is a bug -- it would mean the patient-level
+#     exclusion in Section 6.2 leaked. Read it as an assertion, not a warning.
+if ("L" %in% KIDNEY_DON_TY_KEEP) {
+  cat("\nLiving-donor kidney registrations surviving each pipeline stage\n",
+      "(a large drop between 'eligible' and 'dedup winner' means living-donor\n",
+      "rows are losing slice(1) to a deceased-donor or listing-only row for the\n",
+      "same patient):\n", sep = "")
+} else {
+  cat("\nLiving-donor kidney registrations surviving each pipeline stage.\n",
+      "KIDNEY_DON_TY_KEEP excludes 'L', so every stage after 'kidpan raw' MUST\n",
+      "read 0 -- anything else means the Section 6.2 patient-level exclusion\n",
+      "leaked and the cohort contains living-donor recipients:\n", sep = "")
+}
 print(tibble::tibble(
   stage = c("kidpan raw", "kidpan eligible", "dedup winner", "in esrd cohort"),
   n_living = c(
@@ -1274,6 +1693,17 @@ print(tibble::tibble(
     sum(df_esrd_cohort$kidney_donor_type == "Living", na.rm = TRUE)
   )
 ))
+if (!"L" %in% KIDNEY_DON_TY_KEEP) {
+  n_leak <- sum(df_esrd_cohort$kidney_donor_type == "Living", na.rm = TRUE)
+  if (n_leak > 0) {
+    warning("[F10] ", n_leak, " living-donor recipient(s) reached df_esrd_cohort ",
+            "despite KIDNEY_DON_TY_KEEP excluding 'L'. The patient-level ",
+            "exclusion in Section 6.2 has leaked -- do not trust any table until ",
+            "this is resolved.")
+  } else {
+    cat("OK: 0 living-donor recipients in the cohort, as required.\n")
+  }
+}
 
 #--- 12.4 Small-cell warning for downstream tables ----------------------------
 # Table 3's KDPI >85 column can be very small (single digits). add_p() will
@@ -1309,14 +1739,20 @@ print(df_esrd_cohort |>
 
 
 #===============================================================================
-# SECTION 13. TABLE 1 -- Baseline characteristics, LTA vs KALT
+# SECTION 13. TABLE 1 -- Baseline characteristics by three-level group
 #===============================================================================
+# [F7] Now split THREE ways on Group3 rather than two ways on the binary Group.
+# The old two-column version put never-transplanted patients and patients
+# transplanted 365+ days out in a single "LTA" column, which hid the fact that
+# they differ on almost everything in this table -- including the 35.5% vs 14.5%
+# mortality split. The p-value is correspondingly a 3-group test (chi-square /
+# one-way ANOVA-style t.test extension via gtsummary), not a two-group one.
 table1 <- df_esrd_cohort |>
-  select(Group, AGE, sex_label, BMI_CALC, race_label, diab_label,
+  select(Group3, AGE, sex_label, BMI_CALC, race_label, diab_label,
          dialysis_label, years_to_esrd, FINAL_MELD_PELD_LAB_SCORE,
          LDRI_cat, liver_etiology, esrd_etiology) |>
   tbl_summary(
-    by = Group,
+    by = Group3,
     statistic = list(all_continuous()  ~ "{mean} ({sd})",
                      all_categorical() ~ "{n} ({p}%)"),
     digits = all_continuous() ~ 1,
@@ -1335,10 +1771,18 @@ table1 <- df_esrd_cohort |>
     ),
     missing = "no"
   ) |>
-  add_p(test = list(all_continuous()  ~ "t.test",
+  # [F7] "t.test" is a two-sample test and errors on a three-level `by`.
+  # "oneway.test" is its three-group analogue -- and specifically Welch's
+  # version, which does not assume equal variances. That matters here: the three
+  # arms are 2,140 / 740 / 1,467 patients with visibly different spreads, which
+  # is exactly the situation classical ANOVA handles badly. ("aov" would also
+  # work but is deprecated as of gtsummary 2.0.0.) chisq.test already
+  # generalises to a 3-column contingency table.
+  add_p(test = list(all_continuous()  ~ "oneway.test",
                     all_categorical() ~ "chisq.test")) |>
   modify_header(label ~ "**Characteristic**") |>
-  modify_caption("**Table 1. Baseline Characteristics: LTA vs. KALT**") |>
+  modify_caption(paste("**Table 1. Baseline Characteristics: LTA (no kidney)",
+                       "vs. KALT (<1 y) vs. KALT (≥1 y)**")) |>
   bold_labels()
 
 table1
@@ -1458,7 +1902,9 @@ table2 <- df_kdpi_donor_table |>
     ),
     missing = "no"
   ) |>
-  add_p(test = list(all_continuous()  ~ "aov",       # 3 groups -> ANOVA
+  # [F7] "aov" was deprecated in gtsummary 2.0.0; "oneway.test" is the supported
+  # 3-group replacement and does not assume equal variances across KDPI tiers.
+  add_p(test = list(all_continuous()  ~ "oneway.test",
                     all_categorical() ~ "chisq.test")) |>
   modify_header(label ~ "**Characteristics**") |>
   modify_caption(paste0(
@@ -1480,13 +1926,31 @@ table2
 # parallel de-dup is what made the KDPI tier counts disagree with Table 2.
 # Here Table 3 is a filter on df_esrd_cohort. Nothing is re-read or re-deduped,
 # and the LD-KALT column comes from the same rows as everything else because
-# living donors are no longer filtered out upstream ([C2]).
-
+# living donors are kept in the cohort ([C2], [F10]).
+#
+# [F10] droplevels() is a guard, not a fix for anything currently happening: with
+# living donors admitted, LD-KALT is populated and nothing is dropped. It matters
+# only if KIDNEY_DON_TY_KEEP is ever narrowed to "C", which would leave LD-KALT
+# with zero patients -- an empty factor level would otherwise reach tbl_summary()
+# as an all-NA column with n=0 and have add_p()'s chi-square computed across a
+# degenerate table. The message below names any column that actually vanished, so
+# a dropped column is never silent.
 df_kalt_only <- df_esrd_cohort |>
-  filter(Group == "KALT", !is.na(donor_type_cat))
+  filter(Group == "KALT", !is.na(donor_type_cat)) |>
+  mutate(donor_type_cat = droplevels(donor_type_cat))
 
 cat("\nTable 3 column n:\n")
 print(df_kalt_only |> count(donor_type_cat))
+t3_dropped_levels <- setdiff(c("LD-KALT", KDPI_LABELS), levels(df_kalt_only$donor_type_cat))
+if (length(t3_dropped_levels)) {
+  cat("[F10] Table 3 columns with zero patients, dropped: ",
+      paste(t3_dropped_levels, collapse = ", "), "\n", sep = "")
+  if ("LD-KALT" %in% t3_dropped_levels) {
+    cat("  LD-KALT is empty because KIDNEY_DON_TY_KEEP = ",
+        paste(KIDNEY_DON_TY_KEEP, collapse = ", "),
+        " excludes living donors from the cohort (Section 1.3 [F10]).\n", sep = "")
+  }
+}
 
 table3 <- df_kalt_only |>
   select(donor_type_cat, AGE, sex_label, BMI_CALC, race_label,
@@ -1516,7 +1980,10 @@ table3 <- df_kalt_only |>
     ),
     missing = "no"
   ) |>
-  add_p(test = list(all_continuous()  ~ "aov",
+  # [F7] "aov" was deprecated in gtsummary 2.0.0; "oneway.test" is the supported
+  # replacement. Note the column count here is now donor-type dependent -- with
+  # living donors excluded ([F10]) this compares KDPI tiers only.
+  add_p(test = list(all_continuous()  ~ "oneway.test",
                     all_categorical() ~ "chisq.test")) |>
   modify_header(label ~ "**Characteristics**") |>
   modify_caption("**Table 3. Characteristics of KALT Recipients by Kidney Donor Type**") |>
@@ -1566,7 +2033,7 @@ df_index <- df_esrd_cohort |>
     PT_CODE,
     TRR_ID_CODE,
     TRR_ID_CODE_KIDNEY,
-    Group, KALT_STATUS_CALC,
+    Group, Group3, KALT_STATUS_CALC,
     KDPI_num, KDPI_cat, LDRI, LDRI_cat,
     kidney_donor_type,
     liver_tx_date       = TX_DATE,
@@ -1798,12 +2265,31 @@ print(df_dialysis |>
 
 # Anyone flagged for first-week dialysis whose "resumption" also falls in that
 # window is almost certainly DGF, not graft loss.
+#
+# FIXED: this block used to join df_dialysis onto df_kidpan_raw, which is the
+# PRE-dedup frame (one row per kidney registration), so a patient with several
+# registrations was counted once per row -- 9 early-resumption patients printed
+# as 17. It also measured days_post_tx from that row's own TX_DATE, which for a
+# second registration or a KP row is not the transplant this cohort follows.
+# Both are now keyed to the de-duplicated kidney_tx_date used everywhere else,
+# and FIRST_WK_DIAL is reduced to one value per patient first.
 if ("FIRST_WK_DIAL" %in% names(df_kidpan_raw)) {
-  cat("\nEarly resumptions cross-checked against FIRST_WK_DIAL:\n")
-  print(df_kidpan_raw |>
-          inner_join(df_dialysis, by = "PT_CODE") |>
-          mutate(days_post_tx = as.numeric(dialysis_date - TX_DATE)) |>
+  cat("\nEarly resumptions cross-checked against FIRST_WK_DIAL (one row/patient):\n")
+
+  df_first_wk <- df_kidpan_raw |>
+    mutate(fwd = toupper(trimws(as.character(FIRST_WK_DIAL)))) |>
+    filter(!is.na(fwd), fwd != "") |>
+    group_by(PT_CODE) |>
+    # "Y" on ANY registration wins -- first-week dialysis anywhere is the flag
+    # we are testing for. Falls back to N only when no row says Y.
+    summarise(FIRST_WK_DIAL = if (any(fwd == "Y")) "Y" else fwd[1],
+              .groups = "drop")
+
+  print(df_dialysis |>
+          inner_join(df_index |> select(PT_CODE, kidney_tx_date), by = "PT_CODE") |>
+          mutate(days_post_tx = as.numeric(dialysis_date - kidney_tx_date)) |>
           filter(days_post_tx <= 7) |>
+          left_join(df_first_wk, by = "PT_CODE") |>
           count(FIRST_WK_DIAL))
 }
 
@@ -1814,17 +2300,48 @@ df_dialysis <- df_dialysis |>
   select(PT_CODE, dialysis_date)
 
 #--- 16.5c Completeness check using DIAL_TY -----------------------------------
-# Dialysis type recorded on follow-up but no resumption date = potential missed
+# Dialysis reported on follow-up but no resumption DATE = potential missed
 # event. This is the real limitation to quantify in the manuscript.
+#
+# FIXED: this check used to count ANY non-blank DIAL_TY as "dialysis recorded".
+# DIAL_TY is not free text -- it is "Any Dialysis Since Last Follow-Up", format
+# MNTDIAL (verified in star-file-data-dictionary.xlsx, KIDNEY_FOLLOWUP_DATA):
+#   1   = NO                                   <- 96% of all non-missing rows
+#   2   = YES, resumed maintenance dialysis
+#   3   = YES, no maintenance resumption
+#   4   = YES, maintenance resumption unknown
+#   5   = Yes, returned to chronic maintenance dialysis (ESRD)
+#   6   = Yes, returned to (or continued on) temporary dialysis
+#   998 = UNKNOWN
+# Because code 1 means NO, the old test was TRUE for essentially every patient
+# with any follow-up form, and its "2,050 recorded but no date" cell was almost
+# entirely patients explicitly recorded as NOT on dialysis. Meaningless.
+#
+# Codes are now graded by what they actually assert. Only 2 and 5 are
+# maintenance dialysis, i.e. the thing that constitutes kidney graft failure.
+# 6 is TEMPORARY dialysis -- that is DGF/ATN and must NOT count as graft loss.
+DIAL_TY_MAINT     <- c(2, 5)      # definite maintenance resumption = graft loss
+DIAL_TY_AMBIGUOUS <- c(3, 4)      # dialysis occurred, maintenance status unclear
+DIAL_TY_TEMPORARY <- c(6)         # temporary dialysis; NOT graft loss
+
 if ("DIAL_TY" %in% names(df_kidney_fu_linked)) {
-  cat("\nDIAL_TY recorded vs. resumption date captured:\n")
+  cat("\nDIAL_TY (graded) vs. resumption date captured:\n")
   print(df_kidney_fu_linked |>
+          mutate(dt = suppressWarnings(as.numeric(DIAL_TY))) |>
           group_by(PT_CODE) |>
-          summarise(any_dial_ty = any(!is.na(DIAL_TY) &
-                                        trimws(as.character(DIAL_TY)) != ""),
+          summarise(dial_ty_class = case_when(
+                      any(dt %in% DIAL_TY_MAINT,     na.rm = TRUE) ~ "maintenance (2,5)",
+                      any(dt %in% DIAL_TY_AMBIGUOUS, na.rm = TRUE) ~ "ambiguous (3,4)",
+                      any(dt %in% DIAL_TY_TEMPORARY, na.rm = TRUE) ~ "temporary (6)",
+                      any(dt == 998,                 na.rm = TRUE) ~ "unknown (998)",
+                      TRUE                                         ~ "no dialysis (1)/none"),
                     .groups = "drop") |>
           left_join(df_dialysis, by = "PT_CODE") |>
-          count(any_dial_ty, has_date = !is.na(dialysis_date)))
+          count(dial_ty_class, has_date = !is.na(dialysis_date)))
+
+  cat("The row that matters: dial_ty_class = 'maintenance (2,5)' with",
+      "has_date = FALSE.\nThose are graft failures the date-based capture",
+      "missed. Report that count as the\nascertainment limitation.\n")
 }
 
 #--- 16.6 Assemble --------------------------------------------------------------
@@ -1932,20 +2449,75 @@ print(df_km_tx |> summarise(across(c(pt_time, lg_time, kg_time),
 # SECTION 19. KAPLAN-MEIER AND LOG-RANK
 #===============================================================================
 
-#--- 18.1 Patient survival, KALT vs LTA, transplant-anchored ------------------
-fit_pt_tx <- survfit(Surv(pt_time, pt_event) ~ Group, data = df_km_tx)
+# [F7] Every curve in this section is stratified on Group3, so the true-LTA
+# patients and the two KALT timing strata appear as separate curves rather than
+# being averaged together. The log-rank tests are correspondingly 3-group
+# (2 df); pairwise comparisons are printed in 18.3b so the specific
+# KALT-vs-each contrast is still available.
+#
+# *** READ THIS BEFORE INTERPRETING THE "KALT (>=1 y)" CURVE ***
+# [K2] These are FIXED-LABEL curves on a liver-TX clock, which is exactly the
+# construction Figures 7-9 avoid by restricting to KALT <1 y ([K3]).
+# Separating the strata makes their labels
+# honest, but it does NOT make the >=1-year curve a treatment effect -- it makes
+# the immortal-time artifact visible instead of hidden. A patient can only be
+# classified "KALT (>=1 y)" by surviving at least 365 days past their liver
+# transplant AND long enough to actually receive a kidney (median 4.0 years
+# post-transplant). So that curve is
+# guaranteed to sit at or near 100% survival through the first year on either
+# anchor -- in this cohort it has literally 0 deaths by day 365 from liver
+# listing -- and its apparent advantage over both other groups (pairwise
+# p < 2e-16 below) is largely definitional, not clinical.
+#
+# The unbiased version of that comparison is the time-varying model in Section
+# 24 Block 2, where those pre-transplant years are credited to the untransplanted
+# reference state (TABLE4_LATE_TX_TIME_VARYING = TRUE, Section 1.3c [F6]).
+# Section 25's Table 5 shows the same contrast both ways: a 30-point fixed-label
+# KM gap that becomes HR 0.99 once the clock is handled correctly.
+# These curves are DESCRIPTIVE. Do not quote them as effects.
+
+#--- 18.1 Patient survival by group, transplant-anchored ----------------------
+# NOTE: this anchor lets immortal time into any comparison involving a
+# transplanted group -- see 18.2 for the bias-free version.
+fit_pt_tx <- survfit(Surv(pt_time, pt_event) ~ Group3, data = df_km_tx)
 print(km_at(fit_pt_tx, "Patient survival (from liver TX)"), n = 100)
-lr_p(Surv(pt_time, pt_event) ~ Group, df_km_tx)
+lr_p(Surv(pt_time, pt_event) ~ Group3, df_km_tx)
 
 #--- 18.2 Patient survival, listing-anchored (bias-free) ----------------------
-fit_pt_list <- survfit(Surv(pt_time_list, pt_event_list) ~ Group, data = df_km_list)
+fit_pt_list <- survfit(Surv(pt_time_list, pt_event_list) ~ Group3, data = df_km_list)
 print(km_at(fit_pt_list, "Patient survival (from liver listing)"), n = 100)
-lr_p(Surv(pt_time_list, pt_event_list) ~ Group, df_km_list)
+lr_p(Surv(pt_time_list, pt_event_list) ~ Group3, df_km_list)
 
 #--- 18.3 Death-censored liver graft survival ---------------------------------
-fit_lg <- survfit(Surv(lg_time, lg_event) ~ Group, data = df_km_tx)
+fit_lg <- survfit(Surv(lg_time, lg_event) ~ Group3, data = df_km_tx)
 print(km_at(fit_lg, "Death-censored liver graft survival"), n = 100)
-lr_p(Surv(lg_time, lg_event) ~ Group, df_km_tx)
+lr_p(Surv(lg_time, lg_event) ~ Group3, df_km_tx)
+
+#--- 18.3b Pairwise log-rank between the three groups -------------------------
+# [F7] The 3-group omnibus p above answers "do these three differ at all". These
+# answer "which pair differs", Holm-adjusted across the 3 comparisons. The
+# LTA-no-kidney vs Late-kidney contrast is the one the old binary Group could
+# not show at all, because it compared a group against itself.
+cat("\n[F7] Pairwise log-rank, patient survival from liver TX (Holm-adjusted):\n")
+print(pairwise_survdiff(Surv(pt_time, pt_event) ~ Group3,
+                        data = df_km_tx, p.adjust.method = "holm"))
+cat("\n[F7] Pairwise log-rank, patient survival from liver LISTING (Holm-adjusted):\n")
+print(pairwise_survdiff(Surv(pt_time_list, pt_event_list) ~ Group3,
+                        data = df_km_list, p.adjust.method = "holm"))
+
+# Quantify the artifact rather than just warning about it: if the late-kidney
+# group has (near-)zero deaths before the point at which its members become
+# classifiable, every p-value involving it is measuring survivorship.
+cat("\n[F7] Immortal-time check -- deaths before day 365 by group:\n")
+print(df_km_list |>
+        group_by(Group3) |>
+        summarise(n = dplyr::n(),
+                  deaths_by_365 = sum(pt_event_list == 1 & pt_time_list <= 365,
+                                      na.rm = TRUE),
+                  .groups = "drop"))
+cat("A group with 0 deaths in the first year is not a healthier group; it is a\n",
+    "group whose membership requires surviving that year. See the block comment\n",
+    "at the head of Section 19.\n", sep = "")
 
 df_km_ldri <- df_km_tx |> filter(!is.na(LDRI_cat))
 fit_lg_ldri <- survfit(Surv(lg_time, lg_event) ~ LDRI_cat, data = df_km_ldri)
@@ -1961,7 +2533,7 @@ df_km_kidney_kdpi <- df_km_kidney |> filter(!is.na(KDPI_cat))
 # Tier n here MUST match Section 11 [4] minus anyone lost to a missing or
 # negative follow-up time. Print both to confirm the difference is explainable.
 cat("\nKDPI tier n entering the survival model:\n")
-print(df_km_kidney_kdpi |> count(KDPI_cat, Group))
+print(df_km_kidney_kdpi |> count(KDPI_cat, Group3))
 cat("Lost to missing/negative kidney follow-up time:",
     sum(!is.na(df_km_tx$kidney_tx_date)) - nrow(df_km_kidney), "\n")
 
@@ -1973,9 +2545,15 @@ lr_p(Surv(kg_time, kg_event) ~ KDPI_cat, df_km_kidney_kdpi)
 print(pairwise_survdiff(Surv(kg_time, kg_event) ~ KDPI_cat,
                         data = df_km_kidney_kdpi, p.adjust.method = "holm"))
 
-# KALT vs late kidney TX, within kidney recipients
-fit_kg_grp <- survfit(Surv(kg_time, kg_event) ~ Group, data = df_km_kidney)
-print(km_at(fit_kg_grp, "Death-censored kidney graft survival, KALT vs late TX"), n = 100)
+# KALT vs late kidney TX, within kidney recipients.
+# [F7] droplevels() is required: df_km_kidney is restricted to patients who
+# actually received a kidney, so Group3's "LTA (no kidney)" level is present but
+# empty, and survfit() would otherwise emit an empty stratum. Under the old
+# binary Group this fit was labelled "KALT vs LTA" while the "LTA" stratum in
+# fact contained only late recipients -- Group3 makes the strata say so.
+df_km_kidney_grp <- df_km_kidney |> mutate(Group3 = droplevels(Group3))
+fit_kg_grp <- survfit(Surv(kg_time, kg_event) ~ Group3, data = df_km_kidney_grp)
+print(km_at(fit_kg_grp, "Death-censored kidney graft survival by group"), n = 100)
 
 #--- 18.5 Curves --------------------------------------------------------------
 # Axis/padding conventions for every curve below live in Sections 1.5 and 2.6:
@@ -1989,8 +2567,13 @@ plot_pt <- km_pad_risk_table(ggsurvplot(
   pval.method.coord = km_pval_method_coord(KM_XLIM),
   xlim = KM_XLIM, break.time.by = 365, ylim = KM_YLIM, axes.offset = FALSE,
   xlab = "Days from liver transplant", ylab = "Patient survival (%)",
-  legend.title = "Group", legend.labs = levels(df_km_tx$Group),
-  title = "Patient Survival: KALT vs LTA", ggtheme = theme_classic()
+  # [F7] conf.int = FALSE for the 3-curve versions: three overlapping ribbons on
+  # one panel obscure the curves they are meant to qualify. The CIs are in the
+  # km_at() tables printed above and in Section 22's endpoint table.
+  conf.int.alpha = 0.15,
+  legend.title = "Group", legend.labs = levels(droplevels(df_km_tx$Group3)),
+  title = "Patient Survival by Group (from liver transplant)",
+  ggtheme = theme_classic()
 ), KM_XLIM)
 print(plot_pt)
 
@@ -2001,8 +2584,9 @@ plot_pt_list <- km_pad_risk_table(ggsurvplot(
   pval.method.coord = km_pval_method_coord(KM_XLIM),
   xlim = KM_XLIM, break.time.by = 365, ylim = KM_YLIM, axes.offset = FALSE,
   xlab = "Days from liver listing", ylab = "Patient survival (%)",
-  legend.title = "Group", legend.labs = levels(df_km_list$Group),
-  title = "Patient Survival from Listing (immortal-time-free)",
+  conf.int.alpha = 0.15,
+  legend.title = "Group", legend.labs = levels(droplevels(df_km_list$Group3)),
+  title = "Patient Survival by Group, from Listing (immortal-time-free)",
   ggtheme = theme_classic()
 ), KM_XLIM)
 print(plot_pt_list)
@@ -2014,8 +2598,10 @@ plot_lg <- km_pad_risk_table(ggsurvplot(
   pval.method.coord = km_pval_method_coord(KM_XLIM),
   xlim = KM_XLIM, break.time.by = 365, ylim = KM_YLIM, axes.offset = FALSE,
   xlab = "Days from liver transplant", ylab = "Liver graft survival (%)",
-  legend.title = "Group", legend.labs = levels(df_km_tx$Group),
-  title = "Death-Censored Liver Graft Survival", ggtheme = theme_classic()
+  conf.int.alpha = 0.15,
+  legend.title = "Group", legend.labs = levels(droplevels(df_km_tx$Group3)),
+  title = "Death-Censored Liver Graft Survival by Group",
+  ggtheme = theme_classic()
 ), KM_XLIM)
 print(plot_lg)
 
@@ -2063,12 +2649,40 @@ print(cmprsk::cuminc(ftime   = df_cr$cr_time,
 
 
 #===============================================================================
-# SECTION 21. PROPENSITY SCORE MATCHING (KALT vs LTA)
+# SECTION 21. PROPENSITY SCORE MATCHING (KALT <1 y vs true LTA)
 #===============================================================================
+# [K3] THE CONTRAST THIS SECTION SUPPORTS:
+#   treated = KALT <1 y -- kidney within 365 days of the liver transplant
+#   control = TRUE LTA  -- listed for a kidney, never received one
+#
+# BOTH arms are clean, and that is the whole point. The comparator contains no
+# future kidney recipients (asserted in 21.2), and the treated arm contains no
+# patient who spent years unexposed before their transplant (the >=1-year
+# stratum is filtered out in 21.2). That is what makes an ordinary fixed-label
+# Kaplan-Meier on the liver-TX clock legitimate here, which is what Figures 7-9
+# are. Contrast with [K2]: the merged KALT arm could not be drawn that way.
+#
+# RESIDUAL IMMORTAL TIME -- SMALL, NOT ZERO. To be classified KALT <1 y a
+# patient must survive to their kidney transplant, a median 250 days (IQR
+# 172-314). Deaths in that window land in the LTA arm by construction, so the
+# fixed-label comparison still slightly favours KALT. This is the standard
+# KALT-vs-LTA design in the literature and the bias is roughly a sixth of what
+# the >=1-year stratum carried, but it is NOT nil -- Section 21b.4 quantifies it
+# with a Simon-Makuch sensitivity analysis and prints the fixed-vs-time-varying
+# HR gap. Report the sensitivity alongside the primary result.
+#
+# CONSEQUENCE FOR SAMPLE SIZE. Restricting to <1 y makes KALT much the smaller
+# arm again (740 vs 2,140 true LTA), so controls are plentiful, matching
+# discards surplus LTA rather than treated patients, and essentially every KALT
+# patient should find a partner within the caliper. 21.3 prints retention; a
+# large KALT discard now means the caliper is too tight, not that the arms are
+# mismatched in size.
+#
 # 1:1 (or MATCH_RATIO:1) nearest-neighbor matching on the logit propensity
-# score, treated = KALT, control = LTA. Matching variables: ethnicity, sex,
-# LDRI, recipient diabetes, dialysis status, cause of liver disease, and cause
-# of ESRD -- plus recipient hypertension once RECIP_HTN_COL (Sec 1.3b) is set.
+# score, treated = KALT, control = true LTA. Matching variables: ethnicity,
+# sex, LDRI, recipient diabetes, dialysis status, cause of liver disease, and
+# cause of ESRD -- plus recipient hypertension once RECIP_HTN_COL (Sec 1.3b) is
+# set.
 #
 # This is a SENSITIVITY analysis alongside the unadjusted comparisons in
 # Sections 13/19/20, not a replacement for them: matching trades some
@@ -2076,11 +2690,13 @@ print(cmprsk::cuminc(ftime   = df_cr$cr_time,
 # the two groups are comparable on observed covariates before comparing
 # outcomes.
 #
-# NOTE ON PROPENSITY SCORE DIRECTION: with more LTA than KALT patients (the
-# usual case here), KALT is the treated group. MatchIt matches CONTROLS to
-# TREATED by default, so this discards excess LTA patients, not KALT ones --
-# every KALT patient is either matched or explicitly reported as discarded
-# (Sec 21.4 prints this count).
+# NOTE ON PROPENSITY SCORE DIRECTION. MatchIt matches CONTROLS to TREATED, and
+# KALT <1 y is the treated group. With 740 treated against 2,140 controls, this
+# discards surplus LTA patients, not KALT ones -- every KALT patient is either
+# matched or explicitly reported as discarded in 21.3. Report that count in the
+# methods (e.g. "X of 740 KALT <1 y patients [Z%] were matched"). A material
+# KALT discard implicates MATCH_CALIPER or the covariate set, since controls are
+# not the scarce resource here.
 #===============================================================================
 
 #--- 21.1 Recipient hypertension column discovery -----------------------------
@@ -2109,8 +2725,45 @@ match_covariates <- c("race_label", "sex_label", "LDRI", "diab_label",
                       "dialysis_label", "liver_etiology", "esrd_etiology")
 if (include_htn) match_covariates <- c(match_covariates, RECIP_HTN_COL)
 
+# [K3] THE MATCHED ANALYSIS USES A NARROWER POPULATION THAN THE TABLES.
+# Tables 1-7 use the merged KALT definition (KALT_MAX_DAYS = Inf, [K1]). The
+# matched figures do NOT: they are restricted to true LTA vs the KALT <1 y
+# timing stratum, and the 1,467 >=1-year recipients are dropped here entirely.
+#
+# WHY THE TWO POPULATIONS DIFFER ON PURPOSE. A fixed-label KM on the liver-TX
+# clock is only defensible when the exposure begins near time zero. That holds
+# for <1-year recipients (median 250 days to transplant) and emphatically does
+# not for >=1-year recipients (median 1,467 days, 67.5% of follow-up unexposed);
+# including the latter in a fixed-label figure is what fabricates a 14.5-point
+# survival advantage ([K2]). Restricting the population is what BUYS the right
+# to draw Figures 7-9 as ordinary Kaplan-Meier curves.
+#
+# CONSEQUENCE FOR REPORTING: Figure 7-9 arm sizes will NOT match any table's
+# KALT n, and they are not supposed to. Every matched figure caption states its
+# own n and says the >=1-year stratum is excluded.
 df_match_input <- df_esrd_cohort |>
-  select(PT_CODE, Group, all_of(match_covariates))
+  filter(Group3 %in% c("LTA (no kidney)", "KALT (<1 y)")) |>
+  mutate(Group = droplevels(Group)) |>
+  select(PT_CODE, Group, Group3, TX_DATE_KIDNEY, all_of(match_covariates))
+
+cat("\n[K3] Matched-analysis population (>=1 y recipients excluded):\n")
+print(df_match_input |> count(Group, Group3))
+stopifnot(nlevels(df_match_input$Group) == 2,
+          !any(df_match_input$Group3 == "KALT (≥1 y)"))
+
+# [K1] The control arm must be uncontaminated by construction now. Under
+# KALT_MAX_DAYS = Inf anyone who ever received a kidney is Group == "KALT", so a
+# control holding a kidney-TX date means is_kalt() and the cohort disagree.
+s21_bad_ctrl <- sum(df_match_input$Group == "LTA" &
+                      !is.na(df_match_input$TX_DATE_KIDNEY), na.rm = TRUE)
+if (s21_bad_ctrl > 0) {
+  stop("[Sec 21.2] ", s21_bad_ctrl, " control-arm patients have a kidney ",
+       "transplant date. Under KALT_MAX_DAYS = Inf the LTA arm must be ",
+       "never-transplanted; check is_kalt() and Section 8's date merge.")
+}
+cat("\n[Sec 21.2] OK -- control arm is true LTA: 0 of ",
+    sum(df_match_input$Group == "LTA", na.rm = TRUE),
+    " controls ever received a kidney.\n", sep = "")
 
 cat("\n[Sec 21.2] Missingness per matching covariate (MatchIt requires complete\n",
     "cases; anyone missing ANY of these is dropped from the matched analysis\n",
@@ -2124,7 +2777,7 @@ df_match_complete <- df_match_input |>
 cat("\nComplete cases available for matching: ", nrow(df_match_complete),
     " of ", nrow(df_match_input), " (", nrow(df_match_input) - nrow(df_match_complete),
     " excluded for missing covariate data)\n", sep = "")
-print(df_match_complete |> count(Group))
+print(df_match_complete |> count(Group, Group3))
 
 #--- 21.3 Fit the propensity model and match -----------------------------------
 match_formula <- as.formula(
@@ -2139,6 +2792,31 @@ print(summary(m.out))
 # Sample Sizes table in the printout above shows how many KALT patients were
 # discarded for lack of a comparable LTA match within the caliper -- report
 # this in the methods (e.g. "X of Y KALT patients [Z%] were matched").
+
+# [K3] RETENTION. Controls outnumber treated roughly 3:1 here, so unmatched
+# patients should be almost entirely LTA. Any substantial KALT loss means the
+# caliper is rejecting treated patients who have no comparable control -- a
+# statement about overlap, not about arm sizes -- and it makes the matched KALT
+# arm unrepresentative of KALT <1 y as a whole. Print it rather than discovering
+# it in the figure.
+# Summarised rather than pivoted: a pivot on the logical drops the "FALSE"
+# column entirely when every patient in the arm matched, and the downstream
+# arithmetic then fails on a column that does not exist.
+s21_retention <- df_match_complete |>
+  mutate(matched = !is.na(m.out$weights) & m.out$weights > 0) |>
+  group_by(Group, Group3) |>
+  summarise(total = n(), matched = sum(matched),
+            unmatched = total - matched, .groups = "drop") |>
+  mutate(pct_matched = round(100 * matched / total, 1))
+cat("\n[Sec 21.3] Match retention by arm:\n")
+print(s21_retention, width = 200)
+if (any(s21_retention$pct_matched[s21_retention$Group == "KALT"] < 90)) {
+  warning("[Sec 21.3] Under 90% of KALT <1 y patients were matched. With ",
+          "controls outnumbering treated ~3:1 this points at MATCH_CALIPER or ",
+          "poor covariate overlap, not at arm sizes. The matched KALT arm is ",
+          "then not representative of KALT <1 y as a whole -- say so in the ",
+          "methods, or loosen the caliper.")
+}
 
 #--- 21.4 Balance assessment ---------------------------------------------------
 # Prefer cobalt if available (nicer defaults, handles multi-level factors as a
@@ -2188,7 +2866,7 @@ if (requireNamespace("cobalt", quietly = TRUE)) {
 } else {
   ps_df <- tibble(
     ps      = m.out$distance,
-    Group   = df_match_complete$Group[!is.na(m.out$distance)],
+    Group   = df_match_complete$Group,
     matched = !is.na(m.out$weights) & m.out$weights > 0
   ) |>
     mutate(sample = factor(if_else(matched, "Matched", "Unmatched (all)"),
@@ -2217,13 +2895,43 @@ print(p_ps)
 # and endpoint builders as Sections 17-19 -- nothing about the endpoint
 # definitions changes, only the population and the addition of pair-matching.
 #
-# Two versions of the treatment effect are reported for each endpoint:
-#   (1) an unadjusted KM + log-rank within the matched sample (descriptive,
-#       comparable in spirit to Section 19), and
-#   (2) a log-rank test STRATIFIED BY MATCHED PAIR (coxph(... + strata(subclass)))
-#       via a stratified Cox model, which is the statistically correct way to
-#       analyze pair-matched survival data and is the primary matched-cohort
-#       result to report.
+# [K3] THREE FIGURES, 5-YEAR KAPLAN-MEIER, MATCHED KALT <1 y vs TRUE LTA.
+#
+#   Fig 7  Patient survival                 clock: liver transplant   2 arms
+#   Fig 8  Death-censored kidney graft      clock: KIDNEY transplant  KALT only
+#   Fig 9  Death-censored liver graft       clock: liver transplant   2 arms
+#
+# These are ordinary fixed-label KM curves, which is legitimate HERE and was not
+# legitimate for the merged KALT arm -- see [K3] in Section 21 for why the
+# population restriction is what earns it.
+#
+# WHY FIG 8 IS DIFFERENT ON BOTH AXES, AND IT IS NOT AN OVERSIGHT:
+#
+#   NO LTA ARM. An LTA patient never received a kidney, so they have no kidney
+#   graft that can fail. kg_time/kg_event are NA for every one of them (they are
+#   built off kidney_tx_date in Section 18). A two-arm "kidney graft survival,
+#   LTA vs KALT" is not a comparison with a missing arm -- it is a comparison
+#   that does not exist. Fig 8 therefore shows the matched KALT <1 y arm alone,
+#   stratified by KDPI tier, which is this project's actual question (does donor
+#   kidney quality drive KALT outcomes).
+#
+#   DIFFERENT CLOCK. The other two panels run from liver transplant. Fig 8 runs
+#   from KIDNEY transplant, because a graft cannot fail before it exists:
+#   anchoring it at liver transplant would place the graft "at risk" over the
+#   median 250 days before it was implanted, which is immortal time on the graft
+#   endpoint specifically. The offset is under a year for every patient in this
+#   arm, but the correct anchor is still the kidney.
+#
+# Reported for each two-arm endpoint:
+#   (1) an unadjusted KM + log-rank within the matched sample (the figure), and
+#   (2) a Cox model STRATIFIED BY MATCHED PAIR (coxph(... + strata(subclass))),
+#       which is the correct way to analyse pair-matched survival data and is
+#       the primary matched result to report.
+#
+# 21b.4 is the SENSITIVITY analysis for the residual immortal time that survives
+# the population restriction (a KALT <1 y patient must live to their transplant,
+# median 250 days). It is not optional reading: it is what tells you how much of
+# Figure 7's separation is definitional.
 #===============================================================================
 
 df_matched <- match.data(m.out) |>
@@ -2234,40 +2942,75 @@ df_matched <- match.data(m.out) |>
 df_matched_index <- df_matched |>
   left_join(df_index |> select(-Group), by = "PT_CODE")
 
+# Same three endpoint builders as Section 18, so the matched figures and the
+# full-cohort figures cannot disagree about what an event is. kg_* is anchored
+# at kidney_tx_date and is therefore NA for every LTA patient by construction --
+# that is the intended behaviour, and Fig 8 filters on it rather than trying to
+# impute a graft that does not exist.
 df_matched_km <- df_matched_index |>
   bind_cols(make_patient_endpoint(df_matched_index, "liver_tx_date") |>
               rename(pt_time = time, pt_event = event)) |>
   bind_cols(make_endpoint(df_matched_index, "liver_tx_date", "liver_fail_date") |>
-              rename(lg_time = time, lg_event = event))
+              rename(lg_time = time, lg_event = event)) |>
+  bind_cols(make_endpoint(df_matched_index, "kidney_tx_date", "kidney_fail_date") |>
+              rename(kg_time = time, kg_event = event))
 
 cat("\n[Sec 21b] Matched-cohort n and event counts:\n")
 print(df_matched_km |> count(Group))
 print(df_matched_km |> summarise(patient_deaths = sum(pt_event),
                                  liver_failures = sum(lg_event)))
 
-#--- Patient survival, matched -------------------------------------------------
+#--- 21b.1 Composition of the matched arms -------------------------------------
+# [K3] Both arms are clean by construction: the control arm never received a
+# kidney (asserted in 21.2) and the treated arm contains only <1-year
+# recipients (filtered in 21.2). The assertion below is what keeps that true if
+# anyone widens the matching population later without revisiting Figures 7-9.
+cat("\n[K3] Composition of the matched arms:\n")
+print(df_matched_km |> count(Group, Group3))
+stopifnot(!any(df_matched_km$Group3 == "KALT (≥1 y)", na.rm = TRUE))
+
+n_ctrl         <- sum(df_matched_km$Group == "LTA",  na.rm = TRUE)
+n_kalt_matched <- sum(df_matched_km$Group == "KALT", na.rm = TRUE)
+cat("  matched: ", n_kalt_matched, " KALT <1 y vs ", n_ctrl,
+    " true-LTA controls.\n", sep = "")
+
+cat("\n[Sec 21b] Event counts in the matched cohort:\n")
+print(df_matched_km |>
+        group_by(Group) |>
+        summarise(n              = n(),
+                  patient_deaths = sum(pt_event, na.rm = TRUE),
+                  liver_failures = sum(lg_event, na.rm = TRUE),
+                  kidney_grafts  = sum(!is.na(kg_time)),
+                  kidney_failures = sum(kg_event, na.rm = TRUE),
+                  .groups = "drop"))
+# The kidney_grafts column should read 0 for LTA and n for KALT. Anything else
+# means a patient with no kidney transplant acquired a kidney follow-up window.
+stopifnot(sum(!is.na(df_matched_km$kg_time[df_matched_km$Group == "LTA"])) == 0)
+
+MATCHED_ARM_LABS <- c(sprintf("LTA, no kidney (n=%d)", n_ctrl),
+                      sprintf("KALT <1 y (n=%d)", n_kalt_matched))
+
+MATCHED_FIG_CAPTION <- paste0(
+  "Propensity-matched 1:1 on the Section 21 covariates: ", n_kalt_matched,
+  " KALT <1 y vs ", n_ctrl, " true-LTA controls (listed for a kidney, never transplanted).\n",
+  "Kidney recipients transplanted >=1 year after their liver transplant are EXCLUDED from this figure -- their ",
+  "median 4.0-year\nunexposed period makes a fixed-label curve uninterpretable ([K2]). Arm sizes therefore do not ",
+  "match any table's KALT n.\n",
+  "RESIDUAL IMMORTAL TIME: a KALT patient must survive to their transplant (median 250 d, IQR 172-314), so deaths ",
+  "in that\nwindow fall to the LTA arm by construction and this comparison mildly favours KALT. Section 21b.4 ",
+  "quantifies it.")
+
+#--- 21b.2 Fig 7 -- patient survival, matched ----------------------------------
 fit_pt_matched <- survfit(Surv(pt_time, pt_event) ~ Group, data = df_matched_km)
-print(km_at(fit_pt_matched, "Patient survival, matched cohort (descriptive)"))
+print(km_at(fit_pt_matched, "Patient survival, matched (KALT <1 y vs true LTA)"))
 cat("Unadjusted log-rank p (matched sample, ignores pairing):",
     lr_p(Surv(pt_time, pt_event) ~ Group, df_matched_km), "\n")
 
 fit_pt_cox <- coxph(Surv(pt_time, pt_event) ~ Group + strata(subclass),
                     data = df_matched_km)
-cat("\nStratified Cox (pair-matched), patient survival -- PRIMARY matched result:\n")
+cat("\nPair-stratified Cox, patient survival -- PRIMARY matched result:\n")
 print(summary(fit_pt_cox))
 
-#--- Death-censored liver graft survival, matched ------------------------------
-fit_lg_matched <- survfit(Surv(lg_time, lg_event) ~ Group, data = df_matched_km)
-print(km_at(fit_lg_matched, "Death-censored liver graft survival, matched cohort"))
-cat("Unadjusted log-rank p (matched sample, ignores pairing):",
-    lr_p(Surv(lg_time, lg_event) ~ Group, df_matched_km), "\n")
-
-fit_lg_cox <- coxph(Surv(lg_time, lg_event) ~ Group + strata(subclass),
-                    data = df_matched_km)
-cat("\nStratified Cox (pair-matched), liver graft survival -- PRIMARY matched result:\n")
-print(summary(fit_lg_cox))
-
-#--- Matched KM curves ----------------------------------------------------------
 plot_pt_matched <- km_pad_risk_table(ggsurvplot(
   fit_pt_matched, data = df_matched_km, fun = "pct", conf.int = TRUE,
   pval = TRUE, pval.method = TRUE, risk.table = TRUE, risk.table.height = 0.25,
@@ -2275,10 +3018,117 @@ plot_pt_matched <- km_pad_risk_table(ggsurvplot(
   pval.method.coord = km_pval_method_coord(KM_XLIM),
   xlim = KM_XLIM, break.time.by = 365, ylim = KM_YLIM, axes.offset = FALSE,
   xlab = "Days from liver transplant", ylab = "Patient survival (%)",
-  legend.title = "Group", legend.labs = levels(df_matched_km$Group),
-  title = "Patient Survival, Propensity-Matched Cohort", ggtheme = theme_classic()
+  legend.title = "Arm", legend.labs = MATCHED_ARM_LABS,
+  title = "Fig 7. Patient Survival, Propensity-Matched KALT <1 y vs LTA",
+  caption = MATCHED_FIG_CAPTION, ggtheme = theme_classic()
 ), KM_XLIM)
 print(plot_pt_matched)
+
+#--- 21b.3 Fig 8 -- kidney graft failure, KALT <1 y only, by KDPI tier ---------
+# ONE ARM BY NECESSITY, NOT BY CHOICE. See this section's header: LTA patients
+# have no kidney graft, so there is no comparator curve to draw. The stratifier
+# is KDPI tier, which is the project's own research question.
+#
+# CLOCK: kidney transplant, not liver transplant -- a graft cannot fail before
+# it is implanted.
+#
+# Living donors carry no KDPI and so cannot be tiered; they drop out here and
+# the count is printed rather than left implicit ([F10]).
+df_matched_kg <- df_matched_km |>
+  filter(Group == "KALT", !is.na(kg_time), kg_time >= 0)
+
+cat("\n[Fig 8] Matched KALT <1 y patients with a usable kidney-graft window: ",
+    nrow(df_matched_kg), " of ", n_kalt_matched, "\n", sep = "")
+df_matched_kg_kdpi <- df_matched_kg |> filter(!is.na(KDPI_cat)) |>
+  mutate(KDPI_cat = droplevels(KDPI_cat))
+cat("[Fig 8] Of those, tierable by KDPI: ", nrow(df_matched_kg_kdpi),
+    " (", nrow(df_matched_kg) - nrow(df_matched_kg_kdpi),
+    " dropped -- living donors have no KDPI)\n", sep = "")
+print(df_matched_kg_kdpi |> count(KDPI_cat))
+
+# [K3] DROP KDPI TIERS TOO SMALL TO CARRY A CURVE.
+# Measured on this cohort, the highest-KDPI tier nearly vanishes once the arm is
+# restricted to <1-year recipients (n = 2). That is not noise, it is selection:
+# high-KDPI kidneys go disproportionately to patients who wait longer, so they
+# concentrate in the >=1-year stratum this figure excludes.
+#
+# A 2-patient stratum still PLOTS -- as a flat line at 100% survival with no
+# events -- and reads as "the worst kidneys never fail", which is the opposite
+# of what the data say. survfit will not warn. Drop such tiers explicitly and
+# name them in the caption instead of letting them draw.
+S21B_KG_MIN_N <- 10
+s21b_kg_small <- df_matched_kg_kdpi |> count(KDPI_cat) |> filter(n < S21B_KG_MIN_N)
+S21B_KG_DROPPED <- if (nrow(s21b_kg_small) > 0) {
+  paste0(as.character(s21b_kg_small$KDPI_cat), " (n=", s21b_kg_small$n, ")",
+         collapse = ", ")
+} else NA_character_
+if (nrow(s21b_kg_small) > 0) {
+  cat("[Fig 8] Dropping KDPI tier(s) with n < ", S21B_KG_MIN_N, ": ",
+      S21B_KG_DROPPED, "\n", sep = "")
+  df_matched_kg_kdpi <- df_matched_kg_kdpi |>
+    filter(!KDPI_cat %in% s21b_kg_small$KDPI_cat) |>
+    mutate(KDPI_cat = droplevels(KDPI_cat))
+}
+
+S21B_KG_OK <- nrow(df_matched_kg_kdpi) > 0 &&
+  nlevels(df_matched_kg_kdpi$KDPI_cat) >= 2 &&
+  sum(df_matched_kg_kdpi$kg_event) > 0
+
+if (!S21B_KG_OK) {
+  warning("[Fig 8] Not enough tierable kidney-graft data in the matched KALT ",
+          "arm to draw a KDPI-stratified curve. Figure 8 is skipped.")
+  plot_kg_matched <- NULL
+} else {
+  fit_kg_matched <- survfit(Surv(kg_time, kg_event) ~ KDPI_cat,
+                            data = df_matched_kg_kdpi)
+  print(km_at(fit_kg_matched, "Kidney graft survival, matched KALT <1 y, by KDPI"))
+  cat("Log-rank p across KDPI tiers:",
+      lr_p(Surv(kg_time, kg_event) ~ KDPI_cat, df_matched_kg_kdpi), "\n")
+
+  # NOT pair-stratified: the matched pairs are broken here, because each pair's
+  # LTA member has no kidney graft and is absent from this frame. strata(subclass)
+  # would leave one patient per stratum and contribute nothing to the partial
+  # likelihood. This is an unmatched within-KALT comparison and is labelled so.
+  fit_kg_cox <- coxph(Surv(kg_time, kg_event) ~ KDPI_cat, data = df_matched_kg_kdpi)
+  cat("\nCox by KDPI tier (NOT pair-stratified -- pairs are broken, see comment):\n")
+  print(summary(fit_kg_cox))
+
+  plot_kg_matched <- km_pad_risk_table(ggsurvplot(
+    fit_kg_matched, data = df_matched_kg_kdpi, fun = "pct", conf.int = TRUE,
+    pval = TRUE, pval.method = TRUE, risk.table = TRUE, risk.table.height = 0.25,
+    pval.coord = km_pval_coord(KM_XLIM),
+    pval.method.coord = km_pval_method_coord(KM_XLIM),
+    xlim = KM_XLIM, break.time.by = 365, ylim = KM_YLIM, axes.offset = FALSE,
+    xlab = "Days from KIDNEY transplant", ylab = "Kidney graft survival (%)",
+    legend.title = "KDPI", legend.labs = levels(df_matched_kg_kdpi$KDPI_cat),
+    title = "Fig 8. Death-Censored Kidney Graft Survival, Matched KALT <1 y, by KDPI",
+    caption = paste0(
+      "MATCHED KALT <1 y ARM ONLY (n=", nrow(df_matched_kg_kdpi),
+      "). There is no LTA curve because LTA patients never received a kidney and have no graft that\n",
+      "can fail -- this panel is a within-KALT comparison of donor quality, not a KALT-vs-LTA contrast.\n",
+      "TIME ORIGIN IS THE KIDNEY TRANSPLANT, unlike Figures 7 and 9, because a graft cannot fail before it exists.\n",
+      "Living-donor recipients carry no KDPI and are excluded. Death-censored: patients dying with a functioning ",
+      "graft are censored.",
+      if (!is.na(S21B_KG_DROPPED)) paste0(
+        "\nEXCLUDED FOR SPARSITY: ", S21B_KG_DROPPED,
+        ". High-KDPI kidneys concentrate in the >=1-year stratum this figure does not cover,\n",
+        "so the highest tier is too small here to estimate. Do NOT read its absence as an absence of risk.")
+      else ""),
+    ggtheme = theme_classic()
+  ), KM_XLIM)
+  print(plot_kg_matched)
+}
+
+#--- 21b.4 Fig 9 -- death-censored liver graft survival, matched ---------------
+fit_lg_matched <- survfit(Surv(lg_time, lg_event) ~ Group, data = df_matched_km)
+print(km_at(fit_lg_matched, "Liver graft survival, matched (KALT <1 y vs true LTA)"))
+cat("Unadjusted log-rank p (matched sample, ignores pairing):",
+    lr_p(Surv(lg_time, lg_event) ~ Group, df_matched_km), "\n")
+
+fit_lg_cox <- coxph(Surv(lg_time, lg_event) ~ Group + strata(subclass),
+                    data = df_matched_km)
+cat("\nPair-stratified Cox, liver graft survival -- PRIMARY matched result:\n")
+print(summary(fit_lg_cox))
 
 plot_lg_matched <- km_pad_risk_table(ggsurvplot(
   fit_lg_matched, data = df_matched_km, fun = "pct", conf.int = TRUE,
@@ -2287,11 +3137,77 @@ plot_lg_matched <- km_pad_risk_table(ggsurvplot(
   pval.method.coord = km_pval_method_coord(KM_XLIM),
   xlim = KM_XLIM, break.time.by = 365, ylim = KM_YLIM, axes.offset = FALSE,
   xlab = "Days from liver transplant", ylab = "Liver graft survival (%)",
-  legend.title = "Group", legend.labs = levels(df_matched_km$Group),
-  title = "Death-Censored Liver Graft Survival, Propensity-Matched Cohort",
-  ggtheme = theme_classic()
+  legend.title = "Arm", legend.labs = MATCHED_ARM_LABS,
+  title = "Fig 9. Death-Censored Liver Graft Survival, Propensity-Matched KALT <1 y vs LTA",
+  caption = MATCHED_FIG_CAPTION, ggtheme = theme_classic()
 ), KM_XLIM)
 print(plot_lg_matched)
+
+#--- 21b.5 SENSITIVITY -- how much of Fig 7 is immortal time? ------------------
+# [K3] Figures 7 and 9 are fixed-label: a KALT patient is drawn in the KALT arm
+# from their liver transplant onward, including the median 250 days before their
+# kidney arrived. Restricting to <1-year recipients made that window small, but
+# it did not make it zero, and "small" is an assertion until it is measured.
+#
+# Same matched cohort, same pairing, exposure made TIME-VARYING: every patient
+# begins kidney-free and switches on their actual kidney-TX date. The gap
+# between this HR and fit_pt_cox's is the part of Figure 7's separation that is
+# definitional rather than clinical. Report both.
+s21b_base <- df_matched_km |>
+  transmute(PT_CODE, subclass, pt_time, pt_event,
+            k_raw = as.numeric(kidney_tx_date - liver_tx_date)) |>
+  filter(!is.na(pt_time), pt_time > 0) |>
+  mutate(exposed_at_0 = !is.na(k_raw) & k_raw <= 0,
+         switch_day   = if_else(!is.na(k_raw) & k_raw > 0 & k_raw < pt_time,
+                                k_raw, NA_real_))
+
+s21b_split <- s21b_base |> filter(!is.na(switch_day))
+s21b_long <- bind_rows(
+  s21b_base |> filter(is.na(switch_day)) |>
+    transmute(PT_CODE, subclass, tstart = 0, tstop = pt_time,
+              event = pt_event, kidney = as.integer(exposed_at_0)),
+  s21b_split |>
+    transmute(PT_CODE, subclass, tstart = 0, tstop = switch_day,
+              event = 0L, kidney = 0L),
+  s21b_split |>
+    transmute(PT_CODE, subclass, tstart = switch_day, tstop = pt_time,
+              event = pt_event, kidney = 1L)
+) |>
+  arrange(PT_CODE, tstart) |>
+  mutate(kidney = factor(kidney, levels = c(0, 1),
+                         labels = c("No kidney yet", "Kidney received")))
+
+stopifnot(all(s21b_long$tstop > s21b_long$tstart))
+if (!identical(as.integer(sum(s21b_base$pt_event)),
+               as.integer(sum(s21b_long$event)))) {
+  stop("[Sec 21b.5] expansion changed the event count: ",
+       sum(s21b_base$pt_event), " -> ", sum(s21b_long$event))
+}
+cat("\n[Sec 21b.5] Sensitivity expansion: ", nrow(s21b_base), " patients -> ",
+    nrow(s21b_long), " rows (", nrow(s21b_split), " switch state); ",
+    sum(s21b_long$event), " deaths preserved.\n", sep = "")
+print(s21b_long |> group_by(kidney) |>
+        summarise(person_years = round(sum(tstop - tstart) / 365.25, 1),
+                  deaths = sum(event), .groups = "drop"))
+
+s21b_tvcox <- coxph(Surv(tstart, tstop, event) ~ kidney + strata(subclass),
+                    data = s21b_long)
+cat("\n[Sec 21b.5] Time-varying pair-stratified Cox (patient survival):\n")
+print(summary(s21b_tvcox))
+
+s21b_fx <- summary(fit_pt_cox)$conf.int
+s21b_tv <- summary(s21b_tvcox)$conf.int
+s21b_sensitivity <- tibble(
+  Model = c("Fig 7 fixed label from liver TX (primary)",
+            "Time-varying kidney status (sensitivity)"),
+  HR_CI = c(sprintf("%.2f (%.2f-%.2f)", s21b_fx[1, 1], s21b_fx[1, 3], s21b_fx[1, 4]),
+            sprintf("%.2f (%.2f-%.2f)", s21b_tv[1, 1], s21b_tv[1, 3], s21b_tv[1, 4])),
+  P     = c(fmt_p(summary(fit_pt_cox)$coefficients[1, 5]),
+            fmt_p(summary(s21b_tvcox)$coefficients[1, 5]))
+)
+cat("\n[Sec 21b.5] IMMORTAL-TIME SENSITIVITY -- same cohort, same pairing.\n")
+cat("The gap between these two rows is the definitional component of Fig 7:\n")
+print(s21b_sensitivity, width = 200)
 
 
 #===============================================================================
@@ -2309,15 +3225,24 @@ table_endpoints <- bind_rows(
 
 print(table_endpoints, n = 200)
 
+# [F7] The first three rows are now 3-group (2 df) omnibus tests on Group3, not
+# 2-group tests on the pooled binary Group. `groups` records the arm count so a
+# reader cannot mistake a 3-group omnibus p for a pairwise contrast; the
+# pairwise breakdowns are printed in Section 18.3b.
 table_logrank <- tibble(
-  endpoint = c("Patient survival (TX-anchored)",
-               "Patient survival (listing-anchored)",
-               "Liver graft survival (KALT vs LTA)",
+  endpoint = c("Patient survival (TX-anchored, 3 groups)",
+               "Patient survival (listing-anchored, 3 groups)",
+               "Liver graft survival (3 groups)",
                "Liver graft survival (by LDRI)",
                "Kidney graft survival (by KDPI)"),
-  logrank_p = c(lr_p(Surv(pt_time, pt_event) ~ Group, df_km_tx),
-                lr_p(Surv(pt_time_list, pt_event_list) ~ Group, df_km_list),
-                lr_p(Surv(lg_time, lg_event) ~ Group, df_km_tx),
+  groups = c(nlevels(droplevels(df_km_tx$Group3)),
+             nlevels(droplevels(df_km_list$Group3)),
+             nlevels(droplevels(df_km_tx$Group3)),
+             nlevels(droplevels(df_km_ldri$LDRI_cat)),
+             nlevels(droplevels(df_km_kidney_kdpi$KDPI_cat))),
+  logrank_p = c(lr_p(Surv(pt_time, pt_event) ~ Group3, df_km_tx),
+                lr_p(Surv(pt_time_list, pt_event_list) ~ Group3, df_km_list),
+                lr_p(Surv(lg_time, lg_event) ~ Group3, df_km_tx),
                 lr_p(Surv(lg_time, lg_event) ~ LDRI_cat, df_km_ldri),
                 lr_p(Surv(kg_time, kg_event) ~ KDPI_cat, df_km_kidney_kdpi))
 )
@@ -2412,7 +3337,7 @@ df_supp1 <- df_supp1_all |> filter(!is.na(LDRI_cat))
 cat("\nSupplementary Table 1 cohort -- Group x LDRI tier n:\n")
 print(df_supp1 |> count(Group, LDRI_cat))
 cat("Dropped from Supp Table 1 for a missing LDRI tier (retained in Tables 4/5):\n")
-print(df_supp1_all |> filter(is.na(LDRI_cat)) |> count(Group))
+print(df_supp1_all |> filter(is.na(LDRI_cat)) |> count(Group3))
 
 #--- 22.2 Per-Group, per-endpoint KM + log-rank builder -----------------------
 supp1_km_block <- function(data, time_var, event_var, times = SUPP1_TIMES) {
@@ -2448,6 +3373,21 @@ supp1_km_block <- function(data, time_var, event_var, times = SUPP1_TIMES) {
        n = data |> count(LDRI_cat), level_order = levs,
        fit = fit, fit_data = data)
 }
+
+# [K1] This table keeps the binary Group, and under KALT_MAX_DAYS = Inf that is
+# now an ASSET rather than a caveat on the comparator side: the "LTA" block is
+# true LTA -- never received a kidney -- so it no longer needs disclaiming.
+#
+# [K2] The caveat MOVED TO THE OTHER BLOCK. "KALT" now pools both timing strata,
+# and these are fixed-label KM blocks, so the >=1-year recipients' pre-transplant
+# survival sits inside the KALT block. Keeping the two-block layout is a scope
+# decision, not an oversight: the reference Supplementary Table 1 has two Group
+# blocks x two endpoints, and splitting KALT by timing would make it six blocks
+# and require rebuilding the display assembly in 22.3-22.5. The timing
+# composition is printed here so the block is not read as a treatment effect,
+# and stated in the table footnote.
+cat("\n[K2] Supp Table 1 uses the merged binary Group. Its 'KALT' block pools:\n")
+print(df_supp1 |> filter(Group == "KALT") |> count(Group3))
 
 supp1_blocks <- list(
   LTA_patient  = supp1_km_block(df_supp1 |> filter(Group == "LTA"),  "pt_time", "pt_event"),
@@ -2518,6 +3458,15 @@ supp1_gt <- supp1_table_df |>
   tab_footnote(footnote = paste(
     "Time origin is date of kidney listing. P value is a 3-group log-rank",
     "test across LDRI tiers within each Group x endpoint block.")) |>
+  tab_footnote(footnote = paste(
+    "The \"LTA\" blocks are TRUE LTA: patients listed for a kidney who never",
+    "received one. The \"KALT\" blocks pool both timing strata (kidney <1 year",
+    "and >=1 year after the liver transplant), and because these are",
+    "fixed-label blocks the >=1-year recipients' pre-transplant survival is",
+    "counted inside the KALT block -- read them as descriptive, not as a",
+    "treatment effect. Table 1 reports the timing strata separately, and",
+    "Section 21b.5 gives the time-varying version; this table retains the",
+    "reference table's two-block layout.")) |>
   tab_footnote(footnote = paste(
     "Reported at 1, 3 and 5 years rather than the reference table's 1, 5 and",
     "10 years. Kidney listing spans 10AUG2017-03APR2025 with follow-up",
@@ -2658,6 +3607,25 @@ for (p in supp1_plots) print(p)
 #===============================================================================
 
 #--- 24.1 Shared adjustment covariate list ------------------------------------
+
+# [K2] REFUSED COMBINATION. A merged KALT arm (KALT_MAX_DAYS = Inf) fitted with
+# a FIXED post-transplant label (TABLE4_LATE_TX_TIME_VARYING = FALSE) is the one
+# configuration that reproduces the documented artifact: the >=1-year
+# recipients' median 4.0 pre-transplant years get credited to the exposed state,
+# ~8,385 event-free person-years land in the KALT arm, and what the old
+# definition showed as a null (p=0.19) becomes a 14.5-point "benefit"
+# (p<0.001) -- with the matched patient-survival HR moving from 0.71-0.81
+# (CIs crossing 1) to 0.29 (0.24-0.37). Nothing downstream would flag it --
+# the model converges and the table renders. Stop here instead.
+if (is.infinite(KALT_MAX_DAYS) && !isTRUE(TABLE4_LATE_TX_TIME_VARYING)) {
+  stop("[Sec 24.1] KALT_MAX_DAYS = Inf requires TABLE4_LATE_TX_TIME_VARYING = TRUE.\n",
+       "  With KALT merged across both timing strata, a fixed post-transplant\n",
+       "  label puts >=1-year recipients' pre-kidney person-time into the exposed\n",
+       "  state and manufactures a survival benefit. See [F6]/[K2] in Section 1.3.\n",
+       "  Either set TABLE4_LATE_TX_TIME_VARYING <- TRUE, or narrow\n",
+       "  KALT_MAX_DAYS <- 365 to restore the old two-arm definition.")
+}
+
 # `include_htn` was already established in Section 21 -- reused here as-is.
 covariates_adjust <- c("AGE", "race_label", "sex_label", "diab_label",
                        "dialysis_label", "liver_etiology", "esrd_etiology")
@@ -2941,9 +3909,23 @@ print(summary(fit_tv_lg)$conf.int[grep("^interval_merged", rownames(summary(fit_
 cat("\nSchoenfeld residual test for the FIXED covariates (not the interval terms):\n")
 print(cox.zph(fit_tv_pt)$table[!grepl("^interval_merged", rownames(cox.zph(fit_tv_pt)$table)), ])
 
-#--- 24.5 Block 3 -- summary HR, LTA relative to KALT -------------------------
+#--- 24.5 Block 3 -- summary HR, pooled LTA relative to KALT -------------------
 # Group releveled so KALT is the reference -- the LTA coefficient is then
 # directly "HR for remaining on waiting list/dialysis relative to KALT."
+#
+# [K1] THIS BLOCK USES THE BINARY `Group` BY DESIGN: it is the deliberate
+# two-group summary contrast the reference table reports, and a three-level
+# factor would turn one row into two. Its "LTA" reference is now TRUE LTA --
+# never received a kidney -- so this HR is a clean KALT-vs-no-kidney contrast
+# rather than KALT against a mixture.
+#
+# [K2] It is still a FIXED-LABEL model, so the KALT arm carries the >=1-year
+# recipients' pre-transplant person-time. That is why Block 3 is the SUMMARY row
+# and Block 2 (time-varying) is the one to interpret causally; Section 24.6's
+# footnote states the difference. The event-count diagnostic below is printed by
+# Group3 as well as Group so the timing mix is visible at the point of fitting.
+cat("\n[K2] Block 3 fits the merged binary Group. Composition of its arms:\n")
+print(df_supp1_covars |> count(Group, Group3))
 df_b3_pt <- fit_complete(df_supp1_covars,
                          c("pt_time", "pt_event", "Group", "LDRI", covariates_adjust)) |>
   mutate(Group = relevel(Group, ref = "KALT"))
@@ -3085,10 +4067,16 @@ table4_block2 <- bind_rows(
   select(-sort_key) |>
   mutate(Block = "Post-KALT Time-Dependent HRs for Transplantation Relative to Remaining on Waiting List/Dialysis")
 
+# [K1] Row label spells out what this "LTA" now is. Under KALT_MAX_DAYS = Inf
+# the arm really IS "never received a kidney" -- it is no longer a pool that has
+# to be disclaimed. The label states it positively so the row cannot be confused
+# with the old pooled comparator in earlier drafts of this table.
 table4_block3 <- bind_rows(
-  extract_hr(fit_b3_pt, "GroupLTA", "LTA", r_b3_pt$separation_terms) |>
+  extract_hr(fit_b3_pt, "GroupLTA", "LTA (true: never received a kidney)",
+             r_b3_pt$separation_terms) |>
     mutate(Endpoint = "Patient survival"),
-  extract_hr(fit_b3_lg, "GroupLTA", "LTA", r_b3_lg$separation_terms) |>
+  extract_hr(fit_b3_lg, "GroupLTA", "LTA (true: never received a kidney)",
+             r_b3_lg$separation_terms) |>
     mutate(Endpoint = "Liver graft survival")
 ) |> mutate(Block = "Propensity/Covariate-Adjusted HR for Remaining on Waiting List/Dialysis Relative to KALT")
 
@@ -3138,6 +4126,19 @@ table4_gt <- table4_wide |>
     "(Section 24.4); the merged window is shown in place of the original",
     "cutpoints for that endpoint only.")) |>
   tab_footnote(footnote = paste(
+    "[F6] TWO DIFFERENT MEANINGS OF \"LTA\" IN THIS TABLE. With",
+    "TABLE4_LATE_TX_TIME_VARYING = TRUE, the time-varying block's reference",
+    "state is \"not yet transplanted at this instant\": a patient who receives",
+    "a kidney at any delay contributes their pre-transplant years to the",
+    "reference and their post-transplant years to the interval terms. The",
+    "summary block below it is a FIXED-label contrast in which \"LTA\" means",
+    "\"never received a kidney at all\". The two references are therefore",
+    "close but not identical: the time-varying reference additionally holds",
+    "every KALT patient's own pre-transplant years, including the >=1-year",
+    "recipients' median 6.2 of them. The two blocks answer different",
+    "questions; the time-varying block is the one free of immortal-time",
+    "bias and is the one to interpret causally.")) |>
+  tab_footnote(footnote = paste(
     "NE = not estimable: that covariate level or time window had zero",
     "observed events, so the Cox partial likelihood has no finite maximum",
     "for this term (see the console event-count diagnostics for the",
@@ -3172,50 +4173,66 @@ table4_gt
 # Reproduces the reference "Table 5. Patient Survival Analysis and Time-Varying
 # Mortality Hazard for KALT with KDPI >85% Compared to LTA."
 #
-# [F5] The high-risk group is now KDPI >85% DECEASED-DONOR recipients ONLY.
-# Living-donor KALT recipients were previously folded into it (an earlier
-# request); that has been reversed and they are now EXCLUDED from this table
-# altogether -- they have no KDPI, so they cannot be tiered, and they are not
-# LTA. Note this is not identical to the reference design either: the reference
-# censored LD-KALT patients at their kidney transplant date, letting them
-# contribute pre-transplant person-time to the unexposed reference. Excluding
-# them outright drops that person-time too. With 10 LD-KALT patients in this
-# cohort the practical difference is negligible; the conceptual one is stated
-# here rather than buried.
+# [F5] Living-donor recipients are EXCLUDED from THIS TABLE (313 patients). They
+# remain in the cohort and in every other table -- KIDNEY_DON_TY_KEEP admits them
+# (Section 1.3 [F10]) -- but this table's only axis is kidney quality, and a
+# living-donor kidney has no KDPI, so they cannot be assigned to a group here.
+# The exclusion is therefore local and explicit, done in 25.1 rather than
+# upstream, and it is load-bearing: nothing else removes these patients.
 #
-#   REFERENCE DESIGN                          THIS VERSION
+# Note this is not the reference design either: the reference censored them at
+# their kidney transplant date, letting them contribute pre-transplant
+# person-time to the unexposed reference; excluding them drops that person-time
+# too.
+#
+# [F6] THE EXPOSURE IS NOW DEFINED BY KIDNEY QUALITY AT ANY DELAY, NOT BY KALT
+# STATUS. A patient who receives a KDPI >85% deceased-donor kidney becomes
+# exposed AT THAT TRANSPLANT, whether it arrived within a year of their liver
+# transplant or a decade later. Restricting the exposure to KALT (<365 day)
+# recipients left only 2 patients with 0 deaths, which made both the KM curve
+# and the hazard ratio non-estimable -- the HR came back as NE from
+# fit_coxph_checked()'s separation guard (coef -12.0, SE 453). Counting
+# high-KDPI transplants at any delay raises that to 41 patients with 6 deaths
+# and yields a real estimate.
+#
+# This is safe to do here precisely BECAUSE the model is time-varying: the
+# switch happens on the actual transplant date, so a patient who waited six
+# years for their kidney spends those six years in the reference state. That is
+# what distinguishes it from relabeling late recipients as KALT, which would
+# credit those six event-free years to the exposed group (see [F6] in Section
+# 1.3c for the arithmetic on why that is fatal).
+#
+# The gap between the two components below makes the point concretely. The
+# fixed-label KM shows the high-risk group at 75.9% five-year survival against
+# 45.9% for patients who never received a kidney -- an apparent 30-point
+# advantage for the WORST kidneys. The time-varying HR on the same patients is
+# 0.99 (95% CI 0.44-2.20). Almost the entire KM gap is immortal time and
+# selection: you have to live long enough, and be well enough, to be offered a
+# kidney at all.
+#
+#   THREE FIXED GROUPS (25.1)                 TIME-VARYING STATE (25.4)
 #   -----------------------------------       -----------------------------------
-#   LD-KALT: censored at kidney TX             LD-KALT: excluded entirely
+#   High-risk: KDPI >85% deceased,            unexposed until their kidney TX,
+#   any delay (n=41)                          exposed from then on
 #
-#   KDPI >85% deceased-donor KALT:             UNCHANGED -- the exposure
-#   switches to exposed at kidney TX
+#   KDPI <=85% deceased, any delay            unexposed throughout
+#   (n=2,242)
 #
-#   KDPI <=85% deceased-donor KALT: stays      UNCHANGED -- still stays
-#   in the unexposed risk set before AND       unexposed before and after their
-#   after transplant                           transplant
+#   No kidney transplant (n=2,140)            unexposed throughout
 #
-#   LTA: unexposed throughout                  UNCHANGED
+#   Living donor, any delay (n=313)           EXCLUDED
 #
-# *** POWER WARNING ***  Only 2 patients in this cohort are KALT recipients of
-# a KDPI >85% deceased-donor kidney (Section 12's small-cell diagnostics and
-# Section 25.1's own printout both show this). A descriptive KM and a
-# time-varying HR built on n=2 are not interpretable, and the HR will very
-# likely come back as NE from fit_coxph_checked()'s separation guard or with a
-# confidence interval spanning orders of magnitude. This table is retained
-# because it was requested; it should not be reported as evidence about
-# high-KDPI kidneys without that n stated next to it.
-#
-# Two components, matching the reference table's layout:
-#   (1) Descriptive KM patient survival at 1/3/5 years, high-risk group vs
-#       LTA, anchored at kidney listing (reuses Section 23's endpoint
-#       construction -- same pt_time/pt_event as every other patient-survival
-#       analysis in this pipeline).
-#   (2) A single time-varying HR for the high-risk exposure, built via the
-#       same tmerge() counting-process technique as Table 4 (Section 24), but
-#       with only ONE switch (exposed / unexposed) rather than several
-#       post-transplant intervals -- and checked with the same
-#       fit_coxph_checked() separation safety net, since a rare event split
-#       across even two states can still hit a zero-event cell.
+# Two components:
+#   (1) Descriptive KM patient survival at 1/3/5 years, high-risk vs the
+#       never-transplanted group, anchored at kidney listing (reuses Section
+#       23's endpoint construction -- same pt_time/pt_event as every other
+#       patient-survival analysis here). This is a FIXED-label comparison and
+#       carries immortal time by construction; it is reported because the
+#       reference table reports it, not because it is the estimate to quote.
+#   (2) The time-varying HR for the high-risk exposure -- THE PRIMARY RESULT --
+#       built via the same tmerge() counting-process technique as Table 4
+#       (Section 24) with a single exposed/unexposed switch, and checked with
+#       the same fit_coxph_checked() separation safety net.
 #===============================================================================
 
 # Reference table reports 1/5/10 years; 10 years is not supportable here.
@@ -3226,45 +4243,48 @@ table4_gt
 # labelled "10 years". See Section 23.
 TABLE5_TIMES <- REPORT_TIMES   # c(365, 1095, 1825) -- 1, 3, 5 years
 
-# [F5] Single source of truth for the exposure label, so the classification,
-# the KM strata, the display column and the gt() column header cannot drift.
-TABLE5_HI_LABEL <- "High-risk kidney (KDPI >85%)"
+# [F5] Single source of truth for the group labels, so the classification, the
+# KM strata, the display column and the gt() column header cannot drift.
+TABLE5_HI_LABEL  <- "High-risk kidney (KDPI >85%)"
+TABLE5_MID_LABEL <- "KDPI \u226485% deceased-donor kidney"
+TABLE5_NOK_LABEL <- "No kidney transplant"
 
 #--- 25.1 Group classification -------------------------------------------------
+# [F6] Grouped by KIDNEY QUALITY AT ANY DELAY (KALT_STATUS_CALC 1 or 2), not by
+# KALT status. See the header block for why that is only defensible because
+# 25.4's model is time-varying.
 df_table5_group <- df_esrd_cohort |>
   transmute(
     PT_CODE, Group, KALT_STATUS_CALC, kidney_donor_type, KDPI_cat,
     table5_group = case_when(
-      Group == "LTA" ~ "LTA",
-      # [F5] KDPI >85% deceased-donor recipients only. Living donors have no
-      # KDPI and are excluded from this table (see the header block).
-      Group == "KALT" & kidney_donor_type == "Deceased" &
+      # never received a kidney -- the genuinely transplant-free reference, and
+      # narrower than this pipeline's "LTA", which also contains late recipients
+      KALT_STATUS_CALC == 0 ~ TABLE5_NOK_LABEL,
+      KALT_STATUS_CALC %in% c(1, 2) & kidney_donor_type == "Deceased" &
         KDPI_cat == "KDPI >85" ~ TABLE5_HI_LABEL,
-      # unchanged from the reference design: standard-quality deceased-donor
-      # KALT recipients remain part of the unexposed risk set throughout
-      Group == "KALT" & kidney_donor_type == "Deceased" &
-        KDPI_cat %in% c("KDPI <20", "KDPI 20-85") ~
-        "KDPI \u226485% deceased-donor KALT (unexposed)",
+      KALT_STATUS_CALC %in% c(1, 2) & kidney_donor_type == "Deceased" &
+        KDPI_cat %in% c("KDPI <20", "KDPI 20-85") ~ TABLE5_MID_LABEL,
+      # living donors (no KDPI) and deceased donors with a missing KDPI
       TRUE ~ NA_character_
     )
   )
 
-cat("\n[Table 5] Group classification:\n")
+cat("\n[Table 5] Group classification (exposure = KDPI >85% at ANY delay):\n")
 print(df_table5_group |> count(table5_group))
 
-n_ld <- sum(df_table5_group$Group == "KALT" &
-              df_table5_group$kidney_donor_type == "Living", na.rm = TRUE)
 n_hi <- sum(df_table5_group$table5_group == TABLE5_HI_LABEL, na.rm = TRUE)
-cat("\n[F5] Living-donor KALT recipients EXCLUDED from this table:", n_ld, "\n")
-cat("[F5] High-risk group is now KDPI >85% deceased-donor only, n =", n_hi, "\n")
-cat("(Any other NA table5_group rows are KALT patients missing donor type or",
-    "KDPI and are also excluded -- inspect them directly if the count is",
-    "non-trivial.)\n")
+cat("\n[F6] High-risk group n =", n_hi, "-- restricting this to KALT (<365 day)",
+    "recipients would leave only",
+    sum(df_table5_group$KALT_STATUS_CALC == 1 &
+          df_table5_group$table5_group == TABLE5_HI_LABEL, na.rm = TRUE),
+    "patient(s), which is not estimable.\n")
+cat("[F5] Excluded from this table (no assignable KDPI):\n")
+print(df_table5_group |> filter(is.na(table5_group)) |>
+        count(kidney_donor_type, kdpi_missing = is.na(KDPI_cat)))
 if (n_hi < 10) {
   warning("[Table 5] The high-risk (KDPI >85%) group has only ", n_hi,
           " patient(s). The KM curve and the time-varying HR below are not ",
-          "interpretable at this n and must not be reported without it. ",
-          "See the POWER WARNING in this section's header.")
+          "interpretable at this n and must not be reported without it.")
 }
 
 #--- 25.2 Attach listing-anchored patient-survival time -----------------------
@@ -3276,11 +4296,21 @@ df_table5 <- df_supp1_all |>
   left_join(df_table5_group |> select(PT_CODE, table5_group), by = "PT_CODE") |>
   filter(!is.na(table5_group))
 
-#--- 25.3 Descriptive KM: high-risk group vs LTA ------------------------------
+cat("\n[Table 5] Analysis population after the follow-up filter:\n")
+print(df_table5 |> group_by(table5_group) |>
+        summarise(n = n(), deaths = sum(pt_event), .groups = "drop"))
+
+#--- 25.3 Descriptive KM: high-risk vs never-transplanted ----------------------
+# [F6] The comparator is the never-transplanted group, not "LTA": under the
+# quality-at-any-delay exposure definition, "LTA" would straddle two of this
+# table's three groups. THIS COMPARISON CARRIES IMMORTAL TIME BY CONSTRUCTION
+# -- a patient must survive to their transplant to be classified high-risk --
+# and is reported only because the reference table reports it. Quote 25.4's
+# time-varying HR instead.
 df_table5_km <- df_table5 |>
-  filter(table5_group %in% c(TABLE5_HI_LABEL, "LTA")) |>
+  filter(table5_group %in% c(TABLE5_HI_LABEL, TABLE5_NOK_LABEL)) |>
   mutate(table5_group = factor(table5_group,
-                               levels = c("LTA", TABLE5_HI_LABEL)))
+                               levels = c(TABLE5_NOK_LABEL, TABLE5_HI_LABEL)))
 
 cat("\n[Table 5] Descriptive KM population:\n")
 print(df_table5_km |> count(table5_group))
@@ -3299,8 +4329,12 @@ base5 <- df_table5 |>
   filter(!is.na(pt_time), !is.na(pt_event)) |>
   transmute(
     PT_CODE, tstart = 0, tstop = pt_time, event = pt_event,
-    # NA (never switches) for LTA and for KDPI<=85% deceased KALT -- both
-    # correctly stay unexposed for their whole follow-up as a result.
+    # [F6] NA (never switches) for the never-transplanted group and for KDPI
+    # <=85% recipients -- both correctly stay unexposed for their whole
+    # follow-up. For the high-risk group the offset is measured from KIDNEY
+    # LISTING to their own kidney transplant, so a late recipient's long
+    # pre-transplant stretch is credited to the UNEXPOSED state. That is the
+    # whole reason the exposure can safely be defined at any delay.
     exposure_offset = if_else(
       table5_group == TABLE5_HI_LABEL,
       as.numeric(kidney_tx_date - kidney_listing_date), NA_real_
@@ -3340,7 +4374,7 @@ print(summary(fit_table5)$conf.int)
 
 #--- 25.5 Assemble Table 5 ------------------------------------------------------
 table5_hr_row <- extract_hr(fit_table5, "exposure_labelExposed",
-                            "HR of KDPI >85% KALT",
+                            "HR of a KDPI >85% kidney (any delay)",
                             r_table5$separation_terms)
 
 table5_km_wide <- km5 |>
@@ -3349,14 +4383,19 @@ table5_km_wide <- km5 |>
   select(stratum, year, surv_ci) |>
   tidyr::pivot_wider(names_from = stratum, values_from = surv_ci)
 
-n_lta <- sum(df_table5_km$table5_group == "LTA")
-n_hi_km <- sum(df_table5_km$table5_group == TABLE5_HI_LABEL)
+n_nok    <- sum(df_table5_km$table5_group == TABLE5_NOK_LABEL)
+n_hi_km  <- sum(df_table5_km$table5_group == TABLE5_HI_LABEL)
+# The HR's unexposed state is every non-high-risk patient in df_table5, which is
+# wider than the KM's comparator column -- it also contains the KDPI <=85%
+# recipients. Reported so the two halves of the table cannot be misread as
+# describing the same reference group.
+n_unexp  <- sum(df_table5$table5_group != TABLE5_HI_LABEL)
 
 table5_display <- bind_rows(
   table5_km_wide |> rename(Row = year),
   tibble(Row = "HR (95% CI)",
          !!TABLE5_HI_LABEL := table5_hr_row$HR_CI,
-         LTA = "1.00 (reference)")
+         !!TABLE5_NOK_LABEL := "1.00 (reference)")
 ) |>
   mutate(Row = recode(Row, "1y" = "Patient survival, 1 year",
                       "3y" = "Patient survival, 3 years",
@@ -3370,38 +4409,48 @@ table5_gt <- table5_display |>
   tab_header(
     title = "Table 5",
     subtitle = paste0("Patient Survival and Time-Varying Mortality Hazard: ",
-                      "High-Risk Kidney (KDPI >85%, n=", n_hi_km,
-                      ") vs LTA (n=", n_lta, ")")
+                      "High-Risk Kidney (KDPI >85%, any delay, n=", n_hi_km,
+                      ") vs No Kidney Transplant (n=", n_nok, ")")
   ) |>
   cols_label(!!TABLE5_HI_LABEL :=
-               paste0("KDPI >85% (n=", n_hi_km, ")"),
-             LTA = paste0("LTA (n=", n_lta, ")")) |>
-  tab_footnote(footnote = paste(
-    "HR from a time-varying mortality hazard model anchored at kidney",
-    "listing. Recipients of a KDPI >85% deceased-donor KALT switch from",
-    "unexposed to exposed at their kidney transplant date; recipients of a",
-    "KDPI \u226485% deceased-donor KALT are treated as part of the unexposed",
-    "risk set throughout, and LTA patients remain unexposed throughout.")) |>
+               paste0("KDPI >85%, any delay (n=", n_hi_km, ")"),
+             !!TABLE5_NOK_LABEL := paste0("No kidney transplant (n=", n_nok, ")")) |>
   tab_footnote(footnote = paste0(
-    "SAMPLE SIZE: the high-risk group contains ", n_hi_km, " patient(s). ",
-    "Neither the Kaplan-Meier estimates nor the hazard ratio in this column ",
-    "is interpretable at this sample size, and an HR reported as NE means ",
-    "the Cox partial likelihood had no finite maximum because a state had ",
-    "zero observed events.")) |>
+    "EXPOSURE IS TIME-VARYING AND DEFINED AT ANY DELAY. A patient becomes ",
+    "exposed on the date they receive a KDPI >85% deceased-donor kidney, ",
+    "whether that is within a year of their liver transplant or years later; ",
+    "all of their pre-transplant follow-up is contributed to the unexposed ",
+    "state. Restricting the exposure to KALT (<365 day) recipients leaves 2 ",
+    "patients with 0 deaths and no estimable hazard ratio. The unexposed state ",
+    "for the HR comprises all ", n_unexp, " non-high-risk patients (those who ",
+    "never received a kidney plus recipients of a KDPI \u226485% kidney at any ",
+    "delay), which is WIDER than the Kaplan-Meier comparator column.")) |>
   tab_footnote(footnote = paste(
-    "DEVIATION FROM THE ORIGINAL TABLE: living-donor KALT recipients are",
-    "EXCLUDED from this table entirely, rather than censored at their kidney",
-    "transplant date as in the original methodology. They have no KDPI and so",
-    "cannot be assigned to a kidney-quality group; excluding them also removes",
-    "the pre-transplant person-time they would have contributed to the",
-    "unexposed reference under the original design.")) |>
+    "The Kaplan-Meier rows are a FIXED-label comparison and carry immortal-time",
+    "bias by construction: a patient must survive from kidney listing to their",
+    "kidney transplant in order to be classified high-risk at all. They are",
+    "reported because the reference table reports them. The hazard ratio, which",
+    "is free of that bias, is the estimate to quote -- and the gap between the",
+    "two is large here, which is itself the finding.")) |>
+  tab_footnote(footnote = paste(
+    "DEVIATION FROM THE ORIGINAL TABLE: living-donor recipients are EXCLUDED",
+    "from this table entirely, rather than censored at their kidney transplant",
+    "date as in the original methodology. They have no KDPI and so cannot be",
+    "assigned to a kidney-quality group; excluding them also removes the",
+    "pre-transplant person-time they would have contributed to the unexposed",
+    "reference under the original design.")) |>
+  tab_footnote(footnote = paste(
+    "DEVIATION FROM THE ORIGINAL TABLE: the reference group is patients who",
+    "NEVER received a kidney, which is narrower than this pipeline's \"LTA\"",
+    "label (that label also contains patients transplanted 365 days or more",
+    "after their liver transplant, who appear in this table's other two",
+    "columns instead).")) |>
   tab_footnote(footnote = paste(
     "Reported at 1, 3 and 5 years rather than the reference table's 1, 5 and",
-    "10 years. Kidney listing spans 10AUG2017-03APR2025 with follow-up",
-    "censored at 03APR2025; the longest observed follow-up from listing is",
-    "2,921 days (8.0 years). Neither group reaches 10 years, so a 10-year",
-    "column would report an end-of-follow-up estimate with no patients at",
-    "risk rather than a 10-year one."))
+    "10 years. Kidney listing spans 10AUG2017-03APR2025; the longest observed",
+    "follow-up from listing is 2,921 days (8.0 years), so a 10-year column",
+    "would report an end-of-follow-up estimate with no patients at risk rather",
+    "than a 10-year one."))
 
 table5_gt
 
@@ -3422,6 +4471,12 @@ table5_gt
 # one table. The original six intervals are kept as-is (relabeled "1-2 years"
 # in place of "<=2" for precision, since <=2 years is only non-overlapping
 # with the new bin if its true floor is 1 year, not 0).
+#
+# [F8] The first bin's boundary is TABLE6_KALT_BIN_DAYS = 365.25 days, i.e. one
+# Julian year, matching the scale of every other boundary in the row. It is a
+# quarter-day wider than KALT_STATUS_CALC == 1 (< 365 days), so this table's
+# first column is not exactly the KALT arm -- see the constant's definition
+# below and the reconciliation printed in 26.1 for the exact patient count.
 #
 # TIME ORIGIN: unlike patient survival elsewhere in this pipeline (anchored at
 # kidney LISTING to avoid immortal time bias -- Sections 18/19/23-25), this
@@ -3455,16 +4510,36 @@ table5_gt
 # every column, with n.risk = 0 -- all printed under one "10 y" row label.
 # See Section 23.
 TABLE6_TIMES <- REPORT_TIMES   # c(365, 1095, 1825) -- 1, 3, 5 years
-TABLE6_BIN_LEVELS <- c("KALT (<1 year)", "1-2 years", "2-4 years", "4-6 years",
+
+# [F8] First-bin boundary, in DAYS, stated explicitly as a decision rather than
+# left to fall out of `days / 365.25 < 1`. 365.25 is the chosen value: this
+# table's remaining bins are all multiples of the Julian year (2, 4, 6, 8, 10 x
+# 365.25 days), so a 365-day first boundary would be the only non-Julian cut in
+# the row and would leave a quarter-day gap between bin 1 and bin 2.
+#
+# CONSEQUENCE, ACCEPTED DELIBERATELY: this is a quarter-day wider than the
+# pipeline's KALT definition (KALT_STATUS_CALC == 1 is days < 365, Section 8), so
+# a patient transplanted on exactly day 365 falls in this table's first bin while
+# Group/Group3 classify them as a late kidney recipient. 26.1 prints exactly how
+# many patients that is; in this cohort it is 2. Nothing else in the pipeline
+# uses this boundary, so the discrepancy is confined to this table's first
+# column and does not propagate.
+TABLE6_KALT_BIN_DAYS <- 365.25
+
+TABLE6_FIRST_BIN  <- "KALT (<1 year)"
+TABLE6_BIN_LEVELS <- c(TABLE6_FIRST_BIN, "1-2 years", "2-4 years", "4-6 years",
                        "6-8 years", "8-10 years", "\u226510 years")
 
 #--- 26.1 Bin classification ---------------------------------------------------
 df_table6_pop <- df_index |>
   filter(KALT_STATUS_CALC %in% c(1, 2), !is.na(kidney_tx_date), !is.na(liver_tx_date)) |>
   mutate(
-    olt_to_kidney_years = as.numeric(kidney_tx_date - liver_tx_date) / 365.25,
+    olt_to_kidney_days  = as.numeric(kidney_tx_date - liver_tx_date),
+    olt_to_kidney_years = olt_to_kidney_days / 365.25,
     table6_bin = case_when(
-      olt_to_kidney_years < 1  ~ "KALT (<1 year)",
+      # [F8] first bin cut in days against the explicit constant; the rest stay
+      # in Julian years, which is the same scale expressed differently
+      olt_to_kidney_days < TABLE6_KALT_BIN_DAYS ~ TABLE6_FIRST_BIN,
       olt_to_kidney_years < 2  ~ "1-2 years",
       olt_to_kidney_years < 4  ~ "2-4 years",
       olt_to_kidney_years < 6  ~ "4-6 years",
@@ -3475,8 +4550,21 @@ df_table6_pop <- df_index |>
     table6_bin = factor(table6_bin, levels = TABLE6_BIN_LEVELS)
   )
 
-cat("\n[Table 6] Bin n (KALT (<1 year) is the addition to the reference table):\n")
+cat("\n[Table 6] Bin n (", TABLE6_FIRST_BIN,
+    " is the addition to the reference table):\n", sep = "")
 print(df_table6_pop |> count(table6_bin))
+
+# [F8] Reconciliation against the pipeline's KALT definition. Any patient listed
+# here is in Table 6's first bin but is NOT KALT by Group3 -- i.e. transplanted
+# on exactly day 365 -- and is the entire cost of using a 365.25-day boundary.
+t6_boundary <- df_table6_pop |>
+  filter(table6_bin == TABLE6_FIRST_BIN, KALT_STATUS_CALC != 1)
+cat("[F8] First-bin boundary (", TABLE6_KALT_BIN_DAYS, " days) vs KALT (<365 days): ",
+    nrow(t6_boundary), " patient(s) in the '", TABLE6_FIRST_BIN,
+    "' column are classified as late kidney by Group3.\n", sep = "")
+if (nrow(t6_boundary) > 0) {
+  print(t6_boundary |> count(olt_to_kidney_days, Group3, KALT_STATUS_CALC))
+}
 
 #--- 26.2 Post-kidney-transplant patient survival (landmarked at kidney TX) ---
 # Reuses make_patient_endpoint() (Section 2) exactly as everywhere else in
@@ -3503,16 +4591,18 @@ p_overall6 <- lr_p(Surv(pt_time_k, pt_event_k) ~ table6_bin, df_table6)
 cat("\n[Table 6] Overall log-rank p (7-group, including the new KALT bin):",
     p_overall6, "\n")
 
-# The specific question this section was added to answer: does the new
-# KALT (<1 year) bin differ from any of the original six. Not shown in the
-# reference table's layout (which reports one overall p only), so printed
-# here rather than folded into the display table.
-cat("\n[Table 6] Pairwise log-rank: KALT (<1 year) vs each other bin",
-    "(unadjusted -- this is exploratory, not the paper's primary comparison):\n")
-other_bins6 <- setdiff(TABLE6_BIN_LEVELS, "KALT (<1 year)")
+# The specific question this section was added to answer: does the new first bin
+# differ from any of the original six. Not shown in the reference table's layout
+# (which reports one overall p only), so printed here rather than folded into the
+# display table. [F8] Label now comes from TABLE6_FIRST_BIN so it cannot drift
+# from the factor level it filters on.
+cat("\n[Table 6] Pairwise log-rank: ", TABLE6_FIRST_BIN, " vs each other bin",
+    " (unadjusted -- this is exploratory, not the paper's primary comparison):\n",
+    sep = "")
+other_bins6 <- setdiff(TABLE6_BIN_LEVELS, TABLE6_FIRST_BIN)
 pairwise_kalt6 <- bind_rows(lapply(other_bins6, function(b) {
-  sub <- df_table6 |> filter(table6_bin %in% c("KALT (<1 year)", b))
-  tibble(comparison = paste("KALT (<1 year) vs", b),
+  sub <- df_table6 |> filter(table6_bin %in% c(TABLE6_FIRST_BIN, b))
+  tibble(comparison = paste(TABLE6_FIRST_BIN, "vs", b),
          p = lr_p(Surv(pt_time_k, pt_event_k) ~ table6_bin, sub))
 }))
 print(pairwise_kalt6)
@@ -3557,8 +4647,19 @@ table6_gt <- table6_wide |>
   tab_footnote(footnote = paste(
     "The KALT (<1 year) column is an ADDITION to the original table, covering",
     "patients whose successive kidney transplant occurred within 1 year of",
-    "OLT (this pipeline's standard KALT definition). The original table's",
-    "six columns described only later, staged kidney transplants.")) |>
+    "OLT. The original table's six columns described only later, staged kidney",
+    "transplants.")) |>
+  tab_footnote(footnote = paste0(
+    "BIN BOUNDARY: the first column uses a ", TABLE6_KALT_BIN_DAYS,
+    "-day (one Julian year) cut, chosen so that every boundary in this row is a ",
+    "multiple of 365.25 days. That is a quarter-day wider than this pipeline's ",
+    "KALT <1-year timing boundary (transplant within 365 days of OLT), so ",
+    nrow(t6_boundary),
+    " patient(s) transplanted on exactly day 365 appear in this column while ",
+    "Table 1 and the Kaplan-Meier figures place them in the KALT (>=1 y) ",
+    "stratum. Both are KALT; only the timing split differs. The boundary is ",
+    "local to this table and does not affect any ",
+    "other result.")) |>
   tab_footnote(footnote = paste(
     "Reported at 1, 3 and 5 years rather than the reference table's 1, 5 and",
     "10 years. Follow-up runs from the kidney transplant date; with listing",
@@ -3937,7 +5038,7 @@ table7_gt
 #   post-policy window to 01JAN2010 - 10AUG2025?
 #
 #   Rows    = listing window (S29_PERIODS)
-#   Columns = LTA (reference), KDPI <20, KDPI 20-80, KDPI 80+
+#   Columns = LTA (reference), KDPI <20, KDPI 20-85, KDPI >85
 #   Clock   = days since the patient's EARLIEST kidney registration, censored
 #             administratively at 365 days
 #   Event   = death (patient survival, same definition as
@@ -4011,17 +5112,21 @@ S29_PERIODS <- list(
        end   = as.Date("2025-08-10"))
 )
 
-# Requested tiers: <20, 20-80, 80+ (NOT the 20/85 split of KDPI_BREAKS, which
-# Tables 2/3 and Section 25 use -- these columns are a different cut and will
-# NOT reconcile against KDPI_cat).
-S29_KDPI_BREAKS <- c(-Inf, 20, 80, Inf)
-S29_KDPI_LABELS <- c("KDPI <20", "KDPI 20-80", "KDPI 80+")
+# KDPI tiers: <20, 20-85, >85. These now DERIVE from the pipeline-wide
+# KDPI_BREAKS / KDPI_LABELS (Section 1.4) rather than defining a second cut.
+# Sections 29 and 30 previously used a 20/80 split, which meant their columns
+# could not be reconciled against KDPI_cat in Tables 2, 3 and 5. Pointing both
+# sections at the same constants makes every KDPI-tiered table in the script
+# use one set of cut points, and makes future drift impossible: change
+# KDPI_BREAKS in Section 1.4 and every table follows.
+S29_KDPI_BREAKS <- KDPI_BREAKS
+S29_KDPI_LABELS <- KDPI_LABELS
 
-# Interval closure at the 20 and 80 boundaries.
-#   TRUE  = (-Inf,20], (20,80], (80,Inf] -- matches KDPI_cat's right = TRUE
+# Interval closure at the 20 and 85 boundaries.
+#   TRUE  = (-Inf,20], (20,85], (85,Inf] -- matches KDPI_cat's right = TRUE
 #           convention elsewhere in this pipeline, so a KDPI of exactly 20
-#           lands in the "KDPI <20" column and exactly 80 in "KDPI 20-80".
-#   FALSE = [-Inf,20), [20,80), [80,Inf) -- matches the column LABELS literally.
+#           lands in the "KDPI <20" column and exactly 85 in "KDPI 20-85".
+#   FALSE = [-Inf,20), [20,85), [85,Inf) -- matches the column LABELS literally.
 # Section 29.3 prints how many patients sit exactly on each boundary so the
 # choice is auditable rather than assumed.
 S29_KDPI_RIGHT_CLOSED <- TRUE
@@ -4090,17 +5195,30 @@ s29_build_cohort <- function(win_start, win_end, label) {
       strrep("=", 70), "\n", sep = "")
 
   # -- 6.2 equivalent: age + listing window + no simultaneous non-kidney TX
-  kid_elig <- df_kidpan_raw |>
+  kid_elig_pre <- df_kidpan_raw |>
     mutate(INIT_AGE = suppressWarnings(as.numeric(INIT_AGE))) |>
     filter(INIT_AGE >= age_min, INIT_AGE <= age_max) |>
     filter(!is.na(INIT_DATE), INIT_DATE >= win_start, INIT_DATE <= win_end) |>
-    filter(if_all(all_of(SIM_TX_COLS_KIDNEY), is_blank_flag)) |>
-    filter(is.na(DON_TY) | trimws(as.character(DON_TY)) == "" |
-             trimws(as.character(DON_TY)) %in% KIDNEY_DON_TY_KEEP)
+    filter(if_all(all_of(SIM_TX_COLS_KIDNEY), is_blank_flag))
+
+  # [F10] PATIENT-level donor-type exclusion, mirroring Section 6.2 exactly. This
+  # section rebuilds 6.2 for its own listing window, so it inherited 6.2's old
+  # row-level filter and its bug: a patient whose transplant row is dropped but
+  # whose blank listing row survives is silently recast as never-transplanted and
+  # pooled into this section's LTA reference. Fixed here for the same reason and
+  # in the same way -- if these two ever diverge, Section 29.4's reconciliation
+  # against df_supp1 is what will catch it.
+  s29_dt  <- trimws(as.character(kid_elig_pre$DON_TY))
+  s29_bad <- unique(kid_elig_pre$PT_CODE[
+    !is.na(s29_dt) & s29_dt != "" & !s29_dt %in% KIDNEY_DON_TY_KEEP])
+  kid_elig <- kid_elig_pre |> filter(!PT_CODE %in% s29_bad)
 
   cat("kidney registrations in window:", nrow(kid_elig),
-      "| distinct patients:", dplyr::n_distinct(kid_elig$PT_CODE), "\n")
+      "| distinct patients:", dplyr::n_distinct(kid_elig$PT_CODE),
+      "| patients excluded for donor type:", length(s29_bad), "\n")
   stopifnot(nrow(kid_elig) > 0)
+  stopifnot(all(trimws(as.character(kid_elig$DON_TY)) %in%
+                  c("", NA, KIDNEY_DON_TY_KEEP)))
 
   # -- 7.1 equivalent: earliest listing, computed BEFORE de-duplication
   first_list <- kid_elig |>
@@ -4147,7 +5265,9 @@ s29_build_cohort <- function(win_start, win_end, label) {
     ) |>
     filter(KALT_STATUS_CALC != 3) |>              # = Sec 10's kidney-before-liver drop
     mutate(
-      Group = factor(if_else(KALT_STATUS_CALC == 1, "KALT", "LTA"),
+      # Same is_kalt() as Section 10, so this cohort's exposure definition
+      # cannot drift from the main cohort's ([K1], Section 1.3).
+      Group = factor(if_else(is_kalt(days_liver_to_kidney_tx), "KALT", "LTA"),
                      levels = c("LTA", "KALT")),
       KDPI_num = kdpi_to_pct(KDPI, scale = S29_KDPI_SCALE, announce = FALSE),
       kdpi_tier = cut(KDPI_num, breaks = S29_KDPI_BREAKS, labels = S29_KDPI_LABELS,
@@ -4194,10 +5314,10 @@ s29_prepare <- function(cohort, label) {
 
   # Boundary audit for S29_KDPI_RIGHT_CLOSED
   n_at_20 <- sum(dat$KDPI_num == 20, na.rm = TRUE)
-  n_at_80 <- sum(dat$KDPI_num == 80, na.rm = TRUE)
-  cat("KDPI exactly 20: ", n_at_20, " | exactly 80: ", n_at_80,
+  n_at_85 <- sum(dat$KDPI_num == 85, na.rm = TRUE)
+  cat("KDPI exactly 20: ", n_at_20, " | exactly 85: ", n_at_85,
       "  (right = ", S29_KDPI_RIGHT_CLOSED, ", so 20 -> '", S29_KDPI_LABELS[1],
-      "' and 80 -> '", S29_KDPI_LABELS[if (S29_KDPI_RIGHT_CLOSED) 2 else 3],
+      "' and 85 -> '", S29_KDPI_LABELS[if (S29_KDPI_RIGHT_CLOSED) 2 else 3],
       "')\n", sep = "")
 
   # The 4 columns. A KALT patient with no KDPI tier cannot be placed in any
@@ -4511,9 +5631,9 @@ s29_footnote_common <- paste0(
   ". Endpoint is all-cause death. Both panels are UNADJUSTED.")
 
 s29_footnote_tiers <- paste0(
-  "KDPI tiers here are <20 / 20-80 / 80+, which is NOT the 20/85 split ",
-  "(KDPI_BREAKS) used by Tables 2, 3 and 5 -- these columns will not ",
-  "reconcile against KDPI_cat. Interval closure follows the pipeline's ",
+  "KDPI tiers here are <20 / 20-85 / >85 -- the same 20/85 split (KDPI_BREAKS) ",
+  "used by Tables 2, 3 and 5, so these columns reconcile against KDPI_cat. ",
+  "Interval closure follows the pipeline's ",
   "right = ", S29_KDPI_RIGHT_CLOSED, " convention (see Section 29.1).")
 
 s29_footnote_excl <- paste(
@@ -4555,8 +5675,8 @@ s29_gt_tv <- s29_tv_display |>
     "therefore the pooled un-transplanted state -- LTA follow-up plus each",
     "KALT patient's pre-transplant time -- not a fixed group of patients.")) |>
   tab_footnote(footnote = paste0(
-    "Late kidney transplants (>= 365 days after LIVER transplant, coded LTA by ",
-    "this pipeline's Group definition) can still arrive early on a KIDNEY-",
+    "Kidney transplants >= 365 days after the LIVER transplant (the KALT ",
+    ">=1 y timing stratum) can still arrive early on a KIDNEY-",
     "LISTING clock. S29_LATE_TX_HANDLING is '", S29_LATE_TX_HANDLING,
     "'; Section 29.5 prints how many such transplants fall inside the 365-day ",
     "window, and Section 29.1 documents the other two options ('censor', ",
@@ -4591,7 +5711,7 @@ s29_gt_tv
 #   they got, between the two allocation eras?
 #
 #   Rows    = era, then a between-era comparison block
-#   Columns = KDPI <20 | KDPI 20-80 | KDPI 80+ | All deceased donor |
+#   Columns = KDPI <20 | KDPI 20-85 | KDPI >85 | All deceased donor |
 #             Living donor (no KDPI)
 #   Measure = days from kidney listing to kidney transplant
 #
@@ -4623,7 +5743,7 @@ s29_gt_tv
 #   or were removed while waiting contribute nothing, and they are not missing
 #   at random with respect to kidney quality. The unbiased version of this
 #   question is a competing-risks model with "transplant with a KDPI <20 /
-#   20-80 / 80+ kidney" and "death or removal without transplant" as competing
+#   20-85 / >85 kidney" and "death or removal without transplant" as competing
 #   events, giving a cumulative incidence for each transplant type (the
 #   Aalen-Johansen machinery Section 20 already uses). Note that a plain
 #   Kaplan-Meier "time to transplant" stratified by KDPI tier would be INVALID
@@ -4952,7 +6072,7 @@ s30_fn_cols <- paste0(
   "'", S30_ALL_DD, "' is the three KDPI tiers pooled, not a separate ",
   "classification. Living-donor recipients have no KDPI and are shown ",
   "separately; they are excluded from the pooled column and from the ",
-  "across-tier test. KDPI tiers are <20 / 20-80 / 80+ (Section 29.1), NOT the ",
+  "across-tier test. KDPI tiers are <20 / 20-85 / >85 (Section 29.1), the same ",
   "20/85 split used by Tables 2, 3 and 5.")
 
 s30_fn_selection <- paste0(
@@ -5205,8 +6325,9 @@ print(s31_km |>
 
 #--- 31.4 Competing-risks cross-check (NOT the requested table) ---------------
 # Aalen-Johansen cumulative incidence with death-without-transplant as a
-# competing event rather than as censoring. Printed purely to quantify how much
-# the KM above overstates transplant probability; nothing downstream uses it.
+# competing event rather than as censoring. This quantifies how much the KM
+# above overstates transplant probability -- and, since [F12], s31_cr_fit is
+# also the estimator BEHIND FIG13, so this is no longer a print-only check.
 s31_cr_fit <- survfit(Surv(time, etype) ~ Era, data = s31_dat)
 s31_cr_s   <- summary(s31_cr_fit, times = S31_REPORT_TIMES, extend = TRUE)
 s31_tx_col <- which(s31_cr_fit$states == "transplant")
@@ -5233,27 +6354,158 @@ print(s31_cif_compare |>
 
 
 #--- 31.5 Figures -------------------------------------------------------------
-# Two views of the SAME fit. The cumulative-incidence view is the primary one --
-# a rising "% transplanted" curve is what the question actually asks about --
-# and the conventional survival view ("% still waiting") is kept alongside it
-# because it is the form the rest of this pipeline's figures take.
+# Two views of the same cohort, from two DIFFERENT estimators -- deliberately.
 #
-# fun is given as a function rather than survminer's "event" keyword so the y
-# axis stays on the 0-100 scale that KM_YLIM and km_pval_coord() assume; the
-# "event" keyword returns 0-1 and would put the log-rank annotation off-panel.
-s31_plot_cif <- km_pad_risk_table(ggsurvplot(
-  s31_fit, data = s31_dat, fun = function(y) 100 * (1 - y),
-  conf.int = TRUE, pval = TRUE, pval.method = TRUE,
-  risk.table = TRUE, risk.table.height = 0.28,
-  risk.table.title = "Number still waiting",
-  pval.coord = km_pval_coord(S31_XLIM), ylim = KM_YLIM,
-  pval.method.coord = km_pval_method_coord(S31_XLIM),
-  xlim = S31_XLIM, break.time.by = 365, axes.offset = FALSE,
-  xlab = "Days from kidney listing", ylab = "Received a kidney transplant (%)",
-  legend.title = "Listing era", legend.labs = s31_era_levels,
-  title = "Cumulative Incidence of Kidney Transplant After Listing",
-  ggtheme = theme_classic()
-), S31_XLIM)
+# [F12] THIS FIGURE USED TO PLOT THE WRONG ESTIMATOR FOR ITS OWN TITLE. It was
+# built from s31_fit with fun = 100 * (1 - y), i.e. 1 - Kaplan-Meier, while
+# being titled "Cumulative Incidence" and labelled "Received a kidney
+# transplant (%)". With death-without-transplant present as a COMPETING event,
+# 1 - KM is not the cumulative incidence of transplant: it treats those deaths
+# as censoring, i.e. as though the patient could still go on to be
+# transplanted, and therefore systematically OVERSTATES the probability of
+# transplant. That overstatement is precisely what 31.4's s31_cif_compare
+# already measures in its Gap column -- the corrected estimate was being
+# computed, printed, and then not plotted.
+#
+# The curve is now the Aalen-Johansen cumulative incidence taken from
+# s31_cr_fit, so the figure's title, its axis label and its data agree. The
+# accompanying test is Gray's test (the competing-risks analogue of the
+# log-rank), not the log-rank, for the same reason.
+#
+# s31_plot_km below is UNCHANGED by [F12] and remains a Kaplan-Meier: "% still
+# waiting" is a survival-scale quantity, it is labelled as a KM, and it is
+# correct as such. (Referred to as "fig14" when [F12] was written; the export
+# section renumbered it to fig15 when the matched block gained a figure. Named
+# by object here so the two cannot drift again.)
+#
+# ggsurvplot() cannot render a multi-state survfit (it assumes a single
+# survival curve per stratum), so the panel is assembled directly from
+# s31_cr_fit and paired with a risk table built from s31_fit -- "number still
+# waiting" is n.risk, which is identical in the two fits because they share the
+# same data and the same censoring.
+#
+# [F13] BOTH SECTION 31 FIGURES WERE HORIZONTALLY MISALIGNED -- the curve panel
+# sat roughly a third of the figure's width to the right of where it belonged,
+# and in the CIF figure it overflowed the device entirely, clipping the title
+# and the right-hand end of both curves.
+#
+# The cause is the era labels, not the assembly code. s31_era_levels carries
+# the full date ranges ("Pre-policy: 01JAN2010 - 09AUG2017"), and those strings
+# were passed straight through as legend.labs, which is ALSO what survminer
+# uses for the risk table's row stubs. The stub column is sized to its widest
+# label, and both the ggsurvplot path (which aligns $plot to $table) and the
+# hand-assembled path below (rbind(..., size = "max"), which takes the wider of
+# the two left margins by design) then propagate that width to the curve panel.
+# So a ~33-character row label silently became the curve panel's left offset in
+# both figures. km_pad_risk_table()'s KM_TABLE_PAD_PT could not help: it pads
+# both panels equally, which is what keeps the columns in register, and the
+# problem was never the padding.
+#
+# Fix: the FIGURES use short stub/legend labels ("Pre-policy" / "Post-policy")
+# and carry the date ranges in the subtitle, where they cost no panel width.
+# s31_era_levels itself is untouched, so every table, model and P value in this
+# section still keys off the full labels and no number changes.
+s31_era_short <- sub(":.*$", "", s31_era_levels)
+s31_era_sub   <- paste(s31_era_levels, collapse = "  |  ")
+
+# Gray's test for equality of the transplant CIFs across eras. fstatus uses the
+# same as.numeric(factor) - 1 coding as Section 20, so censor = 0, transplant =
+# 1, death = 2; the test row we want is the transplant cause.
+s31_tx_code  <- which(levels(s31_dat$etype) == "transplant") - 1L
+s31_gray_tab <- cmprsk::cuminc(ftime   = s31_dat$time,
+                               fstatus = as.numeric(s31_dat$etype) - 1,
+                               group   = s31_dat$Era)$Tests
+s31_gray_p   <- unname(s31_gray_tab[as.character(s31_tx_code), "pv"])
+cat("\n[Sec 31] Gray's test P (transplant CIF, pre- vs post-policy era):",
+    fmt_p(s31_gray_p), "\n")
+
+# Tidy the Aalen-Johansen estimate. A multi-state survfit stacks its strata end
+# to end, so the stratum label is rep()ed out by $strata exactly as
+# summary()$strata does in 31.4. A t = 0 row per era pins each curve to the
+# origin, matching axes.offset = FALSE elsewhere.
+s31_cif_curve <- local({
+  s   <- s31_cr_fit
+  txc <- which(s$states == "transplant")
+  d <- tibble(
+    Era   = factor(rep(gsub("^Era=", "", names(s$strata)), times = s$strata),
+                   levels = levels(s31_dat$Era)),
+    time  = s$time,
+    cif   = 100 * s$pstate[, txc],
+    lower = 100 * s$lower[, txc],
+    upper = 100 * s$upper[, txc]
+  ) |>
+    # survfit leaves the confidence limits NA where the CIF is still 0; carrying
+    # the point estimate there keeps the ribbon from breaking at the origin.
+    mutate(lower = dplyr::coalesce(lower, cif),
+           upper = dplyr::coalesce(upper, cif))
+  bind_rows(
+    tibble(Era = factor(levels(s31_dat$Era), levels = levels(s31_dat$Era)),
+           time = 0, cif = 0, lower = 0, upper = 0),
+    d
+  ) |> arrange(Era, time)
+})
+
+# geom_ribbon interpolates linearly between vertices, which would round off a
+# step function. Duplicating each vertex at the start of the next interval makes
+# the ribbon step in register with geom_step().
+s31_cif_ribbon <- s31_cif_curve |>
+  group_by(Era) |>
+  arrange(time, .by_group = TRUE) |>
+  mutate(t_end = dplyr::lead(time, default = max(S31_XLIM))) |>
+  ungroup()
+s31_cif_ribbon <- bind_rows(mutate(s31_cif_ribbon, tt = time),
+                            mutate(s31_cif_ribbon, tt = t_end)) |>
+  arrange(Era, tt)
+
+s31_cif_pcoord <- km_pval_coord(S31_XLIM)
+s31_cif_panel <- ggplot() +
+  geom_ribbon(data = s31_cif_ribbon,
+              aes(x = tt, ymin = lower, ymax = upper, fill = Era), alpha = 0.15) +
+  geom_step(data = s31_cif_curve, aes(x = time, y = cif, colour = Era),
+            linewidth = 0.8) +
+  annotate("text", x = s31_cif_pcoord[1], y = s31_cif_pcoord[2], hjust = 0,
+           size = 3.5, label = paste0("Gray's test P = ", fmt_p(s31_gray_p))) +
+  coord_cartesian(xlim = S31_XLIM, ylim = KM_YLIM, expand = FALSE, clip = "off") +
+  scale_x_continuous(breaks = seq(S31_XLIM[1], S31_XLIM[2], 365)) +
+  # [F13] The curve panel's legend keys are relabelled to the short era names so
+  # the legend matches the risk-table stubs below it; the full date ranges move
+  # to the subtitle. Both scales must be relabelled or the ribbon and the line
+  # split into two legends. The title is also split into title + subtitle: the
+  # single-line version overran the 8in device even once the panel was back in
+  # position.
+  scale_colour_discrete(labels = s31_era_short) +
+  scale_fill_discrete(labels = s31_era_short) +
+  labs(x = "Days from kidney listing", y = "Received a kidney transplant (%)",
+       colour = "Listing era", fill = "Listing era",
+       title = "Cumulative Incidence of Kidney Transplant After Listing",
+       # Two lines: the estimator note and the date ranges each fit an 8in
+       # device alone, but concatenated onto one line they overrun it.
+       subtitle = paste0("Aalen-Johansen; death without transplant is a ",
+                         "competing event.\n", s31_era_sub)) +
+  theme_classic() +
+  theme(legend.position = "top", plot.margin = KM_FIG_MARGIN,
+        plot.subtitle = element_text(size = 9))
+
+s31_cif_risktab <- suppressMessages(
+  ggrisktable(s31_fit, data = s31_dat, break.time.by = 365, xlim = S31_XLIM,
+              risk.table.title = "Number still waiting",
+              legend.labs = s31_era_short) +
+    coord_cartesian(xlim = S31_XLIM, clip = "off")) +
+  theme_classic() + labs(x = NULL, y = NULL) +
+  theme(legend.position = "none", plot.margin = KM_FIG_MARGIN,
+        axis.line = element_blank(), axis.ticks = element_blank(),
+        axis.text.x = element_blank())
+
+# size = "max" lets the risk table's long era row-labels set the shared left
+# margin. Forcing the two panels to the CURVE's widths instead would clip those
+# labels, since the curve's y axis only needs room for "100".
+s31_plot_cif <- local({
+  g <- rbind(ggplotGrob(s31_cif_panel),
+             suppressMessages(ggplotGrob(s31_cif_risktab)), size = "max")
+  pn <- which(g$layout$name == "panel")
+  g$heights[g$layout$t[pn]] <- grid::unit(c(1 - 0.28, 0.28), "null")
+  g
+})
 
 s31_plot_km <- km_pad_risk_table(ggsurvplot(
   s31_fit, data = s31_dat, fun = "pct",
@@ -5264,12 +6516,20 @@ s31_plot_km <- km_pad_risk_table(ggsurvplot(
   pval.method.coord = km_pval_method_coord(S31_XLIM),
   xlim = S31_XLIM, break.time.by = 365, axes.offset = FALSE,
   xlab = "Days from kidney listing", ylab = "Still waiting for a kidney (%)",
-  legend.title = "Listing era", legend.labs = s31_era_levels,
+  # [F13] Short stub/legend labels; date ranges in the subtitle. See the note
+  # above -- legend.labs is what sizes the risk table's stub column, and that
+  # column's width was being propagated to the curve panel's left offset.
+  legend.title = "Listing era", legend.labs = s31_era_short,
   title = "Kaplan-Meier: Time from Kidney Listing to Kidney Transplant",
+  subtitle = s31_era_sub,
   ggtheme = theme_classic()
 ), S31_XLIM)
+s31_plot_km$plot <- s31_plot_km$plot +
+  theme(plot.subtitle = element_text(size = 9))
 
-print(s31_plot_cif)
+# s31_plot_cif is a hand-assembled gtable, not a ggsurvplot, so it is drawn
+# rather than printed. grid.newpage() keeps it off the previous figure.
+grid::grid.newpage(); grid::grid.draw(s31_plot_cif)
 print(s31_plot_km)
 
 
@@ -5538,7 +6798,7 @@ s32_plot <- km_pad_risk_table(ggsurvplot(
   pval.method.coord = km_pval_method_coord(S32_XLIM),
   xlim = S32_XLIM, break.time.by = 365, axes.offset = FALSE,
   xlab = "Days from kidney listing", ylab = "Patient survival (%)",
-  legend.title = "Listing era", legend.labs = levels(s32_dat$Era),
+  legend.title = "Listing era", legend.labs = levels(droplevels(s32_dat$Era)),
   title = "Patient Survival from Kidney Listing, by Listing Era",
   ggtheme = theme_classic()
 ), S32_XLIM)
@@ -5689,10 +6949,15 @@ S33_YEARS <- 2010:2025
 
 # How long after a liver transplant a kidney still counts as "kidney after liver
 # transplant". Inf = any interval, which is what this figure asks for: any
-# recipient whose liver transplant precedes their kidney transplant. Set to 365
-# to match this pipeline's own KALT definition (Section 8, KALT_STATUS_CALC == 1)
-# if you want the figure's category to mean exactly what Tables 1-7 mean by KALT.
-S33_KAL_MAX_DAYS <- Inf
+# recipient whose liver transplant precedes their kidney transplant.
+#
+# [K1] THIS NOW AGREES WITH THE COHORT BY DEFAULT. When KALT_MAX_DAYS (Section
+# 1.3) is Inf, this figure's "kidney after liver transplant" category means
+# exactly what Tables 1-7 mean by KALT, and the two constants should be changed
+# together. They are kept separate because the populations differ -- this figure
+# is national background epidemiology over every kidney transplant in the SAF,
+# not the ESRD cohort -- so a deliberate mismatch remains possible.
+S33_KAL_MAX_DAYS <- KALT_MAX_DAYS
 
 # Kidney RE-transplants are excluded from this figure entirely -- from the
 # numerator AND the denominator -- so every percentage below is a percentage of
@@ -6020,8 +7285,8 @@ s33_gt <- s33_table |>
   tab_footnote(footnote = paste0(
     "'", S33_CAT_KAL, "' is an isolated kidney transplant in a recipient whose ",
     "liver transplant preceded it (liver_data, any interval; S33_KAL_MAX_DAYS = ",
-    S33_KAL_MAX_DAYS, ") -- set S33_KAL_MAX_DAYS to 365 to match this ",
-    "pipeline's own KALT definition. A liver transplanted on the SAME day is a ",
+    S33_KAL_MAX_DAYS, "), the same interval rule this pipeline's KALT ",
+    "definition uses (KALT_MAX_DAYS, Section 1.3). A liver transplanted on the SAME day is a ",
     "simultaneous liver-kidney instead.")) |>
   tab_footnote(footnote = paste0(
     "'", S33_CAT_OTHER, "' holds kidney+intestine, kidney+VCA and any recipient ",
@@ -6044,10 +7309,535 @@ s33_gt
 
 
 #===============================================================================
-# SECTION 34. EXPORT
+# SECTION 34. PATIENT SURVIVAL BY KDPI TIER, ANCHORED AT KIDNEY TRANSPLANT
+#===============================================================================
+# ADDITIVE SECTION. Reads only; every object is prefixed `s34_` / `S34_`. No
+# cohort object is modified and no existing figure or table number changes.
+#
+# WHAT THIS FILLS. The pipeline had kidney GRAFT survival by KDPI on the
+# kidney-TX clock (Fig 4, Section 19) but no PATIENT survival counterpart on the
+# same clock. KDPI-and-patient-survival existed only:
+#   - inside Table 7, as one adjusted coefficient among many (no curve), and
+#   - in Section 29 / Table 5 / Supp Table 1, all anchored at kidney LISTING,
+#     which is a different question and a different denominator.
+# This section is the missing figure: same population and same time origin as
+# Fig 4, patient survival instead of graft survival, so the two read as a pair.
+#
+# POPULATION. Every kidney recipient in df_esrd_cohort with a non-missing KDPI,
+# regardless of timing stratum -- so BOTH KALT <1 y and KALT >=1 y are here.
+# That is deliberate and it is safe, for a reason worth stating:
+#
+# [K2] WHY THERE IS NO IMMORTAL TIME HERE, DESPITE THE MERGED POPULATION.
+# Elsewhere in this pipeline, mixing the timing strata on a LIVER-TX clock is
+# fatal, because a >=1-year recipient spends a median 4.0 years unexposed and
+# a fixed label credits that time to the exposed arm. On the KIDNEY-TX clock
+# that failure mode cannot occur: every patient here has already received a
+# kidney at t = 0, KDPI tier is a property of the organ they received, and no
+# patient can enter or leave their tier. Time zero is the same event for
+# everyone and the strata are fixed at it. This is an ordinary baseline-stratum
+# KM and needs no time-varying treatment.
+#
+# The trade-off is what the clock EXCLUDES rather than what it biases: patients
+# who died before ever receiving a kidney are not in this figure at all, so it
+# describes outcomes AMONG RECIPIENTS and says nothing about whether
+# transplantation helped. For that contrast use Figures 7/9 or Table 4.
+#
+# Living-donor recipients carry no KDPI and are absent by construction ([F10]).
+#===============================================================================
+
+#--- 34.1 Configuration --------------------------------------------------------
+S34_REPORT_TIMES <- REPORT_TIMES   # c(365, 1095, 1825) -- 1, 3, 5 years
+S34_MIN_TIER_N   <- 10             # tiers smaller than this cannot carry a curve
+
+#--- 34.2 Population and endpoint ----------------------------------------------
+# Built from df_index (Section 16) rather than df_km_kidney, because
+# df_km_kidney is filtered on a usable GRAFT window (kg_time) -- the wrong
+# restriction for a patient-survival endpoint, and it would silently drop
+# recipients whose graft window is missing but whose vital status is known.
+s34_pop <- df_index |>
+  filter(!is.na(kidney_tx_date), !is.na(KDPI_cat)) |>
+  mutate(KDPI_cat = droplevels(KDPI_cat))
+
+s34_dat <- s34_pop |>
+  bind_cols(make_patient_endpoint(s34_pop, "kidney_tx_date") |>
+              rename(pt_time_k = time, pt_event_k = event))
+
+cat("\n########## SECTION 34: PATIENT SURVIVAL BY KDPI, FROM KIDNEY TX ##########\n")
+cat("\nNegative/missing post-kidney-TX follow-up (inspect, do not drop silently):\n")
+print(s34_dat |> summarise(neg = sum(pt_time_k <  0, na.rm = TRUE),
+                           na  = sum(is.na(pt_time_k))))
+s34_dat <- s34_dat |> filter(!is.na(pt_time_k), pt_time_k >= 0)
+
+cat("\n[Sec 34] Population: ", nrow(s34_dat),
+    " kidney recipients with a KDPI.\n", sep = "")
+print(s34_dat |> count(KDPI_cat, Group3))
+
+# Same sparsity guard as Fig 8 (Section 21b.3), for the same reason: a tier of
+# two patients still plots, as a flat line with no events, and reads as "these
+# kidneys never fail". On the FULL cohort the high-KDPI tier should be well
+# populated -- it is the <1-year-restricted view where it collapses -- so this
+# firing at all is a signal worth reading, not routine.
+s34_small <- s34_dat |> count(KDPI_cat) |> filter(n < S34_MIN_TIER_N)
+S34_DROPPED <- if (nrow(s34_small) > 0) {
+  paste0(as.character(s34_small$KDPI_cat), " (n=", s34_small$n, ")", collapse = ", ")
+} else NA_character_
+if (nrow(s34_small) > 0) {
+  warning("[Sec 34] KDPI tier(s) below n=", S34_MIN_TIER_N, " dropped: ", S34_DROPPED)
+  s34_dat <- s34_dat |> filter(!KDPI_cat %in% s34_small$KDPI_cat) |>
+    mutate(KDPI_cat = droplevels(KDPI_cat))
+}
+stopifnot(nlevels(s34_dat$KDPI_cat) >= 2, sum(s34_dat$pt_event_k) > 0)
+
+#--- 34.3 KM, log-rank, and unadjusted Cox -------------------------------------
+s34_fit <- survfit(Surv(pt_time_k, pt_event_k) ~ KDPI_cat, data = s34_dat)
+s34_km  <- km_at(s34_fit, "Patient survival by KDPI (from kidney TX)",
+                 times = S34_REPORT_TIMES)
+print(s34_km, n = 100)
+
+s34_lr <- lr_p(Surv(pt_time_k, pt_event_k) ~ KDPI_cat, s34_dat)
+cat("\n[Sec 34] Overall log-rank p across KDPI tiers:", s34_lr, "\n")
+
+cat("\n[Sec 34] Pairwise log-rank, Holm-adjusted:\n")
+print(pairwise_survdiff(Surv(pt_time_k, pt_event_k) ~ KDPI_cat,
+                        data = s34_dat, p.adjust.method = "holm"))
+
+# Unadjusted, reference = lowest KDPI tier. This is a CRUDE contrast: recipients
+# of high-KDPI kidneys differ systematically from recipients of low-KDPI ones
+# (older, longer-waiting, more comorbid), and none of that is adjusted here.
+# Table 7 is the adjusted version of this same question.
+s34_cox <- coxph(Surv(pt_time_k, pt_event_k) ~ KDPI_cat, data = s34_dat)
+cat("\n[Sec 34] Unadjusted Cox by KDPI tier (crude -- see Table 7 for adjusted):\n")
+print(summary(s34_cox))
+
+s34_hr <- local({
+  ci <- summary(s34_cox)$conf.int
+  pv <- summary(s34_cox)$coefficients[, 5]
+  tibble(
+    Contrast = paste0(sub("^KDPI_cat", "", rownames(ci)), " vs ",
+                      levels(s34_dat$KDPI_cat)[1]),
+    HR_CI    = sprintf("%.2f (%.2f-%.2f)", ci[, 1], ci[, 3], ci[, 4]),
+    P        = vapply(pv, fmt_p, character(1))
+  )
+})
+print(s34_hr, width = 200)
+
+#--- 34.4 Figure ---------------------------------------------------------------
+s34_caption <- paste0(
+  "FULL COHORT, every kidney recipient with a KDPI (n=", nrow(s34_dat),
+  "), both timing strata pooled. Companion to Figure 4, which shows GRAFT\n",
+  "survival for the same patients on the same clock.\n",
+  "TIME ORIGIN IS THE KIDNEY TRANSPLANT, so KDPI tier is fixed at t=0 and no patient can change tier -- this is an\n",
+  "ordinary baseline-stratum comparison and carries no immortal time, unlike a liver-TX-anchored KALT contrast ([K2]).\n",
+  "Patients who died before receiving a kidney are NOT represented: this describes outcomes AMONG RECIPIENTS and is\n",
+  "not evidence about the benefit of transplantation. Living-donor recipients have no KDPI and are excluded.\n",
+  "Curves are unadjusted; high-KDPI recipients differ systematically at baseline. Table 7 is the adjusted analysis.\n",
+  "READ THE RISK TABLE BEFORE THE TAILS. The KDPI >85 tier is small and thins fast; its late estimates rest on very\n",
+  "few patients and its confidence band is correspondingly wide. A separation that appears only after the risk table\n",
+  "has fallen into single digits is not a finding.",
+  if (!is.na(S34_DROPPED)) paste0("\nEXCLUDED FOR SPARSITY: ", S34_DROPPED, ".") else "")
+
+s34_plot <- km_pad_risk_table(ggsurvplot(
+  s34_fit, data = s34_dat, fun = "pct", conf.int = TRUE,
+  pval = TRUE, pval.method = TRUE, risk.table = TRUE, risk.table.height = 0.28,
+  pval.coord = km_pval_coord(KM_XLIM),
+  pval.method.coord = km_pval_method_coord(KM_XLIM),
+  xlim = KM_XLIM, break.time.by = 365, ylim = KM_YLIM, axes.offset = FALSE,
+  xlab = "Days from kidney transplant", ylab = "Patient survival (%)",
+  # legend.labs omitted because the strata names already ARE the tier labels;
+  # this matches Fig 4 (Section 19), which plots the same tiers.
+  # (Note: ggsurvplot emits "Ignoring unknown labels: colour" for legend.title
+  # on current ggplot2. That message is pipeline-wide -- ~15 per run across the
+  # existing figures -- and is cosmetic, not introduced here.)
+  legend.title = "KDPI tier",
+  title = "Fig 18. Patient Survival by KDPI Tier, from Kidney Transplant",
+  caption = s34_caption, ggtheme = theme_classic()
+), KM_XLIM)
+print(s34_plot)
+
+#--- 34.5 Display table --------------------------------------------------------
+s34_display <- s34_km |>
+  mutate(years   = round(time_d / 365.25, 0),
+         stratum = gsub("^KDPI_cat=", "", stratum)) |>
+  select(`KDPI tier` = stratum, Years = years, `At risk` = n_risk,
+         Deaths = n_event, `Survival % (95% CI)` = surv)
+print(s34_display, n = 100)
+
+# Export for this section's figure and table is consolidated in the final
+# Section (EXPORT), below.
+
+
+#===============================================================================
+# SECTION 35. WAITLIST-ENTRY TO KIDNEY TRANSPLANT BY KDPI AND ERA -- MEDIAN
+#              [IQR] WAIT, AND PERCENT TRANSPLANTED AT 1 / 3 / 5 YEARS
+#===============================================================================
+# ADDITIVE SECTION. Reads only; every object is prefixed `s35_` / `S35_`.
+# DEPENDS ON Section 31 for s31_dat (the de-duplicated two-era analysis frame)
+# and on Sections 29-30 for the KDPI tier labels and the column set.
+#
+# WHAT THIS ADDS OVER SECTIONS 30 AND 31
+#   Section 30 gives median [IQR] wait by KDPI tier, but on the Section 30
+#   population, where a patient listed in both eras contributes a waiting time
+#   to BOTH rows. Section 31 gives death-censored time-to-transplant by era with
+#   each patient in exactly one stratum, but pooled over all kidney types -- it
+#   has no KDPI breakdown. This section is the intersection of the two: KDPI
+#   breakdown, on the one-patient-one-era frame.
+#
+# THE TWO PANELS HAVE DIFFERENT DENOMINATORS, ON PURPOSE. Read this before
+# comparing a number in Panel A to a number in Panel B.
+#
+#   PANEL A -- median [IQR] observed wait, among the TRANSPLANTED.
+#     Denominator is patients who received a kidney of that tier. KDPI is a
+#     property of a kidney, so it exists only for someone who got one; there is
+#     no KDPI tier to assign to a patient who died waiting. "Death censored"
+#     is therefore vacuous in this panel -- patients who died without a
+#     transplant are not censored, they are simply absent, and the same is true
+#     of everyone still waiting at STUDY_END. This is a description of the waits
+#     that were actually observed, NOT an estimate of how long a listed patient
+#     waits. It is a selected sample and the selection is not random with
+#     respect to kidney quality: the patients who wait longest are exactly the
+#     ones most likely to die first and drop out of this panel, so every median
+#     here is biased SHORT, and more so in the era with more waitlist deaths.
+#
+#   PANEL B -- percent transplanted by 1 / 3 / 5 years, CAUSE-SPECIFIC KM.
+#     Denominator is every patient LISTED in that era. A percentage at a fixed
+#     horizon cannot be computed from Panel A's population, so this panel is a
+#     Kaplan-Meier estimate: for a given tier the event is "received a kidney in
+#     THAT tier", and death, loss to follow-up, STUDY_END, and receipt of a
+#     kidney in ANY OTHER tier all CENSOR. That is the death-censored reading,
+#     and it is the estimator Section 31 uses for the pooled endpoint.
+#     Consequence, stated plainly: censoring death assumes a patient who died
+#     waiting would have gone on to be transplanted at the same rate as a
+#     comparable survivor. They would not. Every percentage in Panel B is
+#     therefore an UPPER BOUND, and the bound is looser in the pre-policy era,
+#     which lost more candidates while waiting. Section 31.4 quantifies the size
+#     of that overstatement for the pooled endpoint (its Gap column); the
+#     tier-specific competing-risks analogue is not computed here.
+#
+#   Because of the above, the two panels do not reconcile arithmetically and are
+#   not meant to. Panel A answers "how long did the people who got a kidney
+#   wait for it"; Panel B answers "what fraction of those listed had a kidney by
+#   year 3". A tier can have a short Panel A median and a low Panel B percentage
+#   at the same time -- that is the signature of a kidney type that is rarely
+#   offered but goes quickly when it is.
+#
+# 5-year horizon: the cohort supports about 8 years of follow-up at most, so
+# 1 / 3 / 5 years is the reporting grid throughout, matching S31_REPORT_TIMES.
+
+#--- 35.1 Configuration -------------------------------------------------------
+
+# Horizons for Panel B. 1, 3 and 5 years, as requested.
+S35_REPORT_TIMES <- c(365, 1095, 1825)
+
+# Column set, taken from Section 30 so the three sections cannot drift:
+# the three KDPI tiers, the three pooled, and living donors separately.
+S35_COLS <- S30_COLS
+
+# Minimum events in a tier x era cell before its KM estimate is printed rather
+# than suppressed. A KM built on one or two events is not an estimate.
+S35_MIN_EVENTS <- 5
+
+
+#--- 35.2 Analysis frame ------------------------------------------------------
+# s31_dat is already: one row per patient, one era per patient (S31_ERA_OVERLAP
+# = "first"), time = days to transplant or to censoring, event = transplant,
+# and patients with no usable follow-up dropped. All this section adds is the
+# KDPI column assignment, using exactly Section 30.2's rule -- a deceased-donor
+# recipient with a missing KDPI belongs to no column and is counted as
+# unclassifiable rather than silently pooled.
+s35_dat <- s31_dat |>
+  mutate(col_group = case_when(
+    event == 0                                           ~ NA_character_,
+    kidney_donor_type == "Living"                        ~ S30_LD,
+    kidney_donor_type == "Deceased" & !is.na(kdpi_tier)  ~ as.character(kdpi_tier),
+    TRUE                                                 ~ NA_character_
+  ),
+  # Panel A's clock. tx_time is the raw listing-to-transplant interval; s31_dat's
+  # `time` column nudges same-day transplants to S31_SAMEDAY_EPS so they are not
+  # placed at the origin of a KM. That nudge is right for Panel B and wrong for
+  # Panel A, where a pre-emptive transplant genuinely is a 0-day wait.
+  wait_days = if_else(event == 1L, tx_time, NA_real_))
+
+cat("\n########## SECTION 35: WAIT TO KIDNEY TX BY KDPI AND ERA ##########\n")
+s35_unclass <- s35_dat |> filter(event == 1L, is.na(col_group))
+if (nrow(s35_unclass) > 0) {
+  cat("[Sec 35] Transplanted but unclassifiable -- in NO column of either panel (",
+      nrow(s35_unclass), "):\n", sep = "")
+  print(s35_unclass |> count(Era, kidney_donor_type,
+                             kdpi_missing = is.na(KDPI_num)))
+}
+cat("[Sec 35] Analysis frame:\n")
+print(s35_dat |>
+        group_by(Era) |>
+        summarise(listed = dplyr::n(), transplanted = sum(event),
+                  classifiable = sum(event == 1L & !is.na(col_group)),
+                  died_no_tx = sum(etype == "death"), .groups = "drop"))
+cat("[Sec 35] Transplants by era x column:\n")
+print(s35_dat |> filter(event == 1L, !is.na(col_group)) |> count(Era, col_group),
+      n = 40)
+
+s35_era_levels <- levels(s35_dat$Era)
+
+# Membership test shared by both panels. S30_ALL_DD is the three KDPI tiers
+# pooled, not a fourth classification, so it is derived rather than looked up.
+s35_in_col <- function(cg, col) {
+  if (identical(col, S30_ALL_DD)) cg %in% S30_KDPI_COLS else cg == col
+}
+
+
+#--- 35.3 Panel A -- median [IQR] observed wait among the transplanted --------
+s35_waits <- function(era, col) {
+  d <- s35_dat |> filter(Era == era, event == 1L, !is.na(col_group))
+  d$wait_days[s35_in_col(d$col_group, col)]
+}
+
+s35_fmt_iqr <- function(x) {
+  if (!length(x)) return("--")
+  q <- stats::quantile(x, c(0.25, 0.5, 0.75), names = FALSE, type = 7)
+  sprintf("%.0f [%.0f-%.0f]", q[2], q[1], q[3])
+}
+s35_fmt_iqr_yrs <- function(x) {
+  if (!length(x)) return("--")
+  q <- stats::quantile(x, c(0.25, 0.5, 0.75), names = FALSE, type = 7) / 365.25
+  sprintf("%.2f [%.2f-%.2f]", q[2], q[1], q[3])
+}
+s35_fmt_n <- function(x, denom) {
+  if (!denom) return("--")
+  sprintf("%d (%.1f%%)", length(x), 100 * length(x) / denom)
+}
+
+s35_panelA <- local({
+  era_rows <- bind_rows(lapply(s35_era_levels, function(er) {
+    vs <- lapply(S35_COLS, function(cl) s35_waits(er, cl))
+    names(vs) <- S35_COLS
+    denom <- sum(s35_dat$Era == er)
+
+    mk <- function(row_label, f) {
+      as_tibble(as.list(vapply(S35_COLS, function(cl) f(vs[[cl]]), character(1)))) |>
+        mutate(Block = er, Row = row_label)
+    }
+    bind_rows(
+      mk("Transplanted, n (% of listed)", function(x) s35_fmt_n(x, denom)),
+      mk("Median wait, days [IQR]",       s35_fmt_iqr),
+      mk("Median wait, years [IQR]",      s35_fmt_iqr_yrs)
+    )
+  }))
+
+  # Between-era contrast. Wilcoxon rank-sum on the raw waits, guarded exactly as
+  # Section 30.4 guards it -- both arms need >= 3 observations or the test is
+  # not attempted and the cell reads "--" rather than carrying a bogus p.
+  pre  <- s35_era_levels[1]; post <- s35_era_levels[2]
+  dif <- vapply(S35_COLS, function(cl) {
+    a <- s35_waits(post, cl); b <- s35_waits(pre, cl)
+    if (!length(a) || !length(b)) NA_real_ else stats::median(a) - stats::median(b)
+  }, numeric(1))
+  pv <- vapply(S35_COLS, function(cl)
+    s30_wilcox_p(s35_waits(post, cl), s35_waits(pre, cl)), numeric(1))
+
+  cmp <- bind_rows(
+    as_tibble(as.list(vapply(S35_COLS, function(cl)
+      if (is.na(dif[[cl]])) "--" else sprintf("%+.0f", dif[[cl]]),
+      character(1)))) |>
+      mutate(Block = "Post- vs pre-policy", Row = "Median difference, days"),
+    as_tibble(as.list(vapply(S35_COLS, function(cl)
+      if (is.na(pv[[cl]])) "--" else fmt_p(pv[[cl]]),
+      character(1)))) |>
+      mutate(Block = "Post- vs pre-policy", Row = "Wilcoxon rank-sum P")
+  )
+
+  bind_rows(era_rows, cmp) |> select(Block, Row, all_of(S35_COLS))
+})
+
+cat("\n[Sec 35] PANEL A -- median [IQR] wait, listing to kidney TX, among the ",
+    "transplanted:\n", sep = "")
+print(s35_panelA, width = 250)
+
+
+#--- 35.4 Panel B -- percent transplanted at 1 / 3 / 5 y, cause-specific KM ---
+# For one era x column: event = transplant with a kidney in that column;
+# everything else -- death, loss to follow-up, STUDY_END, and transplant with a
+# kidney in a DIFFERENT column -- censors, at the time it happened. s31_dat's
+# `time` is already the time of first exit for every patient, so recoding the
+# event indicator alone gives the correct cause-specific censoring: a patient
+# transplanted with another tier's kidney is censored at their transplant date,
+# which is exactly right.
+s35_km_cell <- function(era, col) {
+  d <- s35_dat |>
+    filter(Era == era) |>
+    mutate(ev = as.integer(event == 1L & !is.na(col_group) &
+                             s35_in_col(col_group, col)))
+  n_ev <- sum(d$ev)
+  if (n_ev < S35_MIN_EVENTS) {
+    return(tibble(Era = era, Column = col, time_d = S35_REPORT_TIMES,
+                  n_event_total = n_ev, n_risk = NA_integer_,
+                  cif = NA_real_, cif_low = NA_real_, cif_high = NA_real_,
+                  suppressed = TRUE))
+  }
+  f <- survfit(Surv(time, ev) ~ 1, data = d)
+  s <- summary(f, times = S35_REPORT_TIMES, extend = TRUE)
+  tibble(
+    Era = era, Column = col, time_d = s$time,
+    n_event_total = n_ev, n_risk = s$n.risk,
+    # KM limits are on the survival scale, so inverting swaps upper and lower.
+    cif      = 1 - s$surv,
+    cif_low  = 1 - s$upper,
+    cif_high = 1 - s$lower,
+    suppressed = FALSE
+  )
+}
+
+s35_km <- bind_rows(lapply(s35_era_levels, function(er)
+  bind_rows(lapply(S35_COLS, function(cl) s35_km_cell(er, cl)))))
+
+s35_suppressed <- s35_km |> filter(suppressed) |> distinct(Era, Column, n_event_total)
+if (nrow(s35_suppressed) > 0) {
+  cat("\n[Sec 35] SUPPRESSED -- fewer than ", S35_MIN_EVENTS,
+      " events, no KM estimate reported:\n", sep = "")
+  print(s35_suppressed)
+}
+
+s35_fmt_cell <- function(cif, lo, hi) {
+  if (is.na(cif)) return("--")
+  sprintf("%.1f (%.1f-%.1f)", 100 * cif, 100 * lo, 100 * hi)
+}
+
+s35_panelB <- local({
+  rows <- bind_rows(lapply(s35_era_levels, function(er) {
+    bind_rows(lapply(S35_REPORT_TIMES, function(td) {
+      vals <- vapply(S35_COLS, function(cl) {
+        r <- s35_km |> filter(Era == er, Column == cl, time_d == td)
+        if (!nrow(r)) "--" else s35_fmt_cell(r$cif[1], r$cif_low[1], r$cif_high[1])
+      }, character(1))
+      as_tibble(as.list(vals)) |>
+        mutate(Block = er,
+               Row = sprintf("%g year%s", td / 365, if (td > 365) "s" else ""))
+    }))
+  }))
+
+  # Between-era contrast at each horizon: difference in percentage points,
+  # post minus pre. No test -- these are two KM estimates from independent
+  # strata and the honest comparison is the pooled log-rank Section 31 already
+  # reports, not a per-tier test on the same data at three time points.
+  pre <- s35_era_levels[1]; post <- s35_era_levels[2]
+  dif <- bind_rows(lapply(S35_REPORT_TIMES, function(td) {
+    vals <- vapply(S35_COLS, function(cl) {
+      a <- s35_km |> filter(Era == post, Column == cl, time_d == td)
+      b <- s35_km |> filter(Era == pre,  Column == cl, time_d == td)
+      if (!nrow(a) || !nrow(b) || is.na(a$cif[1]) || is.na(b$cif[1])) return("--")
+      sprintf("%+.1f", 100 * (a$cif[1] - b$cif[1]))
+    }, character(1))
+    as_tibble(as.list(vals)) |>
+      mutate(Block = "Post- vs pre-policy",
+             Row = sprintf("%g year%s, difference (pp)",
+                           td / 365, if (td > 365) "s" else ""))
+  }))
+
+  bind_rows(rows, dif) |> select(Block, Row, all_of(S35_COLS))
+})
+
+cat("\n[Sec 35] PANEL B -- % transplanted by 1 / 3 / 5 y (cause-specific KM, ",
+    "death censored), % (95% CI):\n", sep = "")
+print(s35_panelB, width = 250)
+
+
+#--- 35.5 Publication-styled gt tables ----------------------------------------
+s35_fn_clock <- paste0(
+  "Time origin is ",
+  if (identical(S30_LISTING_SOURCE, "first_listing"))
+    "the patient's earliest kidney registration within their era"
+  else "the de-duplicated registration's own listing date (INIT_DATE_KIDNEY)",
+  " (S30_LISTING_SOURCE = '", S30_LISTING_SOURCE, "'). Follow-up ends at ",
+  "STUDY_END (", format(S29_STUDY_END), ").")
+
+s35_fn_cols <- paste0(
+  "KDPI tiers are <20 / 20-85 / >85 (Section 29.1), the same 20/85 split used ",
+  "by Tables 2, 3 and 5. '", S30_ALL_DD, "' is the three tiers pooled, not a ",
+  "separate classification. Living-donor recipients have no KDPI and are shown ",
+  "separately, outside the pooled column. ", nrow(s35_unclass), " transplanted ",
+  "patient(s) were deceased-donor recipients with a missing KDPI and appear in ",
+  "no column of either panel.")
+
+s35_fn_overlap <- paste0(
+  "Each patient appears in exactly one era (S31_ERA_OVERLAP = '", S31_ERA_OVERLAP,
+  "'): a patient with registrations in both eras is assigned to the earlier one. ",
+  "This is the Section 31 population, NOT the Section 30 population, where such ",
+  "patients contribute to both rows -- so these medians will not match Section ",
+  "30's exactly.")
+
+s35_gt_A <- s35_panelA |>
+  gt(groupname_col = "Block", rowname_col = "Row") |>
+  tab_header(
+    title = "Time from Kidney Waitlist Entry to Kidney Transplant, by KDPI and Listing Era",
+    subtitle = "Panel A -- median [IQR] observed wait among patients who were transplanted"
+  ) |>
+  tab_footnote(footnote = s35_fn_clock) |>
+  tab_footnote(footnote = paste0(
+    "DENOMINATOR IS THE TRANSPLANTED, NOT THE LISTED. Only a patient who ",
+    "received a kidney has a KDPI tier, so patients who died while waiting or ",
+    "who were still waiting at STUDY_END contribute to no column here -- they ",
+    "are absent, not censored. These are the waits that were observed, not an ",
+    "estimate of how long a listed patient waits, and because the longest ",
+    "waiters are the most likely to die first, every median is biased SHORT. ",
+    "Panel B is the estimate on the full listed denominator.")) |>
+  tab_footnote(footnote = paste0(
+    "ADMINISTRATIVE TRUNCATION: a patient listed late in the post-policy era ",
+    "cannot be observed waiting long, so post-policy waits are biased short ",
+    "relative to pre-policy waits over and above any real policy effect. ",
+    "Section 30 Panel B gives the landmark-matched version, in which both eras ",
+    "are observed over the same ", S30_LANDMARK_DAYS, " days; read it before ",
+    "attributing the between-era difference below to the policy.")) |>
+  tab_footnote(footnote = s35_fn_cols) |>
+  tab_footnote(footnote = s35_fn_overlap) |>
+  tab_source_note(source_note = paste(
+    "Wilcoxon rank-sum is unadjusted and is not attempted where either arm has",
+    "fewer than 3 observed waits. Median difference is post-policy minus",
+    "pre-policy; a negative value means shorter waits after the policy."))
+
+s35_gt_B <- s35_panelB |>
+  gt(groupname_col = "Block", rowname_col = "Row") |>
+  tab_header(
+    title = "Percent Transplanted by 1, 3 and 5 Years After Kidney Waitlist Entry",
+    subtitle = "Panel B -- cause-specific Kaplan-Meier, death censored, by KDPI and listing era"
+  ) |>
+  tab_footnote(footnote = s35_fn_clock) |>
+  tab_footnote(footnote = paste0(
+    "Denominator is every patient LISTED in that era. For each column the ",
+    "event is receipt of a kidney in THAT column; death, loss to follow-up, ",
+    "STUDY_END and receipt of a kidney in ANY OTHER column all censor, at the ",
+    "time they occurred. Estimates are 1 - KM with the KM confidence limits ",
+    "inverted.")) |>
+  tab_footnote(footnote = paste0(
+    "CENSORING DEATH MAKES THESE UPPER BOUNDS. A death-censored KM assumes a ",
+    "patient who died waiting would have gone on to be transplanted at the ",
+    "same rate as a comparable survivor, which is false; the resulting ",
+    "percentages overstate the probability of transplant, and by more in the ",
+    "pre-policy era, which lost more candidates while waiting. Section 31.4 ",
+    "measures the size of this overstatement for the pooled endpoint by ",
+    "comparing it against an Aalen-Johansen competing-risks estimate; the ",
+    "tier-specific competing-risks analogue is not computed.")) |>
+  tab_footnote(footnote = paste0(
+    "Cells with fewer than ", S35_MIN_EVENTS, " events in that era x column are ",
+    "suppressed and shown as '--'. ", nrow(s35_suppressed), " cell(s) are ",
+    "suppressed here.")) |>
+  tab_footnote(footnote = s35_fn_cols) |>
+  tab_footnote(footnote = s35_fn_overlap) |>
+  tab_source_note(source_note = paste(
+    "Difference rows are percentage points, post-policy minus pre-policy. No",
+    "per-tier test is given: the estimates are three correlated time points on",
+    "the same curves, and the valid unadjusted comparison is the pooled",
+    "log-rank reported in Section 31."))
+
+s35_gt_A
+s35_gt_B
+
+# Export for this section's tables is consolidated in the final Section
+# (EXPORT), below.
+
+
+#===============================================================================
+# SECTION 36. EXPORT
 #===============================================================================
 # Moved here (was Section 28, immediately after Table 7) so that every section
-# -- including Sections 29-33, appended later -- is fully defined before its
+# -- including Sections 29-35, appended later -- is fully defined before its
 # own export lines run. Nothing about WHAT is exported changed in that move;
 # this section is the union of the original Section 28 plus the export blocks
 # that used to sit at the end of Sections 29 (29.9), 30 (30.9) and 31 (31.7),
@@ -6056,32 +7846,77 @@ OUT_DIR <- "~/Local Documents/AOT/Analysis/Output/Reyes"
 dir.create(OUT_DIR, showWarnings = FALSE)
 
 #--- Figures -------------------------------------------------------------------
-ggsave(file.path(OUT_DIR, "fig1_patient_survival_tx.png"),      plot_pt$plot,      width = 8, height = 6, dpi = 300)
-ggsave(file.path(OUT_DIR, "fig2_patient_survival_listing.png"), plot_pt_list$plot, width = 8, height = 6, dpi = 300)
-ggsave(file.path(OUT_DIR, "fig3_liver_graft_survival.png"),     plot_lg$plot,      width = 8, height = 6, dpi = 300)
-ggsave(file.path(OUT_DIR, "fig4_kidney_graft_survival.png"),    plot_kg$plot,      width = 8, height = 6, dpi = 300)
+# [F11] RISK TABLES WERE BEING DROPPED FROM EVERY EXPORTED KM FIGURE. Each
+# ggsurvplot() call in this script passes risk.table = TRUE, and Section 2.6's
+# km_pad_risk_table() exists solely to stop the outermost "Number at risk"
+# values from being clipped. But these export lines used to write
+# `<plot>$plot`, which is the CURVE PANEL ALONE -- ggsurvplot returns a list
+# whose $table element holds the risk table, and $plot does not contain it. So
+# print(plot_pt) showed curve + risk table on screen while
+# fig1_patient_survival_tx.png contained only the curve, and the padding helper
+# had no effect on any file on disk.
+#
+# save_km() prints the whole ggsurvplot object into the device, which is the
+# same code path print() uses, so the exported PNG is exactly what the console
+# renders -- risk table included, at the risk.table.height each figure was
+# built with. Height is raised to 7in to give the table its own room without
+# compressing the curve panel. Plain ggplots keep using ggsave().
+# Section 31.5's CIF figure is a hand-assembled gtable rather than a
+# ggsurvplot, and a grob is drawn, not printed -- print() on one is a no-op that
+# would silently write a blank PNG. Dispatch on class so both kinds export.
+save_km <- function(path, p, width = 8, height = 7, dpi = 300, bg = "white") {
+  png(path, width = width, height = height, units = "in", res = dpi, bg = bg)
+  on.exit(dev.off(), add = TRUE)
+  if (inherits(p, c("gtable", "grob"))) grid::grid.draw(p) else print(p)
+  invisible(path)
+}
+
+save_km(file.path(OUT_DIR, "fig1_patient_survival_tx.png"),      plot_pt)
+save_km(file.path(OUT_DIR, "fig2_patient_survival_listing.png"), plot_pt_list)
+save_km(file.path(OUT_DIR, "fig3_liver_graft_survival.png"),     plot_lg)
+save_km(file.path(OUT_DIR, "fig4_kidney_graft_survival.png"),    plot_kg)
 ggsave(file.path(OUT_DIR, "fig5_love_plot.png"),                p_love,            width = 7, height = 6, dpi = 300, bg = "white")
 ggsave(file.path(OUT_DIR, "fig6_propensity_score_overlap.png"), p_ps,              width = 7, height = 6, dpi = 300, bg = "white")
-ggsave(file.path(OUT_DIR, "fig7_patient_survival_matched.png"), plot_pt_matched$plot, width = 8, height = 6, dpi = 300)
-ggsave(file.path(OUT_DIR, "fig8_liver_graft_survival_matched.png"), plot_lg_matched$plot, width = 8, height = 6, dpi = 300)
-ggsave(file.path(OUT_DIR, "fig9_supp1_lta_patient_by_ldri.png"),  supp1_plots$LTA_patient$plot,  width = 8, height = 6, dpi = 300)
-ggsave(file.path(OUT_DIR, "fig10_supp1_kalt_patient_by_ldri.png"), supp1_plots$KALT_patient$plot, width = 8, height = 6, dpi = 300)
-ggsave(file.path(OUT_DIR, "fig11_supp1_lta_graft_by_ldri.png"),   supp1_plots$LTA_graft$plot,    width = 8, height = 6, dpi = 300)
-ggsave(file.path(OUT_DIR, "fig12_supp1_kalt_graft_by_ldri.png"),  supp1_plots$KALT_graft$plot,   width = 8, height = 6, dpi = 300)
+# -- Section 21b (matched KALT <1 y vs true LTA) -- Figures 7-9. Fig 8 is
+#    conditional: it is NULL when the matched KALT arm has too few KDPI-tierable
+#    kidney grafts to stratify (21b.3 warns in that case).
+save_km(file.path(OUT_DIR, "fig7_patient_survival_matched.png"), plot_pt_matched)
+if (!is.null(plot_kg_matched)) {
+  save_km(file.path(OUT_DIR, "fig8_kidney_graft_survival_matched_kalt_by_kdpi.png"),
+          plot_kg_matched)
+} else {
+  message("fig8 not written -- no KDPI-tierable kidney grafts in the matched KALT arm.")
+}
+save_km(file.path(OUT_DIR, "fig9_liver_graft_survival_matched.png"), plot_lg_matched)
+# -- Section 23 (Supplementary Table 1 companions) -- renumbered +1 when the
+#    matched block went from two figures to three.
+save_km(file.path(OUT_DIR, "fig10_supp1_lta_patient_by_ldri.png"),  supp1_plots$LTA_patient)
+save_km(file.path(OUT_DIR, "fig11_supp1_kalt_patient_by_ldri.png"), supp1_plots$KALT_patient)
+save_km(file.path(OUT_DIR, "fig12_supp1_lta_graft_by_ldri.png"),   supp1_plots$LTA_graft)
+save_km(file.path(OUT_DIR, "fig13_supp1_kalt_graft_by_ldri.png"),  supp1_plots$KALT_graft)
 # -- Section 31 (Kaplan-Meier, time to kidney TX by listing era) --
-ggsave(file.path(OUT_DIR, "fig13_time_to_kidney_tx_cif_by_era.png"),
-       s31_plot_cif$plot, width = 8, height = 6, dpi = 300)
-ggsave(file.path(OUT_DIR, "fig14_time_to_kidney_tx_km_by_era.png"),
-       s31_plot_km$plot,  width = 8, height = 6, dpi = 300)
+save_km(file.path(OUT_DIR, "fig14_time_to_kidney_tx_cif_by_era.png"), s31_plot_cif)
+save_km(file.path(OUT_DIR, "fig15_time_to_kidney_tx_km_by_era.png"),  s31_plot_km)
 # -- Section 32 (patient survival from kidney listing by listing era) --
-ggsave(file.path(OUT_DIR, "fig15_patient_survival_from_listing_by_era.png"),
-       s32_plot$plot, width = 8, height = 6, dpi = 300)
+save_km(file.path(OUT_DIR, "fig16_patient_survival_from_listing_by_era.png"), s32_plot)
 # -- Section 33 (national kidney transplant type by year) -- wider/taller than
 #    the survival figures because it carries two stacked panels and a 16-year axis
-ggsave(file.path(OUT_DIR, "fig16_kidney_tx_type_by_year.png"),
+ggsave(file.path(OUT_DIR, "fig17_kidney_tx_type_by_year.png"),
        s33_fig, width = 9, height = 7, dpi = 300)
+# -- Section 34 (patient survival by KDPI tier, from kidney TX) -- the
+#    patient-survival companion to Fig 4's graft curves, same clock, same tiers.
+save_km(file.path(OUT_DIR, "fig18_patient_survival_by_kdpi_from_kidney_tx.png"),
+        s34_plot)
+# Section 34 (pooled-KALT Simon-Makuch) was REMOVED when the matched analysis
+# was restricted to KALT <1 y vs true LTA: its subject -- the merged KALT arm's
+# timing mix -- no longer exists in the matched cohort. The immortal-time audit
+# it carried survives as Section 21b.5, whose HR comparison is exported below.
 
 #--- Tables (CSV) ----------------------------------------------------------
+# -- Section 21/21b (matched analysis). These were previously console-only, so
+#    the primary matched estimates vanished on re-run; they are now persisted.
+write.csv(s21_retention,     file.path(OUT_DIR, "sec21_match_retention.csv"),          row.names = FALSE)
+write.csv(s21b_sensitivity,  file.path(OUT_DIR, "sec21b_immortal_time_sensitivity.csv"), row.names = FALSE)
 write.csv(table_endpoints, file.path(OUT_DIR, "table_survival_endpoints.csv"), row.names = FALSE)
 write.csv(table_logrank,   file.path(OUT_DIR, "table_logrank_p.csv"),          row.names = FALSE)
 write.csv(recon_tiers,     file.path(OUT_DIR, "table_kdpi_tier_reconciliation.csv"), row.names = FALSE)
@@ -6108,6 +7943,16 @@ write.csv(s32_km,      file.path(OUT_DIR, "sec32_km_estimates.csv"),            
 # -- Section 33 (national kidney transplant type by year) --
 write.csv(s33_table, file.path(OUT_DIR, "sec33_kidney_tx_type_by_year.csv"),      row.names = FALSE)
 write.csv(s33_pct,   file.path(OUT_DIR, "sec33_kidney_tx_type_by_year_long.csv"), row.names = FALSE)
+# -- Section 34 (patient survival by KDPI tier, from kidney TX) --
+write.csv(s34_display, file.path(OUT_DIR, "sec34_patient_survival_by_kdpi_from_kidney_tx.csv"), row.names = FALSE)
+write.csv(s34_hr,      file.path(OUT_DIR, "sec34_kdpi_crude_hr.csv"),                           row.names = FALSE)
+# -- Section 35 (wait to kidney TX by KDPI and era; % transplanted at 1/3/5 y) --
+# s35_km is the unformatted KM frame behind Panel B -- estimate, both confidence
+# limits, n at risk and the event count per cell -- kept because Panel B's
+# display collapses all of that into one string per cell.
+write.csv(s35_panelA, file.path(OUT_DIR, "sec35_wait_to_kidney_tx_by_kdpi_median_iqr.csv"), row.names = FALSE)
+write.csv(s35_panelB, file.path(OUT_DIR, "sec35_pct_transplanted_1_3_5y_by_kdpi.csv"),      row.names = FALSE)
+write.csv(s35_km,     file.path(OUT_DIR, "sec35_km_estimates_by_kdpi.csv"),                 row.names = FALSE)
 
 #--- Tables (gt / HTML) ---------------------------------------------------------
 gtsummary::as_gt(table1) |> gt::gtsave(file.path(OUT_DIR, "table1.html"))
@@ -6130,6 +7975,9 @@ gt::gtsave(s31_gt, file.path(OUT_DIR, "sec31_time_to_kidney_tx_by_era.html"))
 gt::gtsave(s32_gt, file.path(OUT_DIR, "sec32_survival_from_listing_by_era.html"))
 # -- Section 33 --
 gt::gtsave(s33_gt, file.path(OUT_DIR, "sec33_kidney_tx_type_by_year.html"))
+# -- Section 35 --
+gt::gtsave(s35_gt_A, file.path(OUT_DIR, "sec35_wait_to_kidney_tx_by_kdpi_median_iqr.html"))
+gt::gtsave(s35_gt_B, file.path(OUT_DIR, "sec35_pct_transplanted_1_3_5y_by_kdpi.html"))
 
 
 #===============================================================================
