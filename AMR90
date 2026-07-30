@@ -81,7 +81,9 @@
 required_pkgs <- c(
   "ggplot2", "haven", "tidyr", "dplyr", "knitr", "kableExtra", "stringr",
   "lubridate", "gt", "tibble", "survminer", "survival", "scales",
-  "MatchIt", "cobalt", "gtsummary", "webshot2"
+  "MatchIt", "cobalt", "gtsummary", "webshot2",
+  "survey",  # FIX 5: svyglm(), for clustering matched-pair logistic models on subclass
+  "smd"      # FIX 5: standardized mean difference for the matched Tables 2/3
 )
 
 invisible(lapply(required_pkgs, function(pkg) {
@@ -108,7 +110,7 @@ LANDMARK_DAY <- 90
 # it is not the conventional second post-transplant year (days 365-730).
 YR2_START        <- 90   # outcome window opens
 YR2_END          <- 730.5    # outcome window closes
-YR2_ELIGIBLE_DAY <- 365.25   # must still be under observation here to have an outcome
+YR2_ELIGIBLE_DAY <- 90   # must still be under observation here to have an outcome
 
 # The dead zone between exposure and outcome. Non-empty only when the landmark
 # is earlier than the outcome window, i.e. exactly the situation created by
@@ -754,9 +756,11 @@ message("  treated before landmark (day ", LANDMARK_DAY, "): ",
 #       earlier, wrong run, which collapsed the Control arm and with it every
 #       demographic table.
 assign_arm_at_landmark <- function(landmark_day,
-                                   assessment_rule = ASSESSMENT_RULE) {
-  
-  treated_before <- pat_rej_first %>%
+                                   assessment_rule = ASSESSMENT_RULE,
+                                   pat_rej_first_src = pat_rej_first,
+                                   fol_calc_src = df_immuno_fol_calc) {
+
+  treated_before <- pat_rej_first_src %>%
     filter(!is.na(REJ_TX_DAY), REJ_TX_DAY < landmark_day)
   
   mono <- treated_before %>% filter(NUM_ANTI_REJ_RXED < 2)
@@ -778,18 +782,18 @@ assign_arm_at_landmark <- function(landmark_day,
     # Any record at all: the discharge record documents from day 0, and the
     # first follow-up form reports back to transplant.
     "interval" = unique(c(df_immuno_induc$TRR_ID_CODE,
-                          df_immuno_fol_calc$TRR_ID_CODE)),
-    
+                          fol_calc_src$TRR_ID_CODE)),
+
     # Form dated inside the window, or still admitted at the landmark.
     "strict" = unique(c(
-      df_immuno_fol_calc %>%
+      fol_calc_src %>%
         filter(FOL_DATE_DAYS_DELTA < landmark_day) %>% pull(TRR_ID_CODE),
       df_immuno_induc %>%
         filter(!is.na(DAYS_HOSP_SP_TX), DAYS_HOSP_SP_TX >= landmark_day) %>%
         pull(TRR_ID_CODE)
     )),
-    
-    "any_year1" = unique(df_immuno_fol_calc$TRR_ID_CODE),
+
+    "any_year1" = unique(fol_calc_src$TRR_ID_CODE),
     
     stop("unknown ASSESSMENT_RULE: ", assessment_rule)
   )
@@ -1434,8 +1438,14 @@ run_match <- function(raw_df, label, seed = 1234) {
   
   message("[", label, "] treated units unmatched by caliper: ",
           sum(m$treat == 1 & is.na(m$subclass)))
-  
-  list(matchit = m, match_frame = md, matched_ids = match.data(m)$TRR_ID_CODE)
+
+  # FIX 5: matched_data carries subclass (which pair each patient belongs to)
+  # so callers doing inferential modeling can cluster on it instead of
+  # treating matched patients as an independent sample. matched_ids is kept
+  # for existing callers that only need the ID list (e.g. descriptive tables).
+  list(matchit = m, match_frame = md,
+       matched_ids  = match.data(m)$TRR_ID_CODE,
+       matched_data = match.data(m) %>% select(TRR_ID_CODE, subclass, weights))
 }
 
 # --- Comparison 1: Combined vs Steroid ---
@@ -1630,7 +1640,8 @@ build_gts_table <- function(df_combined, group_col, group_lbls = NULL, caption =
                             labels    = gts_labels,
                             prep_fn   = prep_gts_df,
                             cont_test = c("auto", "t.test", "aov", "wilcox.test", "kruskal.test"),
-                            missing_disp = "no") {
+                            missing_disp = "no",
+                            matched   = FALSE) {
   
   cont_test <- match.arg(cont_test)
   
@@ -1666,13 +1677,25 @@ build_gts_table <- function(df_combined, group_col, group_lbls = NULL, caption =
   
   n_groups <- nlevels(droplevels(factor(d[[group_col]])))
   if (cont_test == "auto") cont_test <- if (n_groups > 2) "aov" else "t.test"
-  
+
   cont_lbl <- switch(cont_test,
                      "t.test"       = "Welch two-sample t-test",
                      "aov"          = "One-way ANOVA",
                      "wilcox.test"  = "Wilcoxon rank-sum test",
                      "kruskal.test" = "Kruskal-Wallis test")
-  
+
+  # FIX (Tables 2/3 SMD): a matched cohort is not an independent random
+  # sample -- a between-group hypothesis test (t-test/chi-square) on matched
+  # pairs mixes leftover imbalance with sampling noise from a test that
+  # doesn't know the rows are paired, and can read as "significant" or "not"
+  # for reasons unrelated to match quality. Standardized mean difference
+  # (SMD) is the balance metric MatchIt itself optimizes against -- the same
+  # one plotted in the Love plots -- so matched = TRUE reports that instead
+  # of a p-value.
+  if (matched && n_groups != 2) {
+    stop("build_gts_table(matched = TRUE) requires exactly 2 groups for SMD; got ", n_groups)
+  }
+
   tbl <- d %>%
     select(all_of(group_col), all_of(vars)) %>%
     tbl_summary(
@@ -1684,21 +1707,33 @@ build_gts_table <- function(df_combined, group_col, group_lbls = NULL, caption =
       ),
       digits = list(all_continuous() ~ 1),
       missing = missing_disp
-    ) %>%
-    add_p(
-      test = list(
-        all_continuous()  ~ cont_test,
-        all_categorical() ~ "gts_safe_cat_test"
-      ),
-      pvalue_fun = ~ style_pvalue(.x, digits = 3)
-    ) %>%
+    )
+
+  tbl <- if (matched) {
+    tbl %>%
+      add_difference(test = everything() ~ "smd") %>%
+      modify_footnote(
+        estimate ~ paste0("Standardized mean difference (matched cohort). ",
+                          "|SMD| < 0.1 is conventionally considered balanced."))
+  } else {
+    tbl %>%
+      add_p(
+        test = list(
+          all_continuous()  ~ cont_test,
+          all_categorical() ~ "gts_safe_cat_test"
+        ),
+        pvalue_fun = ~ style_pvalue(.x, digits = 3)
+      ) %>%
+      modify_footnote(p.value ~ paste0(
+        cont_lbl,
+        "; Pearson's Chi-squared test / Fisher's exact test (simulated p-value where tables exceed 2x2)"))
+  }
+
+  tbl <- tbl %>%
     bold_labels() %>%
     modify_header(all_stat_cols() ~ "**{level}**, N = {n}") %>%
-    modify_footnote(all_stat_cols() ~ "Mean (SD); n (%)") %>%
-    modify_footnote(p.value ~ paste0(
-      cont_lbl,
-      "; Pearson's Chi-squared test / Fisher's exact test (simulated p-value where tables exceed 2x2)"))
-  
+    modify_footnote(all_stat_cols() ~ "Mean (SD); n (%)")
+
   if (!is.null(group_lbls)) {
     for (lv in names(group_lbls)) {
       tbl <- tbl %>% modify_header(
@@ -1738,7 +1773,7 @@ tbl2_df <- bind_rows(
   mutate(REJ_GROUP = factor(REJ_GROUP, levels = c("Combined", "Steroid")))
 
 gts_table2 <- build_gts_table(
-  tbl2_df, "REJ_GROUP",
+  tbl2_df, "REJ_GROUP", matched = TRUE,
   caption = cap("Table 2. Combined vs. Steroid (Propensity Matched)")
 )
 
@@ -1751,7 +1786,7 @@ tbl3_df <- bind_rows(
   mutate(REJ_GROUP = factor(REJ_GROUP, levels = c("Combined", "Control")))
 
 gts_table3 <- build_gts_table(
-  tbl3_df, "REJ_GROUP",
+  tbl3_df, "REJ_GROUP", matched = TRUE,
   caption = cap("Table 3. Combined Therapy vs. No Rejection (Propensity Matched)")
 )
 
@@ -1825,6 +1860,10 @@ keep(gts_table7, "table7_all_arms")
 #    the footnote string, which gtsummary prints verbatim.
 # 3. To export: as_flex_table() (Word), as_gt() (further gt customization), or
 #    as_kable_extra() (PDF via LaTeX).
+# 4. Tables 2 and 3 are the PROPENSITY-MATCHED cohorts and report SMD
+#    (build_gts_table(matched = TRUE)), not a p-value -- a between-group
+#    hypothesis test isn't valid on matched pairs. Tables 1, 4-7 are unmatched
+#    and keep the p-value from point 1/2 above.
 
 
 #===============================================================================
@@ -2394,8 +2433,13 @@ run_coxph_dc <- function(data, ref_arm, label, adjusted = FALSE) {
   }
   d <- data %>% mutate(ARM = relevel(droplevels(ARM), ref = ref_arm))
   if (!"DIAB_BIN" %in% names(d)) d <- d %>% left_join(baseline_covs, by = "TRR_ID_CODE")
-  
+
   rhs <- if (adjusted) paste0("ARM", adj_formula_suffix) else "ARM"
+  # FIX 5: this is always called on propensity-matched pairs, never on the
+  # raw cohort. cluster(subclass) tells coxph the pairs are not independent,
+  # so the SEs/CIs reflect the matched design instead of a simple-random-
+  # sample assumption.
+  if ("subclass" %in% names(d)) rhs <- paste0(rhs, " + cluster(subclass)")
   fit <- coxph(as.formula(paste0("Surv(time_dc, event_dc) ~ ", rhs)), data = d)
   s   <- summary(fit)
   
@@ -2456,10 +2500,15 @@ match_within_dc <- function(df_in, treat_arm, ctrl_arm, label, seed = 1234) {
   message("[", label, "] treated units unmatched by caliper: ",
           sum(m$treat == 1 & is.na(m$subclass)))
   
-  matched_ids <- match.data(m)$TRR_ID_CODE
+  # FIX 5: keep subclass (which pair each matched patient belongs to), not
+  # just the surviving IDs, so downstream models can account for the pairing
+  # instead of treating matched patients as an independent sample.
+  matched <- match.data(m) %>% select(TRR_ID_CODE, subclass, weights)
   list(matchit = m,
        match_frame = md,
-       data = d %>% filter(TRR_ID_CODE %in% matched_ids) %>% mutate(ARM = droplevels(ARM)))
+       data = d %>%
+         inner_join(matched, by = "TRR_ID_CODE") %>%
+         mutate(ARM = droplevels(ARM)))
 }
 
 dc_match_combined_steroid <- match_within_dc(
@@ -2635,6 +2684,57 @@ cox_dc_rej <- coxph(Surv(rej_time, rej_event) ~ relevel(droplevels(ARM), ref = "
                     data = df_dc_rej %>%
                       filter(ARM %in% c("Steroids", "Combined", "Control")))
 print(summary(cox_dc_rej))
+
+# --- Save the model above as a table, same convention as hr_discharge_anchored ---
+# cox_dc_rej relevels ARM inline rather than in a precomputed column (unlike
+# run_coxph_dc / fit_dc_3arm), so term names carry the relevel()/droplevels()
+# call; strip that back down to the bare arm name for display.
+s_dc_rej   <- summary(cox_dc_rej)
+zph_dc_rej <- tryCatch(cox.zph(cox_dc_rej), error = function(e) NULL)
+
+hr_results_dc_rej <- tibble(
+  Comparison = rownames(s_dc_rej$conf.int),
+  n          = cox_dc_rej$n,
+  events     = cox_dc_rej$nevent,
+  HR         = s_dc_rej$conf.int[, "exp(coef)"],
+  CI_lower   = s_dc_rej$conf.int[, "lower .95"],
+  CI_upper   = s_dc_rej$conf.int[, "upper .95"],
+  p_value    = s_dc_rej$coefficients[, "Pr(>|z|)"],
+  ph_test_p  = if (!is.null(zph_dc_rej)) zph_dc_rej$table[seq_len(nrow(s_dc_rej$conf.int)), "p"] else NA_real_
+) %>%
+  mutate(Comparison = paste0(
+    str_remove(Comparison, '^relevel\\(droplevels\\(ARM\\), ref = "Control"\\)'),
+    " vs Control"))
+
+keep(
+  hr_results_dc_rej %>%
+    mutate(
+      `HR (95% CI)` = sprintf("%.2f (%.2f–%.2f)", HR, CI_lower, CI_upper),
+      `P value` = case_when(p_value < 0.001 ~ "<0.001", TRUE ~ sprintf("%.3f", p_value)),
+      `PH test P` = case_when(is.na(ph_test_p) ~ NA_character_,
+                              ph_test_p < 0.001 ~ "<0.001",
+                              TRUE ~ sprintf("%.3f", ph_test_p))
+    ) %>%
+    select(Comparison, n, events, `HR (95% CI)`, `P value`, `PH test P`) %>%
+    gt() %>%
+    cols_label(Comparison = "Arm (ref = Control)", n = "N (model total)",
+               events = "N re-treated (model total)",
+               `HR (95% CI)` = "Hazard Ratio (95% CI)", `P value` = "P value",
+               `PH test P` = "PH Assumption P") %>%
+    tab_header(
+      title = "Hazard Ratio for Post-Discharge Anti-Rejection Therapy",
+      subtitle = paste0("Time origin = discharge from the index admission; follow-up to ",
+                        round(DC_HORIZON_LONG), " days post-discharge")
+    ) %>%
+    tab_options(table.font.size = 13, data_row.padding = px(4),
+                column_labels.font.weight = "bold") %>%
+    tab_source_note(paste0(
+      "PRIMARY REJECTION OUTCOME model (cox_dc_rej), 3-arm (Steroids, Combined, Control), ref = Control. ",
+      "For Control this models time to first-ever post-discharge anti-rejection therapy; for Steroids/",
+      "Combined it models time to RE-treatment, so this HR is not a clean treatment-effect estimate -- see ",
+      "the source note on the descriptive summary table above. N and N re-treated are the model totals ",
+      "across all three arms, not per-row."))
+  , "hr_postdischarge_rejection")
 
 #===============================================================================
 # 20. SENSITIVITY ANALYSIS: Landmark-Anchored Survival
@@ -2817,11 +2917,15 @@ match_within_landmark <- function(df_lm, treat_arm, ctrl_arm, label, seed = 1234
   md <- d %>% select(TRR_ID_CODE, treat, all_of(match_covariates), any_of(balance_only_covariates))
   res <- run_match(md, label, seed = seed)
   if (is.null(res)) return(NULL)
-  
+
+  # FIX 5: join subclass in rather than just filtering to matched_ids, so
+  # run_coxph_lm()/run_coxph_lm_adj() can cluster on the matched pair.
   list(
     matchit     = res$matchit,
     match_frame = res$match_frame,
-    data = d %>% filter(TRR_ID_CODE %in% res$matched_ids) %>% mutate(ARM = droplevels(ARM))
+    data = d %>%
+      inner_join(res$matched_data, by = "TRR_ID_CODE") %>%
+      mutate(ARM = droplevels(ARM))
   )
 }
 
@@ -3394,13 +3498,17 @@ run_coxph_lm <- function(data, ref_arm, label) {
     return(NULL)
   }
   d <- data %>% mutate(ARM = relevel(droplevels(ARM), ref = ref_arm))
-  
-  fit <- coxph(Surv(time_lm, event_lm) ~ ARM, data = d)
+
+  # FIX 5: always called on propensity-matched pairs (see the three callers
+  # below); cluster(subclass) accounts for the pairing instead of treating
+  # matched patients as an independent sample.
+  rhs <- if ("subclass" %in% names(d)) "ARM + cluster(subclass)" else "ARM"
+  fit <- coxph(as.formula(paste0("Surv(time_lm, event_lm) ~ ", rhs)), data = d)
   s   <- summary(fit)
-  
+
   zph  <- tryCatch(cox.zph(fit), error = function(e) NULL)
   ph_p <- if (!is.null(zph)) zph$table[1, "p"] else NA_real_
-  
+
   tibble(
     Comparison = label,
     Direction  = paste0(rownames(s$conf.int)[1], "  (ref = ", ref_arm, ")"),
@@ -3512,8 +3620,12 @@ run_coxph_lm_adj <- function(data, ref_arm, label) {
   if (!"DIAB_BIN" %in% names(d)) {
     d <- d %>% left_join(baseline_covs, by = "TRR_ID_CODE")
   }
-  
-  fit <- coxph(as.formula(paste0("Surv(time_lm, event_lm) ~ ARM", adj_formula_suffix)), data = d)
+
+  # FIX 5: cluster(subclass) when present, same as run_coxph_lm() above --
+  # this is always called on propensity-matched pairs.
+  rhs <- paste0("ARM", adj_formula_suffix)
+  if ("subclass" %in% names(d)) rhs <- paste0(rhs, " + cluster(subclass)")
+  fit <- coxph(as.formula(paste0("Surv(time_lm, event_lm) ~ ", rhs)), data = d)
   s <- summary(fit)
   
   tibble(
@@ -3583,13 +3695,86 @@ keep(
 # Counting-process (start, stop] format, so each patient may occupy more than
 # one row. No cluster/robust variance is needed: the segments from a single
 # patient are non-overlapping in time and the partial likelihood handles them.
+#-------------------------------------------------------------------------------
+# FIX 1 (year-1 truncation): assign_arm_at_landmark(Inf) below is supposed to
+# use treatment timing over ALL available follow-up, not just year 1. But its
+# defaults (pat_rej_first, df_immuno_fol_calc) are built from df_immuno_fol,
+# which is deliberately capped at FOL_DATE_DAYS_DELTA < YEAR1_DAYS (section 4).
+# A patient first treated on, say, day 400 has no row in that capped frame, so
+# REJ_TX_DAY is NA for them and they are scored untreated for the rest of
+# follow-up -- including the time after day 400 when they were actually on
+# treatment. This rebuilds the same pipeline (sections 4-7) from the
+# uncapped df_immuno_fol_read, capped at TV_HORIZON instead of YEAR1_DAYS, so
+# late-starting patients are correctly captured. Only this Mantel-Byar model
+# uses these _tv frames; every other section (including arm_at_landmark
+# itself) is untouched and still uses the year-1-capped frames on purpose --
+# see the section-4 note on why the year-1 window is needed elsewhere.
 #===============================================================================
-arm_all_time <- assign_arm_at_landmark(Inf)   # exposure over all available follow-up
+df_immuno_fol_tv <- df_immuno_fol_read %>%
+  filter(TRR_ID_CODE %in% tx_ids_to_keep) %>%
+  select(-any_of(c("TX_DATE", "DISCHARGE_DATE", "TRTREJ6M", "TRTREJ1Y"))) %>%
+  left_join(df_liver_data_filtered %>%
+              select(TRR_ID_CODE, TX_DATE, DISCHARGE_DATE, TRTREJ6M, TRTREJ1Y),
+            by = "TRR_ID_CODE") %>%
+  filter(!is.na(TX_DATE)) %>%
+  mutate(
+    PX_STAT_DATE_FOL = as.Date(PX_STAT_DATE_FOL),
+    TX_DATE = as.Date(TX_DATE)
+  ) %>%
+  mutate(FOL_DATE_DAYS_DELTA = time_length(interval(TX_DATE, PX_STAT_DATE_FOL), "days")) %>%
+  filter(FOL_DATE_DAYS_DELTA >= 0 & FOL_DATE_DAYS_DELTA < TV_HORIZON) %>%
+  arrange(PX_STAT_DATE_FOL) %>%
+  group_by(TRR_ID_CODE) %>%
+  mutate(REJECT_RUNNING_COUNT = cumsum(if_any(all_of(COLS_TO_CHECK), ~ !is.na(.) & . == 1))) %>%
+  ungroup() %>%
+  mutate(NUM_ANTI_REJ_RXED = rowSums(across(all_of(COLS_TO_CHECK)) == 1, na.rm = TRUE))
+
+pat_rej_array_fol_tv <- df_immuno_fol_tv %>%
+  mutate(
+    REJECT_RUNNING_COUNT = if_else(
+      TRR_ID_CODE %in% inpatient_reject_ID_vect,
+      REJECT_RUNNING_COUNT + 1,
+      REJECT_RUNNING_COUNT
+    )
+  ) |>
+  filter(REJECT_RUNNING_COUNT == 1, NUM_ANTI_REJ_RXED >= 1) %>%
+  group_by(TRR_ID_CODE) %>%
+  slice_min(order_by = PX_STAT_DATE_FOL, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(
+    TRR_ID_CODE, TRR_FOL_ID_CODE, TX_DATE, DISCHARGE_DATE, PX_STAT_DATE_FOL,
+    FOL_DATE_DAYS_DELTA, REJECT_RUNNING_COUNT, NUM_ANTI_REJ_RXED,
+    all_of(COLS_TO_CHECK)
+  ) %>%
+  mutate(DISCHARGE_DATE = as.Date(DISCHARGE_DATE))
+
+pat_rej_array_tv <- bind_rows(pat_rej_array_dis, pat_rej_array_fol_tv, .id = "source") %>%
+  mutate(source = as.integer(source))
+
+pat_rej_first_tv <- pat_rej_array_tv %>%
+  group_by(TRR_ID_CODE) %>%
+  slice_min(order_by = source, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(
+    REJ_TX_DAY = if_else(source == 1L,
+                         as.numeric(INPATIENT_RX_DAY),
+                         as.numeric(FOL_DATE_DAYS_DELTA))
+  )
+
+message("Time-varying model: rejectors first captured only after day ", YEAR1_DAYS,
+        " (missed by the year-1-capped frame): ",
+        length(setdiff(pat_rej_first_tv$TRR_ID_CODE, pat_rej_first$TRR_ID_CODE)))
+
+arm_all_time <- assign_arm_at_landmark(
+  Inf,
+  pat_rej_first_src = pat_rej_first_tv,
+  fol_calc_src = df_immuno_fol_tv
+)   # exposure over all available follow-up, through TV_HORIZON
 
 tv_base <- df_survival %>%
   filter(!is.na(PTIME), PTIME > 0) %>%
   select(TRR_ID_CODE, PTIME, event) %>%
-  left_join(pat_rej_first %>% select(TRR_ID_CODE, REJ_TX_DAY), by = "TRR_ID_CODE") %>%
+  left_join(pat_rej_first_tv %>% select(TRR_ID_CODE, REJ_TX_DAY), by = "TRR_ID_CODE") %>%
   left_join(arm_all_time, by = "TRR_ID_CODE") %>%
   filter(!is.na(ARM))
 
@@ -3977,14 +4162,19 @@ yr2_adj_covs <- "AGE + GENDER + MELD_PELD_LAB_SCORE + COLD_ISCH + DIAB_BIN"
 tidy_glm_or <- function(fit) {
   co <- summary(fit)$coefficients
   ci <- suppressMessages(confint.default(fit))  # Wald CIs
-  
+
+  # FIX 5: svyglm() (used for matched-pair models clustered on subclass)
+  # reports a t-test p-value column ("Pr(>|t|)") instead of glm's z-test
+  # ("Pr(>|z|)"). Match by pattern so this works for both model types.
+  p_col <- grep("^Pr\\(>\\|[zt]\\|\\)$", colnames(co), value = TRUE)[1]
+
   tibble(
     term     = rownames(co),
     N        = stats::nobs(fit),
     OR       = exp(co[, "Estimate"]),
     CI_lower = exp(ci[, 1]),
     CI_upper = exp(ci[, 2]),
-    p_value  = co[, "Pr(>|z|)"]
+    p_value  = co[, p_col]
   ) %>%
     filter(term != "(Intercept)")
 }
@@ -4281,11 +4471,14 @@ match_yr2_outcome <- function(model_df, outcome, treat_grp, ctrl_grp, label, see
   md  <- d %>% select(TRR_ID_CODE, treat, all_of(match_covariates))
   res <- run_match(md, label, seed = seed)
   if (is.null(res)) return(NULL)
-  
+
+  # FIX 5: join subclass/weights instead of filtering to matched_ids, so the
+  # models below can be fit on the matched-pair design rather than treating
+  # matched patients as an independent sample.
   dm <- d %>%
-    filter(TRR_ID_CODE %in% res$matched_ids) %>%
+    inner_join(res$matched_data, by = "TRR_ID_CODE") %>%
     mutate(EXPOSURE_GROUP = relevel(droplevels(EXPOSURE_GROUP), ref = ctrl_grp))
-  
+
   # Guard against a zero-event arm, which makes the OR non-estimable.
   ev <- tapply(dm[[outcome]], dm$EXPOSURE_GROUP, sum, na.rm = TRUE)
   if (any(ev == 0)) {
@@ -4293,11 +4486,19 @@ match_yr2_outcome <- function(model_df, outcome, treat_grp, ctrl_grp, label, see
             " (events by arm: ", paste(names(ev), ev, sep = "=", collapse = ", "), ")")
     return(NULL)
   }
-  
-  f_unadj <- glm(as.formula(paste(outcome, "~ EXPOSURE_GROUP")), data = dm, family = binomial)
-  f_adj   <- glm(as.formula(paste(outcome, "~ EXPOSURE_GROUP +", yr2_adj_covs)),
-                 data = dm, family = binomial)
-  
+
+  # svyglm() with ids = ~subclass clusters the standard errors on the matched
+  # pair, so a pair that moves together in outcome doesn't get counted as two
+  # independent observations. quasibinomial() avoids the "non-integer #
+  # successes" warning svyglm gives with binomial() on weighted/matched data;
+  # the point estimates are identical to binomial(), only the dispersion
+  # handling differs.
+  dsgn <- svydesign(ids = ~subclass, weights = ~weights, data = dm)
+  f_unadj <- svyglm(as.formula(paste(outcome, "~ EXPOSURE_GROUP")),
+                     design = dsgn, family = quasibinomial())
+  f_adj   <- svyglm(as.formula(paste(outcome, "~ EXPOSURE_GROUP +", yr2_adj_covs)),
+                     design = dsgn, family = quasibinomial())
+
   bind_rows(
     or_from(f_unadj, ctrl_grp, "Unadjusted"),
     or_from(f_adj,   ctrl_grp, "Adjusted")
